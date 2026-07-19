@@ -1,0 +1,19 @@
+[project]
+name = "purecdp"
+version = "0.1.0"
+description = "Vanilla Python Chrome DevTools Protocol. Optional dependencies for accelerated performance"
+readme = "README.md"
+license = "0BSD"
+requires-python = ">=3.14"
+
+
+[project.optional-dependencies]
+faster = [
+    "orjson>=3.11",                                # wire JSON dumps/loads
+    "pybase64>=1.4.3",                             # screenshot/PDF/body base64
+    "uvloop>=0.22; platform_system != 'Windows'",  # faster event loop (POSIX)
+    "winloop>=0.6; platform_system == 'Windows'",  # faster event loop (Windows)
+]
+
+[project.entry-points.pytest11]
+purecdp = "purecdp.testing.pytest_plugin"

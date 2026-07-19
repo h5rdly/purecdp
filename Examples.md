@@ -1,0 +1,525 @@
+# purecdp by example
+
+Runnable, copy-pasteable recipes grouped by what you're trying to do. Every
+example is stdlib-only at runtime (the `[faster]` accelerators are optional and
+kick in automatically when present). See [README.md](README.md) for the tour and
+[DESIGN.md](DESIGN.md) for the why.
+
+The layers, low to high:
+
+- **`purecdp.protocol`** — generated typed bindings, one module per CDP domain.
+- **`purecdp` core** — sans-I/O engine + asyncio `Connection`/`Session` + `launch`/`connect`.
+- **`purecdp.testing`** — `Page`, the agent surface (`snapshot`/`act`), stealth, frames, MCP.
+
+Jump to:
+
+- [1. Basics](#1-basics) · [2. Low-level protocol flows](#2-low-level-protocol-flows)
+- [3. Testing a frontend](#3-testing-a-frontend) · [4. Low-observability / stealth](#4-low-observability--stealth)
+- [5. Driving with an LLM (agent surface)](#5-driving-with-an-llm-agent-surface)
+- [6. Cross-origin iframes](#6-cross-origin-iframes) · [7. Connecting to a browser you didn't launch](#7-connecting-to-a-browser-you-didnt-launch)
+- [8. Grab bag](#8-grab-bag) · [What purecdp is good for](#what-purecdp-is-good-for)
+
+---
+
+## 1. Basics
+
+### The one-liner: `launched_page`
+
+`launched_page` launches a browser, hands you `(browser, page)` with the `Page`
+fully armed (Page/Runtime/Network enabled, console + network capture running),
+and always tears everything down.
+
+```python
+import asyncio
+from purecdp.testing import launched_page
+
+async def main():
+    async with launched_page() as (browser, page):   # finds Chromium/Chrome/Brave
+        await page.goto("https://example.com", wait="load")
+        print(await page.title())
+        print(await page.evaluate("document.querySelector('h1').textContent"))
+        await page.screenshot("example.png")
+
+asyncio.run(main())
+```
+
+`page.evaluate` awaits promises by default and raises `JSError` on an exception
+or rejection. `wait=` is `"load"` (default), `"idle"` (load + network quiet), or
+`"none"` (return as soon as navigation starts).
+
+### Waiting, clicking, reading
+
+```python
+async with launched_page() as (browser, page):
+    await page.goto("https://news.ycombinator.com", wait="idle")
+
+    await page.wait_for_selector(".titleline")
+    first = await page.text(".titleline a")          # textContent of the first match
+    count = await page.query_count(".titleline")
+    print(count, "stories; top:", first)
+
+    # hold an element, filtered by visible text, then click it
+    more = await page.query("a", containing="More", index=-1)
+    await more.click()
+```
+
+`query(...)` polls (riding out SPA re-renders), can filter by `containing=`
+(case-insensitive text, the `:has-text()` CDP never had), and picks by `index`
+(`-1` = newest, for apps that leave stale copies of a widget in the DOM).
+
+### Enumerating a set: `query_all`
+
+`query_all` returns *all* matches as held `Element`s (single-shot, no polling) —
+for iterating or filtering a group. Each is a real handle, so you can read
+properties off it and act on it without a stale-copy race.
+
+```python
+# every enabled chip, filtered by a live property read
+chips = await page.query_all("[data-testid=filter] button")
+enabled = [c for c in chips if not await c.eval("(el) => el.disabled")]
+await enabled[-1].mouse_click()
+
+# scoped to a held element, with a text filter (case-insensitive)
+card = await page.query(".react-flow__node", containing="caucasian")
+(remove_btn,) = await card.query_all("button", containing="remove")
+await remove_btn.mouse_click()
+```
+
+Use `query` for one element *with* waiting, `query_count` to just count, and
+`query_all` to work with the whole set.
+
+---
+
+## 2. Low-level protocol flows
+
+When you want the raw protocol — no `Page` opinions. You drive a `Session` with
+generated command objects and typed events. This is the whole library under the
+helpers.
+
+```python
+import asyncio
+import purecdp
+from purecdp.protocol import page, runtime
+
+async def main():
+    async with await purecdp.launch(headless=True) as browser:
+        session = await browser.new_page()           # create target + attach
+
+        await session.execute(page.enable())
+        # subscribe BEFORE triggering, or you race the event
+        waiter = asyncio.create_task(session.wait_for(page.LoadEventFired))
+        await asyncio.sleep(0)
+        await session.execute(page.navigate(url="https://example.com"))
+        await waiter
+
+        title, _details = await session.execute(
+            runtime.evaluate(expression="document.title", return_by_value=True))
+        print(title.value)
+
+asyncio.run(main())
+```
+
+### Event streams
+
+`session.listen(*types)` gives an async iterator of typed events; it only
+deserializes the events you asked for (the rest are dropped without ever being
+parsed — that's most of the throughput win).
+
+```python
+from purecdp.protocol import network
+
+async with await purecdp.launch() as browser:
+    session = await browser.new_page()
+    await session.execute(network.enable())
+
+    stream = session.listen(network.ResponseReceived, buffer_size=4096)
+    asyncio.create_task(drive_the_page(session))     # your navigation etc.
+    async for event in stream:
+        print(event.response.status, event.response.url)
+        if str(event.response.url).endswith("/done"):
+            break
+    stream.close()
+```
+
+### Auto-attach: popups, workers, OOPIFs
+
+`connection.set_auto_attach()` attaches child targets automatically (flat mode)
+and resumes paused ones for you.
+
+```python
+async with await purecdp.launch() as browser:
+    conn = browser.connection
+    await conn.set_auto_attach(wait_for_debugger=False)
+    # every new tab/popup/worker/iframe target now attaches on its own Session,
+    # reachable via conn.sessions; hook it with conn.add_session_hook(fn).
+```
+
+`pipe=True` on `launch` swaps the websocket for `--remote-debugging-pipe`
+(POSIX); everything above is identical over the pipe.
+
+---
+
+## 3. Testing a frontend
+
+### The stdlib way: `CDPTestCase`
+
+Each test gets a fresh browser, an isolated context, and `self.page`. Skips
+(doesn't fail) when no browser binary is found. Tests use plain `assert` — no
+`self.assertX`, and don't run under `-O`.
+
+```python
+from purecdp.testing import CDPTestCase
+
+class LoginTests(CDPTestCase):
+    async def test_shows_error_on_bad_password(self):
+        await self.page.goto("https://myapp.example/login", wait="idle")
+        await self.page.set_value("#email", "me@example.com")   # React-safe write
+        await self.page.set_value("#password", "wrong")
+        await self.page.query("button[type=submit]")            # wait for it
+        await self.page.click("button[type=submit]")
+        assert "Invalid" in await self.page.text(".error")
+        assert not self.page.js_errors                          # no uncaught JS
+```
+
+Prefer pytest? The optional plugin (never a dependency) provides `cdp_browser`
+/ `cdp_page` and runs `async def` tests itself:
+
+```python
+async def test_title(cdp_page):
+    await cdp_page.goto("data:text/html,<title>hi</title>")
+    assert await cdp_page.title() == "hi"
+```
+
+### Stub the network — assert on behavior, not a live backend
+
+```python
+class CartTests(CDPTestCase):
+    async def test_empty_cart(self):
+        # path-keyed mocks; a trailing "/" is a prefix match, anything else exact
+        await self.page.mock_api({
+            "/api/cart": {"items": []},
+            "/api/user/": lambda path: {"id": path.rsplit("/", 1)[-1]},
+        })
+        await self.page.goto("https://shop.example/cart", wait="idle")
+        await self.page.wait_for_selector("#empty-state")
+```
+
+For full control over a request, use `route()` directly:
+
+```python
+async def handler(request):
+    if request.method == "POST":
+        await request.fulfill(status=201, json={"ok": True})
+    else:
+        await request.abort()                # or request.continue_(url=...)
+await self.page.route("*/api/orders", handler)
+```
+
+### Assert on the traffic itself
+
+`page.record()` captures full exchanges (request body, status, response body)
+for URLs matching a filter — "assert on the traffic, not the DOM".
+
+```python
+rec = self.page.record(needle="/api/track")
+before = len(rec.exchanges)
+await self.page.click("#buy")
+ex = await rec.wait_for_next(before)         # blocks until the next match lands
+assert ex.request_json["event"] == "purchase"
+assert ex.status == 200
+```
+
+For a streamed (`text/event-stream`) response, `parse_sse` turns the captured
+body into events (any per-frame encoding — base64, JSON — is yours to decode):
+
+```python
+from purecdp.testing import parse_sse
+
+ex = await rec.wait_for_next(before)
+for event in parse_sse(ex.text):
+    if event.event == "done":
+        break
+    handle(event.data)
+```
+
+### Capture a download
+
+`page.expect_download()` catches a file download triggered inside the block and
+hands back the bytes — no writing to a real Downloads folder, no polling the
+disk.
+
+```python
+async with self.page.expect_download() as info:
+    await self.page.click("#export-csv")     # the trigger
+download = await info.value
+assert download.suggested_filename == "report.csv"
+rows = (await download.read()).decode().splitlines()
+assert len(rows) == expected_row_count
+# await download.save_as("out.csv")          # keep it, if you want
+```
+
+It enables downloads for the whole connection, so pair it with a browser/context
+you own (the `CDPTestCase` default); raises `DownloadError` on cancel/timeout.
+
+### Reuse a logged-in session across runs
+
+```python
+# once, after logging in:
+state = await page.storage_state()           # cookies + localStorage
+pathlib.Path("state.json").write_text(json.dumps(state))
+
+# later runs — skip the login flow entirely:
+await page.goto("https://myapp.example/")    # need the origin first for localStorage
+await page.set_storage_state(json.loads(pathlib.Path("state.json").read_text()))
+```
+
+Other testing niceties: `page.expect_navigation()` (await a click-triggered
+load without racing it), `page.expect_download()` (capture a download),
+`page.query_all()` (enumerate/filter a set of held elements),
+`page.handle_dialogs()` (auto-accept alerts/confirms), `page.seed_session_storage()`
+/ `add_init_script()` (plant state before the SPA boots), `page.console` /
+`page.js_errors` (always-on capture).
+
+---
+
+## 4. Low-observability / stealth
+
+Honest framing: these reduce common, cheap detection signals — **not** a promise
+of undetectability. CreepJS-class realm-diff fingerprinting and TLS/HTTP2 (JA3/
+JA4) signatures still identify automation; no init script touches the network
+stack. Treat it as "no cheap automation tells", not "invisible". Because purecdp
+drives a *real* browser, its TLS fingerprint is already authentically Chrome's.
+
+Three layers, strongest when combined:
+
+```python
+import purecdp
+from purecdp.testing import Page, apply_stealth
+
+async with await purecdp.launch(stealth=True) as browser:  # AutomationControlled off, headless=new
+    session = await browser.new_page()
+    # skip Runtime.enable — enabling it is itself detectable (isAutomatedWithCDP)
+    page = await Page.create(session, capture=False, track_network=False)
+    await apply_stealth(page)                              # fingerprint init-scripts, BEFORE goto
+    await page.goto("https://example.com")
+```
+
+Pick a subset and tune spoofed values:
+
+```python
+await apply_stealth(
+    page,
+    evasions=["navigator.webdriver", "webgl.vendor", "navigator.plugins"],
+    webgl_vendor="Intel Inc.",
+    webgl_renderer="Intel Iris OpenGL Engine",
+    languages=("en-GB", "en"),
+)
+```
+
+`workers=True` (default) injects the same patches into worker scope so a
+worker's WebGL/navigator values agree with the page's (a mismatch is a known
+tell). The opt-in extras — `navigator.maxTouchPoints`, `navigator.connection`,
+`function.toString` — need a deliberate choice (the last is itself a realm-diff
+tell) and are off by default.
+
+### Behavioral realism (the more durable signal)
+
+How input *moves* — all over trusted CDP Input events, not JS:
+
+```python
+el = await page.query("#submit")
+await el.human_click()                    # curved, eased path to a near-center point
+await page.human_type("hello@example.com")   # per-key events, human cadence
+await page.human_scroll(1200)             # eased wheel steps, not one jump
+```
+
+`page.cursor` is a stateful cursor whose position persists across moves.
+
+---
+
+## 5. Driving with an LLM (agent surface)
+
+`page.snapshot()` returns a compact, ref-tagged view built from the
+accessibility tree — small and stable enough to hand a model instead of raw HTML
+or a screenshot. Each control gets a ref (`e1`, `e2`, …); password fields are
+masked. `act()` performs one action on a ref; `element_for_ref()` is the escape
+hatch to the full `Element` API.
+
+```python
+snap = await page.snapshot()
+print(snap)
+# - RootWebArea "Login"
+#   - textbox "Email" [e1]
+#   - textbox "Password" = "••••••" [e2]
+#   - button "Sign in" [e3]
+
+await page.act("e1", "fill", text="me@example.com")   # click/hover/focus/fill/type/select/scroll
+await page.act("e3", "click")
+```
+
+`act(..., stable=True)` (the default) waits for the target to be actionable —
+visible, enabled, settled across animation frames, and not obscured — before it
+fires, raising `ActionabilityError` on timeout. It's the safety gate a model
+needs on real, animated pages. Pass `stable=False` to fire immediately.
+
+### Auto-dismiss cookie / consent banners
+
+```python
+page.add_auto_dismiss("#cookie-accept", ".consent button.agree")
+# banners matching these are clicked away while any stable action waits for its target
+await page.act("e5", "click")
+```
+
+### A minimal agent loop
+
+```python
+async def run_agent(page, model, goal):
+    await page.goto(goal["url"], wait="idle")
+    for _ in range(20):
+        snap = await page.snapshot()
+        step = await model.decide(goal["task"], str(snap))   # your LLM call
+        if step["action"] == "done":
+            return step.get("answer")
+        await page.act(step["ref"], step["action"],
+                       text=step.get("text"), values=step.get("values"))
+```
+
+### Expose it over MCP (no extra dependency)
+
+A stdlib JSON-RPC-over-stdio Model Context Protocol server wrapping the same
+surface. Tools: `navigate`, `snapshot`, `act`, and — off by default —
+`evaluate`.
+
+```sh
+python -m purecdp.mcp                 # headless; tools: navigate, snapshot, act
+python -m purecdp.mcp --headful       # visible window
+python -m purecdp.mcp --stealth       # low-observability launch
+python -m purecdp.mcp --allow-eval    # also expose arbitrary-JS evaluate (sharp edge)
+```
+
+`evaluate` runs arbitrary page JavaScript, so it's gated behind `--allow-eval`
+(neither advertised nor callable otherwise).
+
+---
+
+## 6. Cross-origin iframes
+
+A cross-origin (out-of-process) iframe runs in its own renderer with its own CDP
+session, so the page's JS can't reach into it. `page.frame(...)` correlates the
+`<iframe>` to that session and returns a `Frame` — the same
+query/evaluate/snapshot/act surface as `Page`, scoped inside the frame, with
+trusted Input routed to the frame's own session.
+
+```python
+from purecdp.testing import FrameNotFound
+
+async with launched_page() as (browser, page):
+    await page.goto("https://host.example/checkout", wait="idle")
+
+    # identify by CSS selector for the <iframe> (robust) or url= (fnmatch)
+    pay = await page.frame("iframe#payment", timeout=5)
+    await pay.query("input[name=card]")
+    await pay.evaluate("document.querySelector('input[name=card]').value = '4242...'")
+
+    # nest to any depth — auto-attach has already propagated down
+    inner = await pay.frame("iframe.threeds")
+```
+
+Only genuinely cross-origin iframes need this; same-origin frames stay reachable
+from the page's own JS. First `frame()` call arms flat auto-attach on the page;
+pages that never call it pay nothing.
+
+### One stitched snapshot across every frame
+
+`snapshot(cross_frame=True)` splices out-of-process iframes into a single
+outline, so a consent/payment iframe's controls appear inline and `act(ref)`
+reaches into them transparently — the agent never has to know a frame boundary
+was there.
+
+```python
+snap = await page.snapshot(cross_frame=True)
+print(snap)                       # controls from the top doc AND the OOPIFs, one tree
+await page.act("e7", "fill", text="4242424242424242")   # ref lived in the payment iframe
+```
+
+The default (`cross_frame=False`) is the plain single-frame snapshot with zero
+extra cost.
+
+---
+
+## 7. Connecting to a browser you didn't launch
+
+`connect()` attaches over CDP to an already-running browser — Chrome-in-Docker,
+a browserless / cloud session, or a local `chromium --remote-debugging-port=9222`.
+Unlike `launch`, it neither starts nor owns the browser: `aclose()` just detaches
+and leaves it running.
+
+```python
+import purecdp
+from purecdp.testing import Page
+
+# discover the endpoint via /json/version on host/port …
+async with await purecdp.connect(host="127.0.0.1", port=9222) as browser:
+    session = await browser.new_page()
+    page = await Page.create(session)
+    await page.goto("https://example.com")
+
+# … or pass a browser-level ws:// endpoint straight through:
+browser = await purecdp.connect("ws://127.0.0.1:9222/devtools/browser/abc123")
+```
+
+---
+
+## 8. Grab bag
+
+Handy one-liners drawn from the `Page` surface.
+
+```python
+# Isolated contexts (cheap per-scenario isolation — own cookies/storage)
+ctx = await browser.new_context()
+p1 = await Page.create(await browser.new_page(context=ctx))
+
+# Emulation
+await page.set_viewport(390, 844, device_scale_factor=3, mobile=True)
+await page.emulate_media(color_scheme="dark", reduced_motion="reduce")
+await page.set_geolocation(48.8566, 2.3522)
+await page.set_timezone("Europe/Paris")
+
+# PDF (headless only) and full-page screenshot
+await page.pdf("out.pdf", landscape=True, print_background=True)
+await page.screenshot("full.png", full_page=True)
+
+# Inject before the app boots
+await page.add_init_script("window.__TEST__ = true;")
+await page.add_style_tag(content="* { transition: none !important; }")  # kill animations
+
+# Keyboard: real key events (synthetic setters never type Enter)
+await (await page.query("#search")).focus()
+await page.insert_text("purecdp")
+await page.press("Enter")
+
+# Cookies
+await page.set_cookies([{"name": "sid", "value": "abc", "url": "https://x.example"}])
+```
+
+---
+
+## What purecdp is good for
+
+- **End-to-end / integration testing** of web frontends — `CDPTestCase` or the
+  pytest plugin, network stubbing, traffic assertions, isolated contexts. Zero
+  test dependencies.
+- **LLM browser agents** — the ref-tagged `snapshot`/`act` surface (plus the MCP
+  server) is purpose-built to hand a page to a model and let it act, across frame
+  boundaries.
+- **Scraping / automation that shouldn't advertise itself** — the stealth base +
+  behavioral realism, honestly scoped.
+- **Bots and flows over a real browser** — form filling, file uploads, PDF
+  generation, screenshotting, dialog handling.
+- **Driving cloud / remote browsers** — `connect()` to browserless, Docker, or any
+  `--remote-debugging-port` endpoint.
+- **A clean CDP substrate** — the sans-I/O engine + typed protocol bindings are a
+  dependency-free base to build your own higher-level tooling on.
+
+Not a goal: defeating mature anti-bot fingerprinting (see the stealth honesty
+note), or a synchronous / Selenium-style API — purecdp is asyncio-native.

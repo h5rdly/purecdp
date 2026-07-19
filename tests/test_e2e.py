@@ -1,0 +1,124 @@
+'''End-to-end smoke tests against a real Chromium-based browser.
+
+Skipped cleanly when no browser binary is available (see purecdp.browser
+CANDIDATES / $CDP_BROWSER). Extra launch flags can be injected with
+$PURECDP_E2E_ARGS (space-separated), e.g. sandboxed CI environments may need
+"--no-sandbox".
+
+Runnable three ways: `python -m unittest`, `python tests/test_e2e.py`,
+or `python -m pytest` — none require pytest. Plain asserts: don't run with -O.
+'''
+
+import asyncio
+import os
+import pathlib
+import sys
+import unittest
+
+_SRC = str(pathlib.Path(__file__).resolve().parents[1] / 'src')
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
+import purecdp  # noqa: E402
+from purecdp.protocol import browser as browser_domain  # noqa: E402
+from purecdp.protocol import network, page, runtime, storage, target  # noqa: E402
+
+BROWSER = purecdp.find_browser()
+EXTRA_ARGS = tuple(os.environ.get('PURECDP_E2E_ARGS', '').split())
+
+
+@unittest.skipUnless(BROWSER, 'no Chromium-based browser found')
+class EndToEndTests(unittest.IsolatedAsyncioTestCase):
+    async def test_websocket_evaluate_and_navigate(self):
+        async with asyncio.timeout(60):
+            async with await purecdp.launch(extra_args=EXTRA_ARGS) as browser:
+                session = await browser.new_page()
+                assert session.target_id is not None
+
+                # evaluate
+                result, exception_details = await session.execute(
+                    runtime.evaluate(expression='6 * 7', return_by_value=True))
+                assert exception_details is None
+                assert result.value == 42
+
+                # navigate + load event, subscribe-before-trigger
+                await session.execute(page.enable())
+                waiter = asyncio.create_task(
+                    session.wait_for(page.LoadEventFired, timeout=30))
+                await asyncio.sleep(0)
+                await session.execute(page.navigate(
+                    url='data:text/html,<title>purecdp</title>ok'))
+                await waiter
+                title, *_ = await session.execute(
+                    runtime.evaluate(expression='document.title',
+                                     return_by_value=True))
+                assert title.value == 'purecdp'
+
+    async def test_pipe_evaluate(self):
+        async with asyncio.timeout(60):
+            async with await purecdp.launch(pipe=True, extra_args=EXTRA_ARGS) as browser:
+                session = await browser.new_page()
+                result, exception_details = await session.execute(
+                    runtime.evaluate(expression='1 + 1', return_by_value=True))
+                assert exception_details is None
+                assert result.value == 2
+
+    async def test_contexts_isolation_and_close(self):
+        async with asyncio.timeout(60):
+            async with await purecdp.launch(extra_args=EXTRA_ARGS) as browser:
+                conn = browser.connection
+                async with await browser.new_context() as ctx_a:
+                    async with await browser.new_context() as ctx_b:
+                        page_a = await browser.new_page(context=ctx_a)
+                        page_b = await browser.new_page(context=ctx_b)
+                        # cookie isolation between contexts (Storage domain is
+                        # browser-level and context-scoped)
+                        await conn.execute(storage.set_cookies(
+                            [network.CookieParam(name='iso', value='A',
+                                                 url='https://example.com')],
+                            browser_context_id=browser_domain.BrowserContextID(
+                                ctx_a.context_id)))
+                        in_a = await conn.execute(storage.get_cookies(
+                            browser_context_id=browser_domain.BrowserContextID(
+                                ctx_a.context_id)))
+                        in_b = await conn.execute(storage.get_cookies(
+                            browser_context_id=browser_domain.BrowserContextID(
+                                ctx_b.context_id)))
+                        assert any(c.name == 'iso' for c in in_a)
+                        assert not any(c.name == 'iso' for c in in_b)
+                        # closing one page leaves the rest healthy
+                        await browser.close_page(page_a)
+                        while not page_a.closed:
+                            await asyncio.sleep(0.01)
+                        ok, *_ = await page_b.execute(runtime.evaluate(
+                            expression='2 + 2', return_by_value=True))
+                        assert ok.value == 4
+
+    async def test_auto_attach_resumes_popup(self):
+        async with asyncio.timeout(60):
+            async with await purecdp.launch(extra_args=EXTRA_ARGS) as browser:
+                conn = browser.connection
+                opener = await browser.new_page('data:text/html,opener')
+                await conn.set_auto_attach(wait_for_debugger=True)
+
+                waiter = asyncio.create_task(conn.wait_for(
+                    target.AttachedToTarget,
+                    predicate=lambda e: str(e.target_info.opener_id or '')
+                    == opener.target_id,
+                    timeout=30))
+                await asyncio.sleep(0)
+                await opener.execute(runtime.evaluate(
+                    expression="window.open('about:blank')", user_gesture=True))
+                attached = await waiter
+
+                popup = conn.sessions[str(attached.session_id)]
+                assert popup.target_id == str(attached.target_info.target_id)
+                # the popup attached paused; auto-resume must have run it,
+                # or this evaluate would hang
+                answer, *_ = await popup.execute(runtime.evaluate(
+                    expression='7 * 6', return_by_value=True))
+                assert answer.value == 42
+
+
+if __name__ == '__main__':
+    unittest.main()

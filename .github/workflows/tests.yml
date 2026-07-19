@@ -1,0 +1,135 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # purecdp drives a REAL Chromium; on CI it runs headless without user
+  # namespaces, so every launch needs --no-sandbox. Both vars matter:
+  # CDPTestCase reads $PURECDP_LAUNCH_ARGS, the raw-launch e2e tests
+  # (test_e2e / test_testing_e2e) read $PURECDP_E2E_ARGS. Setting both covers
+  # every launch path. Without a browser these tests skip cleanly, so the leg
+  # that installs one is what makes them actually run.
+  # --enable-unsafe-swiftshader gives headless glibc Chrome a software WebGL
+  # context so the stealth WebGL test verifies its spoof instead of skipping
+  # (recent Chrome gates SwiftShader behind it). Harmless where WebGL is still
+  # absent — that test then skips on its own.
+  PURECDP_E2E_ARGS: --no-sandbox --enable-unsafe-swiftshader
+  PURECDP_LAUNCH_ARGS: --no-sandbox --enable-unsafe-swiftshader
+
+jobs:
+  # Linux, Windows, macOS — a real glibc Chromium, the full suite incl. the
+  # browser e2e tests (goto/snapshot/stealth/OOPIF/downloads).
+  test-standard:
+    name: Test (${{ matrix.os }}, ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        # purecdp requires-python is >=3.14; 3.14t is the free-threaded build.
+        python-version: ['3.14', '3.14t']
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: ${{ endsWith(matrix.python-version, 't') }}
+
+      # A known-good Chromium for Testing, same on all three OSes. purecdp finds
+      # it via $CDP_BROWSER (checked before PATH and the bundled-app locations).
+      - uses: browser-actions/setup-chrome@v1
+        id: setup-chrome
+        with:
+          chrome-version: stable
+
+      - name: Point purecdp at the browser
+        shell: bash
+        run: echo "CDP_BROWSER=${{ steps.setup-chrome.outputs.chrome-path }}" >> "$GITHUB_ENV"
+
+      # Fail loudly here if the interpreter can't import purecdp or can't see the
+      # browser — a clear one-line story instead of every e2e test skipping and
+      # nobody noticing. (Tests bootstrap sys.path to ./src themselves; this
+      # ad-hoc import needs PYTHONPATH set.)
+      - name: Sanity — import and browser discovery
+        shell: bash
+        run: |
+          PYTHONPATH="$PWD/src" python -c "import purecdp; print('purecdp', purecdp.__version__, '| browser:', purecdp.find_browser())"
+
+      # Zero runtime deps: nothing to install, `discover` runs the whole suite
+      # straight from the checkout. -X faulthandler dumps every thread on a fatal
+      # fault. DO NOT add -O — the tests use plain `assert`.
+      - name: Run tests
+        if: runner.os != 'Linux'
+        timeout-minutes: 20
+        run: python -X faulthandler -m unittest discover tests
+
+      # On Linux, wrap in a watchdog so a wedged browser becomes a thread dump
+      # (SIGABRT -> faulthandler) instead of the job hanging to its hard limit.
+      - name: Run tests (watchdog)
+        if: runner.os == 'Linux'
+        timeout-minutes: 20
+        run: timeout -s ABRT 900 python -X faulthandler -m unittest discover tests
+
+  # Alpine / musl — apk's musl-native Chromium. The glibc Chrome-for-Testing
+  # binary the standard leg uses cannot run here, which is exactly why this leg
+  # earns its keep: it exercises purecdp against musl and a musl browser.
+  test-alpine:
+    name: Test (Alpine/musl)
+    runs-on: ubuntu-latest
+    container:
+      image: python:3.14-alpine
+    env:
+      # tiny /dev/shm in containers makes Chromium abort mid-load; keep it off
+      # the shm path in addition to the shared --no-sandbox.
+      PURECDP_E2E_ARGS: --no-sandbox --disable-dev-shm-usage
+      PURECDP_LAUNCH_ARGS: --no-sandbox --disable-dev-shm-usage
+    steps:
+      - uses: actions/checkout@v6
+
+      # chromium + the runtime libs it pulls; a font (ttf-freefont) because
+      # headless Chromium still aborts without one; git so actions/checkout uses
+      # git rather than the slower REST download.
+      - name: Install musl Chromium
+        run: apk add --no-cache chromium nss freetype harfbuzz ca-certificates ttf-freefont git
+
+      # No $CDP_BROWSER needed: apk puts `chromium` on PATH and find_browser()
+      # picks it up. Confirm it here.
+      - name: Sanity — import and browser discovery
+        run: |
+          PYTHONPATH="$PWD/src" python -c "import purecdp; print('purecdp', purecdp.__version__, '| browser:', purecdp.find_browser())"
+
+      - name: Run tests
+        timeout-minutes: 20
+        run: python -X faulthandler -m unittest discover tests
+
+  # FreeBSD — validates the pure-Python core on a non-Linux, non-glibc host: the
+  # sans-I/O engine, both transports, the protocol codegen and the parsers all
+  # import and pass. The browser e2e tests SKIP here (no Chromium): a full
+  # browser in the nested VM is heavy and flaky, and it isn't what FreeBSD is
+  # proving. To attempt real e2e too, add `chromium` to the pkg line, then set
+  # CDP_BROWSER and PURECDP_*_ARGS=--no-sandbox before the run.
+  test-freebsd:
+    name: Test (FreeBSD)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Test in FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: pkg install -y python314
+          run: |
+            python3.14 -c "import purecdp; print('purecdp', purecdp.__version__)" || exit 1
+            python3.14 -X faulthandler -m unittest discover tests
