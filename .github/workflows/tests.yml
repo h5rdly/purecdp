@@ -59,15 +59,19 @@ jobs:
         with:
           chrome-version: stable
 
-      # macOS: Chromium via Homebrew, then strip the Gatekeeper quarantine xattr
-      # so it launches headless without a first-launch notarization stall (the
-      # cause of the flaky Chrome-for-Testing). Modern brew dropped the
-      # --no-quarantine flag, so we remove the attribute explicitly.
-      - name: Install Chromium (macOS)
+      # macOS: (1) Chromium via Homebrew, then strip the Gatekeeper quarantine
+      # xattr so it launches headless without a first-launch notarization stall
+      # (modern brew dropped --no-quarantine, so remove the attr explicitly);
+      # (2) alias 127.0.0.2/.3 on lo0 — the cross-origin OOPIF tests use them as
+      # distinct sites, but macOS (BSD) only routes 127.0.0.1 by default, so the
+      # cross-site iframes hang the parent's load event (same as FreeBSD).
+      - name: Set up browser + loopback (macOS)
         if: runner.os == 'macOS'
         run: |
           brew install --cask chromium
           sudo xattr -dr com.apple.quarantine "/Applications/Chromium.app" || true
+          sudo ifconfig lo0 alias 127.0.0.2 up || true
+          sudo ifconfig lo0 alias 127.0.0.3 up || true
 
       - name: Point purecdp at the browser
         shell: bash
