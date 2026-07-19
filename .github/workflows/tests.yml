@@ -59,11 +59,15 @@ jobs:
         with:
           chrome-version: stable
 
-      # macOS: Chromium via Homebrew, --no-quarantine so it launches headless
-      # without the Gatekeeper stall that made Chrome-for-Testing flaky here.
+      # macOS: Chromium via Homebrew, then strip the Gatekeeper quarantine xattr
+      # so it launches headless without a first-launch notarization stall (the
+      # cause of the flaky Chrome-for-Testing). Modern brew dropped the
+      # --no-quarantine flag, so we remove the attribute explicitly.
       - name: Install Chromium (macOS)
         if: runner.os == 'macOS'
-        run: brew install --cask chromium --no-quarantine
+        run: |
+          brew install --cask chromium
+          sudo xattr -dr com.apple.quarantine "/Applications/Chromium.app" || true
 
       - name: Point purecdp at the browser
         shell: bash
