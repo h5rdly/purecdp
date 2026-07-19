@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# Least privilege by default; the publish job elevates for itself.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build
+
+      - name: Build
+        run: python -m build --outdir dist/
+
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(ls dist/*.whl | sed -E 's|.*/purecdp-([^-]+)-.*|\1|')"
+          echo "tag=$tag  package=$pkg"
+          test "$tag" = "$pkg" || { echo "::error::tag v$tag != package version $pkg — bump purecdp.__version__"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: purecdp-dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI + GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: write   # create the GitHub Release
+      id-token: write   # PyPI trusted publishing (OIDC) — no API token/secret needed
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: purecdp-dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

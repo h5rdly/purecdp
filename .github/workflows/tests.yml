@@ -136,7 +136,18 @@ jobs:
         with:
           usesh: true
           prepare: |
-            pkg install -y python314 chromium
+            # Point the ports repo at the QUARTERLY branch: chromium is reliably
+            # built there, while `latest` (the VM default) intermittently drops
+            # it after an upstream build break 
+            mkdir -p /usr/local/etc/pkg/repos
+            cat > /usr/local/etc/pkg/repos/FreeBSD-ports.conf <<'EOF'
+            FreeBSD-ports: { url: "pkg+https://pkg.freebsd.org/${ABI}/quarterly" }
+            EOF
+            pkg update -f
+            pkg install -y python314
+            # best-effort: if chromium is still unavailable, the browser e2e
+            # tests skip (find_browser -> None) and the pure suite still runs.
+            pkg install -y chromium || echo "::warning::chromium unavailable in pkg; FreeBSD browser e2e will skip"
             mount -t procfs proc /proc || true
             mount -t fdescfs fdesc /dev/fd || true
             ifconfig lo0 alias 127.0.0.2/32 || true

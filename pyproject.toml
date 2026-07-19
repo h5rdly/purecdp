@@ -1,11 +1,26 @@
+[build-system]
+requires = ["setuptools>=83"]
+build-backend = "setuptools.build_meta"
+
+
 [project]
 name = "purecdp"
-version = "0.1.0"
+dynamic = ["version"]                                # single source: purecdp.__version__
 description = "Vanilla Python Chrome DevTools Protocol. Optional dependencies for accelerated performance"
-readme = "README.md"
+readme = "Readme.md"   # exact on-disk case — GitHub's Linux runner is case-sensitive
 license = "0BSD"
 requires-python = ">=3.14"
 
+
+keywords = [
+    "cdp", "chrome-devtools-protocol", "chromium", "browser", "devtools", "browser-automation", 
+]
+classifiers = [
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+]
 
 [project.optional-dependencies]
 faster = [
@@ -15,5 +30,17 @@ faster = [
     "winloop>=0.6; platform_system == 'Windows'",  # faster event loop (Windows)
 ]
 
+[project.urls]
+Homepage = "https://github.com/h5rdly/purecdp"
+
 [project.entry-points.pytest11]
 purecdp = "purecdp.testing.pytest_plugin"
+
+[tool.setuptools.dynamic]
+version = { attr = "purecdp.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+purecdp = ["py.typed"]
