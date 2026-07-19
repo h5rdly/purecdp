@@ -118,23 +118,33 @@ jobs:
         timeout-minutes: 20
         run: python -X faulthandler -m unittest discover tests
 
-  # FreeBSD — validates the pure-Python core on a non-Linux, non-glibc host: the
-  # sans-I/O engine, both transports, the protocol codegen and the parsers all
-  # import and pass. The browser e2e tests SKIP here (no Chromium): a full
-  # browser in the nested VM is heavy and flaky, and it isn't what FreeBSD is
-  # proving. To attempt real e2e too, add `chromium` to the pkg line, then set
-  # CDP_BROWSER and PURECDP_*_ARGS=--no-sandbox before the run.
+  # FreeBSD — the FULL suite incl. browser e2e, against a real Chromium in the VM
+  # (a non-Linux, non-glibc host). FreeBSD Chromium needs procfs + fdescfs
+  # mounted and headless flags; the cross-origin OOPIF tests use 127.0.0.2/.3 as
+  # distinct sites, which FreeBSD's lo0 doesn't route by default (Linux treats
+  # all of 127/8 as loopback), so alias them. Root-needing setup goes in
+  # `prepare` (guaranteed root); `run` just sets env and runs. Same recipe as
+  # tests/freebsd_gauntlet.py (the local QEMU counterpart).
   test-freebsd:
     name: Test (FreeBSD)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Test in FreeBSD VM
+        timeout-minutes: 50   # chromium is a large pkg; the VM's download is slow
         uses: vmactions/freebsd-vm@v1
         with:
           usesh: true
-          prepare: pkg install -y python314
+          prepare: |
+            pkg install -y python314 chromium
+            mount -t procfs proc /proc || true
+            mount -t fdescfs fdesc /dev/fd || true
+            ifconfig lo0 alias 127.0.0.2/32 || true
+            ifconfig lo0 alias 127.0.0.3/32 || true
           run: |
             export PYTHONPATH=src   # src layout: the sanity import needs it (discover self-bootstraps)
-            python3.14 -c "import purecdp; print('purecdp', purecdp.__version__)" || exit 1
-            python3.14 -X faulthandler -m unittest discover tests
+            export CDP_BROWSER="$(command -v chrome || command -v chromium)"
+            export PURECDP_E2E_ARGS="--no-sandbox --disable-dev-shm-usage --disable-gpu"
+            export PURECDP_LAUNCH_ARGS="--no-sandbox --disable-dev-shm-usage --disable-gpu"
+            python3.14 -c "import purecdp; print('purecdp', purecdp.__version__, '| browser:', purecdp.find_browser())" || exit 1
+            python3.14 -X faulthandler -c "import faulthandler, sys, unittest; faulthandler.dump_traceback_later(600, exit=True); sys.exit(not unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.discover('tests')).wasSuccessful())"

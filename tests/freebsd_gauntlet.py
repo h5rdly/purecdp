@@ -1,7 +1,7 @@
 '''Run the purecdp test suite on FreeBSD under QEMU/KVM, WITH a real Chromium —
-no root required. This is the full-e2e counterpart to the CI FreeBSD leg (which
-skips the browser); here Chrome is installed in the guest so goto/snapshot/
-stealth/OOPIF/download tests actually run on FreeBSD.
+no root required. The local (QEMU) counterpart to the CI FreeBSD leg: the same
+recipe (python314 + chromium + procfs/fdescfs + lo0 127.0.0.2/.3 aliases), but
+reusing a cached image so you can iterate offline and debug interactively.
 
 Modelled on checkdisk's freebsd_gauntlet.py; the same hard-won bits apply:
 

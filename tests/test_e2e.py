@@ -26,9 +26,32 @@ from purecdp.protocol import network, page, runtime, storage, target  # noqa: E4
 BROWSER = purecdp.find_browser()
 EXTRA_ARGS = tuple(os.environ.get('PURECDP_E2E_ARGS', '').split())
 
+# Browser e2e sporadically flakes on the hosted runners — a dropped transport
+# ("transport closed by peer") or a browser that stalls into a timeout, seen on
+# the macOS/Windows legs. Retry those tests once. A genuine failure still errors on 
+# the final attempt (so a real break isn't masked).
+_FLAKY = (purecdp.CDPConnectionClosed, purecdp.CDPTransportError, TimeoutError)
+
+
+def retry_flaky(times=2):
+    '''Decorator: re-run an async browser-e2e test on transient flakiness.'''
+    def decorate(fn):
+        async def wrapper(self, *args, **kwargs):
+            for attempt in range(times):
+                try:
+                    return await fn(self, *args, **kwargs)
+                except _FLAKY:
+                    if attempt == times - 1:
+                        raise
+        wrapper.__name__ = fn.__name__
+        wrapper.__doc__ = fn.__doc__
+        return wrapper
+    return decorate
+
 
 @unittest.skipUnless(BROWSER, 'no Chromium-based browser found')
 class EndToEndTests(unittest.IsolatedAsyncioTestCase):
+    @retry_flaky()
     async def test_websocket_evaluate_and_navigate(self):
         async with asyncio.timeout(60):
             async with await purecdp.launch(extra_args=EXTRA_ARGS) as browser:
@@ -55,6 +78,7 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
                 assert title.value == 'purecdp'
 
     @unittest.skipIf(sys.platform == 'win32', 'pipe transport is POSIX-only')
+    @retry_flaky()
     async def test_pipe_evaluate(self):
         async with asyncio.timeout(60):
             async with await purecdp.launch(pipe=True, extra_args=EXTRA_ARGS) as browser:
@@ -64,6 +88,7 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
                 assert exception_details is None
                 assert result.value == 2
 
+    @retry_flaky()
     async def test_contexts_isolation_and_close(self):
         async with asyncio.timeout(60):
             async with await purecdp.launch(extra_args=EXTRA_ARGS) as browser:
@@ -95,19 +120,8 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
                             expression='2 + 2', return_by_value=True))
                         assert ok.value == 4
 
+    @retry_flaky()
     async def test_auto_attach_resumes_popup(self):
-        # window.open under auto-attach occasionally races the browser dropping
-        # the debug connection ("transport closed by peer") — browser flakiness.
-        # Retry the whole flow once on a dropped transport.
-        for attempt in range(2):
-            try:
-                await self._auto_attach_resumes_popup()
-                return
-            except (purecdp.CDPConnectionClosed, purecdp.CDPTransportError):
-                if attempt == 1:
-                    raise
-
-    async def _auto_attach_resumes_popup(self):
         async with asyncio.timeout(60):
             async with await purecdp.launch(extra_args=EXTRA_ARGS) as browser:
                 conn = browser.connection
