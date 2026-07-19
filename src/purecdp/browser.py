@@ -61,7 +61,10 @@ STEALTH_ARGS = (
 
 def find_browser() -> str | None:
     '''Locate a Chromium-based binary: $CDP_BROWSER, then PATH, then known
-    bundle locations. Returns None if nothing is found.'''
+    bundle locations. Returns None if nothing is found '''
+    
+    if os.environ.get('PURECDP_NO_BROWSER'):
+        return None
     env = os.environ.get('CDP_BROWSER')
     if env:
         return env

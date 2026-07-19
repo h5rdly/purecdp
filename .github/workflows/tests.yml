@@ -27,8 +27,13 @@ env:
   PURECDP_LAUNCH_ARGS: --no-sandbox --enable-unsafe-swiftshader
 
 jobs:
-  # Linux, Windows, macOS — a real glibc Chromium, the full suite incl. the
-  # browser e2e tests (goto/snapshot/stealth/OOPIF/downloads).
+  # Linux + Windows install Chrome for Testing; macOS installs Chromium via
+  # Homebrew WITH --no-quarantine. (The runner's Chrome-for-Testing stalls
+  # headless launch on macOS — a Gatekeeper-quarantine symptom: a quarantined
+  # .app's first launch triggers a notarization check that hangs a headless
+  # process. Stripping the quarantine xattr is the fix.) All three then run the
+  # FULL suite incl. browser e2e. Fallback if macOS still misbehaves: set
+  # PURECDP_NO_BROWSER on it (find_browser -> None) to run the pure suite only.
   test-standard:
     name: Test (${{ matrix.os }}, ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
@@ -47,28 +52,43 @@ jobs:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: ${{ endsWith(matrix.python-version, 't') }}
 
-      # A known-good Chromium for Testing, same on all three OSes. purecdp finds
-      # it via $CDP_BROWSER (checked before PATH and the bundled-app locations).
+      # Linux/Windows: a known-good Chrome for Testing.
       - uses: browser-actions/setup-chrome@v1
         id: setup-chrome
+        if: runner.os != 'macOS'
         with:
           chrome-version: stable
 
+      # macOS: Chromium via Homebrew, --no-quarantine so it launches headless
+      # without the Gatekeeper stall that made Chrome-for-Testing flaky here.
+      - name: Install Chromium (macOS)
+        if: runner.os == 'macOS'
+        run: brew install --cask chromium --no-quarantine
+
       - name: Point purecdp at the browser
         shell: bash
-        run: echo "CDP_BROWSER=${{ steps.setup-chrome.outputs.chrome-path }}" >> "$GITHUB_ENV"
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            echo "CDP_BROWSER=/Applications/Chromium.app/Contents/MacOS/Chromium" >> "$GITHUB_ENV"
+          else
+            echo "CDP_BROWSER=${{ steps.setup-chrome.outputs.chrome-path }}" >> "$GITHUB_ENV"
+          fi
 
-      # Fail loudly here if the interpreter can't import purecdp or can't see the
-      # browser — a clear one-line story instead of every e2e test skipping and
-      # nobody noticing. (Tests bootstrap sys.path to ./src themselves; this
-      # ad-hoc import needs PYTHONPATH set.)
-      - name: Sanity — import, browser discovery, and a launch smoke
+      # Import + browser discovery — a clear one-line story.
+      - name: Sanity — import and browser discovery
         shell: bash
-        timeout-minutes: 3
         run: |
           export PYTHONPATH="$PWD/src"
           python -c "import purecdp; print('purecdp', purecdp.__version__, '| browser:', purecdp.find_browser())"
 
+      # Actually launch + close the browser: turns a broken/stalling browser
+      # (incl. a still-misbehaving macOS Chromium) into a fast, clear failure
+      # here instead of a silent death in the test step.
+      - name: Launch smoke
+        shell: bash
+        timeout-minutes: 3
+        run: |
+          export PYTHONPATH="$PWD/src"
           python -c "import asyncio, purecdp; loop = asyncio.new_event_loop(); b = loop.run_until_complete(purecdp.launch(extra_args=('--no-sandbox',))); loop.run_until_complete(b.aclose()); print('launch smoke: OK')"
 
       # Zero runtime deps: `discover` runs the whole suite straight from the
