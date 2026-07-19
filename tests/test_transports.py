@@ -114,6 +114,7 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
             raise AssertionError('expected CDPTransportError')
 
 
+@unittest.skipIf(sys.platform == 'win32', 'pipe transport is POSIX-only')
 class PipeTests(unittest.IsolatedAsyncioTestCase):
     async def _spawn_echo(self):
         return await spawn_pipe_process([sys.executable, '-c', PIPE_ECHO_CHILD])

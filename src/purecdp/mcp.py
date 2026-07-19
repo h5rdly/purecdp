@@ -198,15 +198,12 @@ class MCPServer:
 
 
 async def serve_stdio(server: MCPServer) -> None:
-    '''Run ``server`` over stdin/stdout (newline-delimited JSON-RPC).'''
+    '''Run ``server`` over stdin/stdout (newline-delimited JSON-RPC) '''
     loop = asyncio.get_running_loop()
-    reader = asyncio.StreamReader()
-    await loop.connect_read_pipe(
-        lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
     try:
         while True:
-            line = await reader.readline()
-            if not line:
+            line = await loop.run_in_executor(None, sys.stdin.readline)
+            if not line:  # EOF
                 break
             line = line.strip()
             if not line:

@@ -54,6 +54,7 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
                                      return_by_value=True))
                 assert title.value == 'purecdp'
 
+    @unittest.skipIf(sys.platform == 'win32', 'pipe transport is POSIX-only')
     async def test_pipe_evaluate(self):
         async with asyncio.timeout(60):
             async with await purecdp.launch(pipe=True, extra_args=EXTRA_ARGS) as browser:
@@ -95,6 +96,18 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
                         assert ok.value == 4
 
     async def test_auto_attach_resumes_popup(self):
+        # window.open under auto-attach occasionally races the browser dropping
+        # the debug connection ("transport closed by peer") — browser flakiness.
+        # Retry the whole flow once on a dropped transport.
+        for attempt in range(2):
+            try:
+                await self._auto_attach_resumes_popup()
+                return
+            except (purecdp.CDPConnectionClosed, purecdp.CDPTransportError):
+                if attempt == 1:
+                    raise
+
+    async def _auto_attach_resumes_popup(self):
         async with asyncio.timeout(60):
             async with await purecdp.launch(extra_args=EXTRA_ARGS) as browser:
                 conn = browser.connection

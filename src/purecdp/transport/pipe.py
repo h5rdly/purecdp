@@ -8,9 +8,7 @@ portable path.
 
 from __future__ import annotations
 
-import asyncio
-import os
-import typing
+import asyncio, os, sys, typing
 from contextlib import suppress
 
 from ..errors import CDPTransportError
@@ -94,6 +92,11 @@ async def spawn_pipe_process(
     preexec_fn, after fork — clobbering 3/4 in the *child* is safe), and
     returns the process plus a connected :class:`PipeTransport`.
     '''
+    if sys.platform == 'win32':
+        raise CDPTransportError(
+            'the pipe transport is POSIX-only (needs fd 3/4 plumbing via '
+            'preexec_fn); use the websocket transport (launch(pipe=False)) '
+            'on Windows')
     child_read, we_write = os.pipe()  # child fd 3: reads what we write
     we_read, child_write = os.pipe()  # child fd 4: writes what we read
     os.set_inheritable(child_read, True)
