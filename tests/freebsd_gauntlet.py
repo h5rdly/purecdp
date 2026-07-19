@@ -41,7 +41,7 @@ import subprocess
 import sys
 import time
 
-REPO = os.path.dirname(os.path.abspath(__file__))
+REPO = __file__.replace('\\', '/').rsplit('/', 2)[0]
 CACHE = os.environ.get('FREEBSD_GAUNTLET_DIR',
                        os.path.expanduser('~/.cache/freebsd-gauntlet'))
 DEFAULT_VERSION = '15.1'

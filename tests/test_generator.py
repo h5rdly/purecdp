@@ -100,13 +100,13 @@ class EmitTests(unittest.TestCase):
         import purecdp.protocol
 
         out_dir = pathlib.Path(purecdp.protocol.__file__).parent
-        pin = (SPEC_DIR / 'PIN').read_text().split()[0][:12]
+        pin = (SPEC_DIR / 'PIN').read_text(encoding='utf-8').split()[0][:12]
         files = emit.emit_all(get_spec(), pin=pin)
         on_disk = {p.name for p in out_dir.glob('*.py')}
         assert on_disk == set(files)
         for name, source in files.items():
             with self.subTest(module=name):
-                assert (out_dir / name).read_text() == source, (
+                assert (out_dir / name).read_text(encoding='utf-8') == source, (
                     f'{name} is stale — rerun the generator'
                 )
 

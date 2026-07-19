@@ -5,11 +5,10 @@ Runnable three ways: `python -m unittest`, `python tests/test_testing.py`,
 or `python -m pytest` — none require pytest. Plain asserts: don't run with -O.
 '''
 
-import asyncio
-import base64
-import pathlib
-import sys
+import asyncio, base64, pathlib, sys
 import unittest
+from unittest import mock
+
 
 _SRC = str(pathlib.Path(__file__).resolve().parents[1] / 'src')
 if _SRC not in sys.path:
@@ -23,6 +22,7 @@ except ImportError:
 import purecdp  # noqa: E402
 from purecdp import Connection  # noqa: E402
 from purecdp.testing import JSError, NavigateError, Page  # noqa: E402
+
 
 EXCEPTION_DETAILS = {
     'exceptionId': 1, 'text': 'Uncaught', 'lineNumber': 3, 'columnNumber': 7,
@@ -186,12 +186,13 @@ class InterceptTests(PageTestBase):
             raise RuntimeError('oops')
 
         await self.page.route('*', handler)
-        import warnings
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter('always')
+        # patch warnings.warn at the call site (context/thread independent) rather than 
+        # catch_warnings, which can miss it on the free-threaded build.
+        
+        with mock.patch('warnings.warn') as warn:
             self.transport.push(self.paused_event('R5', 'https://x/thing'))
             await drain()
-        assert any('route handler failed' in str(w.message) for w in caught)
+        assert any('route handler failed' in str(c.args[0]) for c in warn.call_args_list if c.args)
         assert self.sent('Fetch.continueRequest')[0]['params']['requestId'] == 'R5'
 
 

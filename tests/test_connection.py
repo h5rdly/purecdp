@@ -5,12 +5,8 @@ Runnable three ways: `python -m unittest`, `python tests/test_connection.py`,
 or `python -m pytest` — none require pytest. Plain asserts: don't run with -O.
 '''
 
-import asyncio
-import pathlib
-import sys
-import unittest
-import warnings
-
+import asyncio, pathlib, sys, warnings, unittest
+from unittest import mock
 _SRC = str(pathlib.Path(__file__).resolve().parents[1] / 'src')
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
@@ -143,16 +139,14 @@ class EventDispatchTests(unittest.IsolatedAsyncioTestCase):
         # a listener wanting only LoadEventFired; push a *different* known
         # event whose payload would raise on parse. Eager parsing would emit a
         # ProtocolDriftWarning — silence proves the dispatcher skipped it.
-        import warnings
         transport = FakeTransport(scripted_browser)
         async with Connection(transport) as conn:
             with conn.listen(page.LoadEventFired) as stream:
-                with warnings.catch_warnings(record=True) as caught:
-                    warnings.simplefilter('always')
+                with mock.patch('warnings.warn') as warn:
                     transport.push({'method': 'Page.frameStartedLoading',
                                     'params': {}})  # missing required frameId
                     await drain()
-                assert caught == []  # never parsed → no drift warning
+                assert warn.call_count == 0  # never parsed → no drift warning
                 # the wanted event still flows and parses fine
                 transport.push({'method': 'Page.loadEventFired',
                                 'params': {'timestamp': 9.0}})
@@ -215,13 +209,15 @@ class EventDispatchTests(unittest.IsolatedAsyncioTestCase):
         transport = FakeTransport()
         async with Connection(transport) as conn:
             with conn.listen(buffer_size=2) as stream:
-                with warnings.catch_warnings(record=True) as caught:
-                    warnings.simplefilter('always')
+                # on the free-threaded build warnings state is context-scoped, so the
+                # warning escapes catch_warnings. Patch warnings.warn at the call
+                # site instead, which is context/thread independent.
+                with mock.patch('warnings.warn') as warn:
                     for ts in (1.0, 2.0, 3.0):
                         transport.push({'method': 'Page.loadEventFired',
                                         'params': {'timestamp': ts}})
                     await drain()
-                assert any('dropping oldest' in str(w.message) for w in caught)
+                assert any('dropping oldest' in str(c.args[0]) for c in warn.call_args_list if c.args)
                 first = await anext(stream)
                 second = await anext(stream)
             assert (first.timestamp, second.timestamp) == (2.0, 3.0)

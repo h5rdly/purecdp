@@ -62,25 +62,29 @@ jobs:
       # browser — a clear one-line story instead of every e2e test skipping and
       # nobody noticing. (Tests bootstrap sys.path to ./src themselves; this
       # ad-hoc import needs PYTHONPATH set.)
-      - name: Sanity — import and browser discovery
+      - name: Sanity — import, browser discovery, and a launch smoke
         shell: bash
+        timeout-minutes: 3
         run: |
-          PYTHONPATH="$PWD/src" python -c "import purecdp; print('purecdp', purecdp.__version__, '| browser:', purecdp.find_browser())"
+          export PYTHONPATH="$PWD/src"
+          python -c "import purecdp; print('purecdp', purecdp.__version__, '| browser:', purecdp.find_browser())"
 
-      # Zero runtime deps: nothing to install, `discover` runs the whole suite
-      # straight from the checkout. -X faulthandler dumps every thread on a fatal
-      # fault. DO NOT add -O — the tests use plain `assert`.
+          python -c "import asyncio, purecdp; loop = asyncio.new_event_loop(); b = loop.run_until_complete(purecdp.launch(extra_args=('--no-sandbox',))); loop.run_until_complete(b.aclose()); print('launch smoke: OK')"
+
+      # Zero runtime deps: `discover` runs the whole suite straight from the
+      # checkout. faulthandler.dump_traceback_later() is a PORTABLE watchdog —
+      # after 600s it dumps EVERY thread's traceback and hard-exits, so a wedged
+      # browser/test becomes a diagnosis on every OS (the mac/Windows legs had
+      # none before — only Linux got `timeout -s ABRT`, so a hang there died
+      # silently at the 20-min wall). verbosity=2 also names each test as it
+      # starts. NEVER add -O — the tests use plain `assert`.
       - name: Run tests
-        if: runner.os != 'Linux'
         timeout-minutes: 20
-        run: python -X faulthandler -m unittest discover tests
-
-      # On Linux, wrap in a watchdog so a wedged browser becomes a thread dump
-      # (SIGABRT -> faulthandler) instead of the job hanging to its hard limit.
-      - name: Run tests (watchdog)
-        if: runner.os == 'Linux'
-        timeout-minutes: 20
-        run: timeout -s ABRT 900 python -X faulthandler -m unittest discover tests
+        run: >-
+          python -X faulthandler -c "import faulthandler, sys, unittest;
+          faulthandler.dump_traceback_later(600, exit=True);
+          sys.exit(not unittest.TextTestRunner(verbosity=2).run(
+          unittest.defaultTestLoader.discover('tests')).wasSuccessful())"
 
   # Alpine / musl — apk's musl-native Chromium. The glibc Chrome-for-Testing
   # binary the standard leg uses cannot run here, which is exactly why this leg
@@ -131,5 +135,6 @@ jobs:
           usesh: true
           prepare: pkg install -y python314
           run: |
+            export PYTHONPATH=src   # src layout: the sanity import needs it (discover self-bootstraps)
             python3.14 -c "import purecdp; print('purecdp', purecdp.__version__)" || exit 1
             python3.14 -X faulthandler -m unittest discover tests

@@ -41,8 +41,8 @@ def main(argv: list[str] | None = None) -> int:
     changed = 0
     for name, source in sorted(files.items()):
         path = args.out / name
-        if not path.is_file() or path.read_text() != source:
-            path.write_text(source)
+        if not path.is_file() or path.read_text(encoding='utf-8') != source:
+            path.write_text(source, encoding='utf-8')
             changed += 1
     print(f'{len(spec.domains)} domains -> {len(files)} files '
           f'({changed} written) in {args.out}')

@@ -444,7 +444,7 @@ class M7FeatureE2ETests(CDPTestCase):
         await el.set_input_files(tmp)
         assert await self.page.evaluate(
             "document.getElementById('f').files[0].name") \
-            == tmp.rsplit('/', 1)[-1]
+            == tmp.replace('\\', '/').rsplit('/', 1)[-1]  
         os.unlink(tmp)
 
     async def test_dialogs_auto_handled(self):

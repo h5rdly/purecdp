@@ -162,7 +162,7 @@ def load(paths: list[pathlib.Path]) -> Spec:
     versions: set[str] = set()
     seen: set[str] = set()
     for path in paths:
-        raw = json.loads(path.read_text())
+        raw = json.loads(path.read_text(encoding='utf-8'))
         versions.add('{major}.{minor}'.format(**raw['version']))
         for dom_obj in raw['domains']:
             dom = Domain.parse(dom_obj)
