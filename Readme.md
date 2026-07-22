@@ -9,8 +9,7 @@ Three things, layered:
 2. **`purecdp` core** — sans-I/O protocol engine + asyncio transports (websocket / pipe) + browser launcher.
 3. **`purecdp.testing`** — opinionated helpers for driving a browser in tests, incl. a pytest plugin.
 
-See [Examples.md](Examples.md) for task-grouped recipes (basics, testing, stealth, LLM agents, frames),
-[DESIGN.md](DESIGN.md) for architecture and rationale, and [ROADMAP.md](ROADMAP.md) for work order and status.
+See [Examples.md](Examples.md) for task-grouped recipes (basics, testing, stealth, LLM agents, frames).
 
 ## Quickstart
 
@@ -68,7 +67,23 @@ class MyAppTests(CDPTestCase):
 `page.route()` request stubbing/rewriting/aborting. For traffic-level
 assertions there's `page.record()` (full request/response exchanges, with
 `parse_sse()` for streamed bodies) and `page.expect_download()` (capture a
-download's bytes without touching disk).
+download's bytes without touching disk). And when a test fails, its pages
+are dumped as diagnostic artifacts — screenshot, HTML, console, recorded
+traffic, traceback — under `purecdp-artifacts/<test id>/` before the browser
+closes; green tests write nothing.
+
+For SPA-proof tests there are lazy locators: `page.live(selector)` and
+`get_by_test_id` / `get_by_text` / `get_by_role` / `get_by_label` hold the
+*query*, not a node — every action re-resolves against the current DOM (a
+React remount can't leave you a stale handle), auto-waits for actionability,
+and one `.should(...)` gives polling assertions:
+
+```python
+await page.get_by_test_id("chat-input").fill("hello")
+await page.get_by_role("button", name="Send").click()
+await page.live(".msg", containing="hello").should(visible=True, count=1)
+await page.live(".spinner").should(count=0)          # waits until it's gone
+```
 
 Prefer pytest? The optional plugin (auto-registered when installed, or
 `-p purecdp.testing.pytest_plugin`) provides a session-scoped `cdp_browser`

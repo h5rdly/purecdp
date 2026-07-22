@@ -31,7 +31,8 @@ from ..protocol import network as network_proto
 from ..protocol import page as page_proto
 from ..protocol import runtime as runtime_proto
 from . import _agent
-from .element import Element, _elements_from_array, _query_all_js, _query_js
+from .element import Element, ElementQueries
+from .live import LiveFactories
 from .snapshot import Snapshot
 from .intercept import Handler, InterceptedRequest, Route, match_route
 from .recorder import NetworkRecorder
@@ -150,7 +151,7 @@ def _remote_text(obj: typing.Any) -> str:
     return str(obj.type)
 
 
-class Page:
+class Page(ElementQueries, LiveFactories):
     '''High-level page driver for tests. See Page.create().'''
 
     def __init__(self, session: Session, default_timeout: float):
@@ -166,6 +167,8 @@ class Page:
         self._last_network_activity = 0.0
         self._tasks: list[asyncio.Task] = []
         self._streams: list[EventStream] = []
+        #: NetworkRecorders started via record(); artifacts-on-failure dumps them.
+        self._recorders: list[NetworkRecorder] = []
         self._routes: list[Route] = []
         self._intercepting = False
         self._cursor: typing.Any = None
@@ -421,68 +424,8 @@ class Page:
             f'document.querySelector({json.dumps(selector)}) !== null',
             timeout=timeout, poll=poll)
 
-    # -- element handles -----------------------------------------------------
-
-    async def query(
-        self,
-        selector: str,
-        *,
-        containing: str | None = None,
-        index: int = 0,
-        timeout: float | None = None,
-        poll: float = 0.05,
-        required: bool = True,
-    ) -> Element | None:
-        '''Wait for and hold an element: CSS selector, optionally filtered to
-        those whose textContent contains ``containing`` (case-insensitive —
-        the :has-text() CDP never had), picked by ``index`` (-1 = newest/last,
-        for apps that keep stale copies of widgets in the DOM). Polling rides
-        out framework re-renders; raises TimeoutError with the selector in
-        the message unless ``required=False`` (presence probes).'''
-        js = _query_js('document', selector, containing, index)
-        try:
-            async with asyncio.timeout(timeout or self.default_timeout):
-                while True:
-                    result = await self.evaluate(
-                        f'({js})(document)', return_by_value=False)
-                    if result.object_id is not None:
-                        return Element(self, str(result.object_id))
-                    await asyncio.sleep(poll)
-        except TimeoutError:
-            if required:
-                detail = f' containing {containing!r}' if containing else ''
-                raise TimeoutError(
-                    f'no element for {selector!r}{detail} within '
-                    f'{timeout or self.default_timeout}s') from None
-            return None
-
-    async def query_count(self, selector: str) -> int:
-        return int(await self.evaluate(
-            f'document.querySelectorAll({json.dumps(selector)}).length'))
-
-    async def query_all(
-        self,
-        selector: str,
-        *,
-        containing: str | None = None,
-    ) -> list[Element]:
-        '''Every element matching ``selector`` as a held :class:`Element`
-        (single-shot — no polling), optionally filtered to those whose
-        textContent contains ``containing`` (case-insensitive). ``[]`` when
-        nothing matches.
-
-        Use it to enumerate or filter a *set* — chips, rows, a node's buttons —
-        e.g. ``[c for c in await page.query_all('button') if not await
-        c.eval('(el)=>el.disabled')]``. Holding each node dodges the stale-copy
-        trap that re-running a first-match selector would hit. For a single
-        element *with* waiting, use :meth:`query`; to just count, use
-        :meth:`query_count`.'''
-        function = _query_all_js('document', selector, containing)
-        result = await self.evaluate(
-            f'({function})(document)', return_by_value=False)
-        if result.object_id is None:
-            return []
-        return await _elements_from_array(self, str(result.object_id))
+    # query/query_count/query_all and live()/get_by_* are inherited —
+    # ElementQueries (element.py) and LiveFactories (live.py), shared with Frame.
 
     # -- cross-origin frames (M10 Phase 1) -----------------------------------
 
@@ -732,6 +675,7 @@ class Page:
         )
         self._streams.append(stream)
         self._tasks.append(asyncio.create_task(recorder._pump(stream)))
+        self._recorders.append(recorder)
         return recorder
 
     @asynccontextmanager

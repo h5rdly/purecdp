@@ -10,6 +10,7 @@ Handles are invalidated by navigation; re-query after goto().
 
 from __future__ import annotations
 
+import asyncio
 import json
 import typing
 from contextlib import suppress
@@ -397,3 +398,73 @@ def _query_all_js(root: str, selector: str, containing: str | None) -> str:
             " (e.textContent || '').toLowerCase().includes(needle));")
     parts.append(' return els; })')
     return ''.join(parts)
+
+
+class ElementQueries:
+    '''Mixin: the eager query surface shared by every Element owner (Page and
+    Frame define it once here). Owners provide ``evaluate`` and
+    ``default_timeout``; ``_where`` seasons timeout messages ('' / ' in frame').
+    '''
+
+    _where = ''
+
+    async def query(
+        self,
+        selector: str,
+        *,
+        containing: str | None = None,
+        index: int = 0,
+        timeout: float | None = None,
+        poll: float = 0.05,
+        required: bool = True,
+    ) -> Element | None:
+        '''Wait for and hold an element: CSS selector, optionally filtered to
+        those whose textContent contains ``containing`` (case-insensitive —
+        the :has-text() CDP never had), picked by ``index`` (-1 = newest/last,
+        for apps that keep stale copies of widgets in the DOM). Polling rides
+        out framework re-renders; raises TimeoutError with the selector in
+        the message unless ``required=False`` (presence probes).'''
+        js = _query_js('document', selector, containing, index)
+        try:
+            async with asyncio.timeout(timeout or self.default_timeout):
+                while True:
+                    result = await self.evaluate(
+                        f'({js})(document)', return_by_value=False)
+                    if result.object_id is not None:
+                        return Element(self, str(result.object_id))
+                    await asyncio.sleep(poll)
+        except TimeoutError:
+            if required:
+                detail = f' containing {containing!r}' if containing else ''
+                raise TimeoutError(
+                    f'no element for {selector!r}{detail}{self._where} within '
+                    f'{timeout or self.default_timeout}s') from None
+            return None
+
+    async def query_count(self, selector: str) -> int:
+        return int(await self.evaluate(
+            f'document.querySelectorAll({json.dumps(selector)}).length'))
+
+    async def query_all(
+        self,
+        selector: str,
+        *,
+        containing: str | None = None,
+    ) -> list[Element]:
+        '''Every element matching ``selector`` as a held :class:`Element`
+        (single-shot — no polling), optionally filtered to those whose
+        textContent contains ``containing`` (case-insensitive). ``[]`` when
+        nothing matches.
+
+        Use it to enumerate or filter a *set* — chips, rows, a node's buttons —
+        e.g. ``[c for c in await page.query_all('button') if not await
+        c.eval('(el)=>el.disabled')]``. Holding each node dodges the stale-copy
+        trap that re-running a first-match selector would hit. For a single
+        element *with* waiting, use :meth:`query`; to just count, use
+        :meth:`query_count`.'''
+        function = _query_all_js('document', selector, containing)
+        result = await self.evaluate(
+            f'({function})(document)', return_by_value=False)
+        if result.object_id is None:
+            return []
+        return await _elements_from_array(self, str(result.object_id))

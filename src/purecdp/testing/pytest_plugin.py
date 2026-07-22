@@ -18,6 +18,7 @@ $PURECDP_LAUNCH_ARGS.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import os
 
@@ -49,20 +50,43 @@ def cdp_browser(cdp_loop):
 
 
 @pytest.fixture
-def cdp_page(cdp_browser, cdp_loop):
+def cdp_page(cdp_browser, cdp_loop, request):
     async def make():
         context = await cdp_browser.new_context()
         session = await cdp_browser.new_page(context=context)
         return context, await Page.create(session)
 
     context, page = cdp_loop.run_until_complete(make())
+    artifacts_on = not os.environ.get('PURECDP_NO_ARTIFACTS')
+    if artifacts_on and os.environ.get('PURECDP_ARTIFACTS_NETWORK'):
+        page.record()
     yield page
+
+    # dump artifacts while the page is still alive if the test failed
+    # (pytest_runtest_makereport below stashed the call-phase report)
+    report = getattr(request.node, '_purecdp_report_call', None)
+    if artifacts_on and report is not None and report.failed:
+        from .artifacts import _sanitize, artifacts_dir, dump_artifacts
+        dest = os.path.join(artifacts_dir(), _sanitize(request.node.nodeid))
+        with contextlib.suppress(BaseException):
+            cdp_loop.run_until_complete(dump_artifacts(
+                [page], dest, test_id=request.node.nodeid,
+                exc=report.longreprtext))
 
     async def cleanup():
         await page.aclose()
         await context.aclose()
 
     cdp_loop.run_until_complete(cleanup())
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    '''Stash each phase's report on the item so fixtures can see the test's
+    outcome during their teardown (used for artifacts-on-failure).'''
+    outcome = yield
+    report = outcome.get_result()
+    setattr(item, '_purecdp_report_' + report.when, report)
 
 
 @pytest.hookimpl(tryfirst=True)

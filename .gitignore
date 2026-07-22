@@ -1,6 +1,11 @@
 __pycache__/
 *.pyc
+purecdp-artifacts/
 .pytest_cache/
 dist/
 build/
 *.egg-info/
+
+tests/windebug/
+Roadmap.md
+Design.md

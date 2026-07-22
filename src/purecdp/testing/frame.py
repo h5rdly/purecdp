@@ -17,12 +17,12 @@ here. See ROADMAP M10 for stitched cross-frame snapshots (Phase 3).
 from __future__ import annotations
 
 import asyncio
-import json
 import typing
 
 from ..protocol import runtime as runtime_proto
 from . import _agent
-from .element import Element, _elements_from_array, _query_all_js, _query_js
+from .element import Element, ElementQueries
+from .live import LiveFactories
 from .snapshot import Snapshot
 
 if typing.TYPE_CHECKING:
@@ -34,11 +34,13 @@ class FrameNotFound(Exception):
     '''No cross-origin iframe matched, or it never attached in time.'''
 
 
-class Frame:
+class Frame(ElementQueries, LiveFactories):
     '''A cross-origin child frame, driven through its own CDP session. Created
     by :meth:`Page.frame`; exposes the same element/agent surface as Page, scoped
     to the frame. Invalidated when the iframe navigates/detaches (re-acquire via
     ``page.frame(...)``).'''
+
+    _where = ' in frame'         # seasons ElementQueries timeout messages
 
     def __init__(self, page: Page, session: Session, frame_id: str):
         self.page = page                 # the Page this iframe is embedded in
@@ -82,52 +84,8 @@ class Frame:
             raise JSError.from_details(details)
         return result.value if return_by_value else result
 
-    async def query(
-        self,
-        selector: str,
-        *,
-        containing: str | None = None,
-        index: int = 0,
-        timeout: float | None = None,
-        poll: float = 0.05,
-        required: bool = True,
-    ) -> Element | None:
-        '''Wait for and hold an element inside this frame (see Page.query).'''
-        js = _query_js('document', selector, containing, index)
-        try:
-            async with asyncio.timeout(timeout or self.default_timeout):
-                while True:
-                    result = await self.evaluate(
-                        f'({js})(document)', return_by_value=False)
-                    if result.object_id is not None:
-                        return Element(self, str(result.object_id))
-                    await asyncio.sleep(poll)
-        except TimeoutError:
-            if required:
-                detail = f' containing {containing!r}' if containing else ''
-                raise TimeoutError(
-                    f'no element for {selector!r}{detail} in frame within '
-                    f'{timeout or self.default_timeout}s') from None
-            return None
-
-    async def query_count(self, selector: str) -> int:
-        return int(await self.evaluate(
-            f'document.querySelectorAll({json.dumps(selector)}).length'))
-
-    async def query_all(
-        self,
-        selector: str,
-        *,
-        containing: str | None = None,
-    ) -> list[Element]:
-        '''Every element matching ``selector`` inside this frame as a held
-        Element (single-shot; see :meth:`Page.query_all`).'''
-        function = _query_all_js('document', selector, containing)
-        result = await self.evaluate(
-            f'({function})(document)', return_by_value=False)
-        if result.object_id is None:
-            return []
-        return await _elements_from_array(self, str(result.object_id))
+    # query/query_count/query_all and live()/get_by_* are inherited —
+    # ElementQueries (element.py) and LiveFactories (live.py), shared with Page.
 
     async def frame(
         self,

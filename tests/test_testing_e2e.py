@@ -342,6 +342,91 @@ class CdpHygieneE2ETests(unittest.IsolatedAsyncioTestCase):
                 assert page.console == []
 
 
+class LiveE2ETests(CDPTestCase):
+    '''M11 lazy locators: re-resolution across re-renders, get_by_*, scoped
+    chaining, and the auto-retrying should() assertion.'''
+
+    EXTRA_ARGS = EXTRA
+
+    async def test_reresolves_across_dom_replacement(self):
+        # a held Element would go stale; a Live re-queries on each use.
+        await self.page.goto(
+            "data:text/html,<div id=host><button onclick='window.n=(window.n||0)+1'>"
+            'go</button></div>')
+        btn = self.page.live('#host button')
+        await btn.click()
+        assert await self.page.evaluate('window.n') == 1
+        await self.page.evaluate(
+            "document.getElementById('host').innerHTML ="
+            " \"<button onclick='window.n=(window.n||0)+1'>go2</button>\"")
+        await btn.click()                       # re-resolves to the NEW button
+        assert await self.page.evaluate('window.n') == 2
+        await btn.should(text='go2')
+
+    async def test_should_count_and_text_retry(self):
+        await self.page.goto(
+            'data:text/html,<ul id=list></ul><script>let i=0;'
+            'const t=setInterval(()=>{const li=document.createElement("li");'
+            'li.className="row";li.textContent="r"+i;'
+            'document.getElementById("list").appendChild(li);'
+            'if(++i>=3)clearInterval(t)},40)</script>')
+        await self.page.live('.row').should(count=3)          # polls until 3 exist
+        await self.page.live('.row').last.should(text='r2')
+
+    async def test_should_timeout_raises_expectation_error(self):
+        from purecdp.testing import ExpectationError
+        await self.page.goto('data:text/html,<div>hi</div>')
+        try:
+            await self.page.live('.missing').should(visible=True, timeout=0.4)
+        except ExpectationError as exc:
+            assert 'visible' in str(exc)
+        else:
+            raise AssertionError('expected ExpectationError')
+
+    async def test_get_by_test_id_text_role(self):
+        await self.page.goto(
+            'data:text/html,<button data-testid=go onclick="window.x=1">'
+            'Continue</button><span data-testid=lbl>hello</span>')
+        await self.page.get_by_test_id('go').click()
+        assert await self.page.evaluate('window.x') == 1
+        assert (await self.page.get_by_test_id('lbl').text()) == 'hello'
+        await self.page.get_by_text('Continue').should(visible=True)
+        await self.page.get_by_role('button', name='Continue').should(count=1)
+
+    async def test_get_by_label_fill_and_value(self):
+        await self.page.goto(
+            'data:text/html,<label>Min'
+            '<input aria-label="Minimum value"></label>')
+        inp = self.page.get_by_label('Minimum value')
+        await inp.fill('1000')
+        await inp.should(value='1000')
+        assert (await inp.value()) == '1000'
+
+    async def test_containing_scoped_and_count(self):
+        await self.page.goto(
+            'data:text/html,'
+            '<div class=card>alpha<button>a1</button><button>a2</button></div>'
+            '<div class=card>beta<button>b1</button></div>')
+        card = self.page.live('.card', containing='alpha')
+        await card.live('button').last.should(text='a2')
+        assert (await card.live('button').count()) == 2
+
+    async def test_synthetic_click_resolves_wrapper(self):
+        await self.page.goto(
+            "data:text/html,<label id=w><span>Agree</span>"
+            "<input type=checkbox style='opacity:0;width:0;height:0'></label>")
+        await self.page.live('#w').click(trusted=False)     # resolves to the input
+        assert await self.page.evaluate(
+            "document.querySelector('input').checked") is True
+
+    async def test_get_escape_hatch_returns_element(self):
+        from purecdp.testing import Element
+        await self.page.goto('data:text/html,<input id=i value=hi>')
+        el = await self.page.live('#i').get()
+        assert isinstance(el, Element)
+        assert (await el.eval('(e) => e.value')) == 'hi'
+
+
 class M7FeatureE2ETests(CDPTestCase):
     '''Emulation, cookies, storage, content, PDF, element actions, dialogs.'''
 
@@ -1026,3 +1111,96 @@ class DownloadE2ETests(CDPTestCase):
             pass
         else:
             raise AssertionError('expected DownloadError on timeout')
+
+
+class ArtifactsE2ETests(unittest.TestCase):
+    '''Artifacts-on-failure against a real browser: run a throwaway inner
+    CDPTestCase and inspect what its failure leaves on disk. Deliberately a
+    sync TestCase — the inner case owns its own asyncio runner, so it can't
+    be driven from within an already-running loop.'''
+
+    def _run(self, case_cls, name):
+        result = unittest.TestResult()
+        case_cls(name).run(result)
+        if result.skipped:
+            self.skipTest(result.skipped[0][1])
+        return result
+
+    def test_failure_dumps_screenshot_html_console(self):
+        with tempfile.TemporaryDirectory() as tmp:
+
+            class Failing(CDPTestCase):
+                EXTRA_ARGS = EXTRA
+                ARTIFACTS_DIR = tmp
+
+                async def check_boom(self):
+                    await self.page.goto(
+                        'data:text/html,<h1 id="artifact-marker">hi</h1>'
+                        '<script>console.log("from the page")</script>')
+                    await eventually(lambda: self.page.console)
+                    assert False, 'deliberate'
+
+            result = self._run(Failing, 'check_boom')
+            assert len(result.failures) == 1        # dump didn't mask it
+            (subdir,) = os.listdir(tmp)
+            d = os.path.join(tmp, subdir)
+            shot = pathlib.Path(d, 'screenshot.png').read_bytes()
+            assert shot.startswith(b'\x89PNG') and len(shot) > 1000
+            assert 'artifact-marker' in pathlib.Path(d, 'page.html').read_text()
+            assert 'from the page' in pathlib.Path(d, 'console.log').read_text()
+            info = pathlib.Path(d, 'info.txt').read_text()
+            assert 'outcome: FAIL (AssertionError)' in info
+            assert 'deliberate' in info             # the traceback
+
+    def test_pass_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+
+            class Passing(CDPTestCase):
+                EXTRA_ARGS = EXTRA
+                ARTIFACTS_DIR = tmp
+
+                async def check_fine(self):
+                    await self.page.goto('data:text/html,<p>ok</p>')
+
+            result = self._run(Passing, 'check_fine')
+            assert result.wasSuccessful() and os.listdir(tmp) == []
+
+    def test_network_artifacts_when_armed(self):
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html')
+                self.end_headers()
+                self.wfile.write(b'<p>net</p>')
+
+            def log_message(self, *a):
+                pass
+
+        httpd = ThreadingHTTPServer(('127.0.0.1', 0), H)
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+
+                class NetFailing(CDPTestCase):
+                    EXTRA_ARGS = EXTRA
+                    ARTIFACTS_DIR = tmp
+                    ARTIFACTS_NETWORK = True
+
+                    async def check_boom(self):
+                        await self.page.goto(
+                            f'http://127.0.0.1:{port}/', wait='load')
+                        # the recorder ARTIFACTS_NETWORK armed on this page
+                        rec = self.page._recorders[0]
+                        await eventually(lambda: rec.exchanges)
+                        assert False, 'deliberate'
+
+                result = self._run(NetFailing, 'check_boom')
+                assert len(result.failures) == 1
+                (subdir,) = os.listdir(tmp)
+                net = pathlib.Path(tmp, subdir, 'network.log').read_text()
+                assert f'GET http://127.0.0.1:{port}/ -> 200' in net
+                assert '<p>net</p>' in net          # response body included
+        finally:
+            httpd.shutdown()
+            httpd.server_close()

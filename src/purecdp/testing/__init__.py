@@ -6,8 +6,10 @@
   import purecdp.testing.pytest_plugin only happens when pytest loads it)
 '''
 
+from .artifacts import dump_artifacts
 from .element import ActionabilityError, Element
 from .frame import Frame, FrameNotFound
+from .live import ExpectationError, Live
 from .human import HumanCursor, human_scroll, human_type
 from .intercept import InterceptedRequest
 from .page import (
@@ -44,6 +46,8 @@ __all__ = [
     'human_scroll',
     'Element',
     'ActionabilityError',
+    'Live',
+    'ExpectationError',
     'Frame',
     'FrameNotFound',
     'JSError',
@@ -59,4 +63,5 @@ __all__ = [
     'ServerSentEvent',
     'parse_sse',
     'CDPTestCase',
+    'dump_artifacts',
 ]

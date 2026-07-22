@@ -190,6 +190,109 @@ async def test_title(cdp_page):
     assert await cdp_page.title() == "hi"
 ```
 
+### Failures leave artifacts behind
+
+When a `CDPTestCase` test (or a pytest `cdp_page` test) fails, purecdp dumps
+what you need to diagnose it — captured *before* the browser closes:
+
+```
+purecdp-artifacts/tests.test_app.CartTests.test_checkout/
+    info.txt          # outcome + traceback + per-page URL/title + capture status
+    screenshot.png    # full-page, one per page the test opened
+    page.html         # the DOM at the moment of failure
+    console.log       # captured console messages (when any)
+    js_errors.log     # uncaught page exceptions (when any)
+    network.log       # recorded traffic (see below)
+```
+
+Green tests write nothing. Every capture is best-effort: a crashed renderer
+still yields a manifest saying exactly what could be saved, and the dump can
+never turn a clean test failure into a confusing teardown error.
+
+Knobs (class attributes; the pytest fixture uses the env equivalents):
+
+```python
+class CartTests(CDPTestCase):
+    ARTIFACTS = True           # default; PURECDP_NO_ARTIFACTS=1 forces off
+    ARTIFACTS_DIR = None       # default $PURECDP_ARTIFACTS_DIR or ./purecdp-artifacts
+    ARTIFACTS_NETWORK = True   # also record traffic on every page so failures
+                               # include it (off by default; env:
+                               # PURECDP_ARTIFACTS_NETWORK=1 for cdp_page)
+```
+
+Traffic your test records itself with `page.record()` is dumped regardless of
+`ARTIFACTS_NETWORK`. On CI, ship the directory with failing runs:
+
+```yaml
+- uses: actions/upload-artifact@v4
+  if: failure()
+  with: { path: purecdp-artifacts/, if-no-files-found: ignore }
+```
+
+`dump_artifacts(pages, dest, exc=...)` is also importable directly for ad-hoc
+scripts (call it in your `except` block while the browser is still up).
+
+### Locators (`live`) + auto-retrying assertions — the robust way for SPAs
+
+`page.live(...)` returns a **lazy locator**: it holds the *query*, not a node, and
+re-runs it on every action and assertion. That's the fix for the classic
+single-page-app flake — a React re-render, a virtual list remount, a chat UI that
+keeps stale copies of a widget won't leave you holding a dead handle.
+
+`.should(**conditions)` polls until the conditions hold (or times out), so you
+never hand-roll `wait_for` loops. It raises on failure, so it fits plain `assert`
+tests — no special assertion objects.
+
+```python
+import re
+from purecdp.testing import CDPTestCase
+
+class TodoAppTests(CDPTestCase):
+    async def test_add_and_remove_items(self):
+        await self.page.goto("https://app.example/todos", wait="idle")
+
+        await self.page.get_by_test_id("new-item").fill("buy milk")
+        await self.page.get_by_role("button", name="Add").click()
+
+        # poll until the state settles — no manual waiting
+        await self.page.live(".todo-item").should(count=1)
+        await self.page.get_by_test_id("summary").should(text=re.compile(r"\d+ of \d+ done"))
+
+        # re-render safe: this re-resolves each call, even if the node remounted
+        item = self.page.live(".todo-item", containing="milk")
+        await item.live("button").last.click()          # its delete button
+        await item.should(count=0)
+```
+
+Building blocks:
+
+```python
+# construct
+page.live("css selector", containing="text")   # substring filter, case-insensitive
+page.get_by_test_id("column-picker")            # [data-testid="..."]
+page.get_by_text("Continue")                    # innermost element with that text
+page.get_by_role("button", name="Continue")     # approximate ARIA role + accessible name
+page.get_by_label("Minimum value")              # form control by its label
+
+# refine (each returns a new locator — immutable)
+loc.first ; loc.last ; loc.nth(2) ; loc.containing("x") ; loc.live("button")
+
+# act (re-resolves the first match, auto-waits for actionability)
+await loc.click()                 # trusted mouse click; .click(trusted=False) resolves wrappers
+await loc.fill("1000")            # React-safe value write
+await loc.type("hello") ; await loc.hover() ; await loc.select("opt")
+await loc.text() ; await loc.value() ; await loc.count()
+el = await loc.get()              # escape hatch to the eager Element API
+
+# assert (polls until all hold, else raises ExpectationError = a test failure)
+await loc.should(visible=True, text="Invalid")
+await loc.should(count=0)                        # asserts it's gone
+await loc.should(value="1000", enabled=True)
+```
+
+`query` / `query_all` / `Element` remain as the lower-level eager layer; `live` is
+the ergonomic default. (It works inside cross-origin frames too — `frame.live(...)`.)
+
 ### Stub the network — assert on behavior, not a live backend
 
 ```python
