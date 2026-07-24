@@ -299,6 +299,56 @@ class DriveParityE2ETests(CDPTestCase):
         assert exchange.json == {'answer': 42}          # the HTML page was skipped
         assert [e.url.rsplit('/', 1)[-1] for e in turn.new] == ['err', 'query']
 
+    async def test_exchange_headers_carry_the_wire_truth(self):
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html')
+                self.send_header('Set-Cookie', 'sid=wire-truth; Path=/')
+                self.end_headers()
+                self.wfile.write(b'<p>hdrs</p>')
+
+            def log_message(self, *args):
+                pass
+
+        httpd = ThreadingHTTPServer(('127.0.0.1', 0), H)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            recorder = self.page.record(needle='127.0.0.1')
+            await self.page.goto(f'http://127.0.0.1:{httpd.server_port}/')
+            first = await recorder.wait_for_next(0)
+
+            assert first.timestamp is not None      # epoch seconds at request
+            req_keys = {k.lower() for k in first.request_headers}
+            assert 'user-agent' in req_keys
+            # Set-Cookie exists ONLY in responseReceivedExtraInfo (the base
+            # event redacts it) — merged in, possibly a beat after completion
+            await eventually(lambda: any(
+                k.lower() == 'set-cookie' for k in first.response_headers))
+            assert 'wire-truth' in first.response_headers[next(
+                k for k in first.response_headers if k.lower() == 'set-cookie')]
+
+            # the cookie travels back on the NEXT request — and Cookie exists
+            # only in requestWillBeSentExtraInfo, proving the request-side merge
+            await self.page.evaluate("fetch('/again').then(r => r.text())")
+            second = await recorder.wait_for_next(1)
+            await eventually(lambda: any(
+                k.lower() == 'cookie' for k in second.request_headers))
+            cookie = second.request_headers[next(
+                k for k in second.request_headers if k.lower() == 'cookie')]
+            assert 'sid=wire-truth' in cookie
+
+            # the same capture exports as a valid, self-consistent HAR
+            import json as json_mod
+            har = json_mod.loads(json_mod.dumps(recorder.har()))
+            entries = har['log']['entries']
+            assert len(entries) == 2
+            assert entries[0]['response']['status'] == 200
+            assert entries[0]['time'] > 0                # real duration
+            assert '<p>hdrs</p>' in entries[0]['response']['content']['text']
+        finally:
+            httpd.shutdown()
+
     async def test_query_containing_accepts_regex(self):
         await self.page.goto(
             'data:text/html,<div class=node>BRAND AND CO</div>'
@@ -368,7 +418,7 @@ class CdpHygieneE2ETests(unittest.IsolatedAsyncioTestCase):
 
         async with asyncio.timeout(60):
             async with await purecdp.launch(stealth=True, extra_args=EXTRA) as browser:
-                session = await browser.new_page()
+                session = await browser.new_session()
                 # a "clean" page: no Runtime/Network domain enabled
                 page = await Page.create(session, capture=False,
                                          track_network=False)
@@ -910,7 +960,7 @@ class ConnectE2ETests(CDPTestCase):
         port, _ = self._endpoint_parts()
         other = await purecdp.connect(host='127.0.0.1', port=int(port))
         try:
-            session = await other.new_page()
+            session = await other.new_session()
             page = await Page.create(session)
             await page.goto('data:text/html,<title>remote</title>')
             assert await page.title() == 'remote'
@@ -923,7 +973,7 @@ class ConnectE2ETests(CDPTestCase):
         port, path = self._endpoint_parts()
         other = await purecdp.connect(f'ws://127.0.0.1:{port}{path}')
         try:
-            session = await other.new_page()
+            session = await other.new_session()
             page = await Page.create(session)
             assert await page.evaluate('1 + 1') == 2
         finally:

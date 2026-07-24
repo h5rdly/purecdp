@@ -129,7 +129,7 @@ class MCPServer:
                 self._page = await self._page_factory()
             else:
                 self._browser = await launch(**self._launch_kwargs)
-                session = await self._browser.new_page()
+                session = await self._browser.new_session()
                 self._page = await Page.create(session)
         return self._page
 

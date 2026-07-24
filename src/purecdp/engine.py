@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 from . import _json, protocol
 from ._shared import T_JSON_DICT, UnknownEvent, parse_event
-from .errors import CDPError, CDPProtocolError, ProtocolDriftWarning
+from .errors import CDPCommandError, CDPProtocolError, ProtocolDriftWarning
 
 #: The shape of every generated command: yields one request, receives the raw
 #: result, returns the typed value.
@@ -40,7 +40,7 @@ class CommandResult:
 
 @dataclass(frozen=True)
 class CommandFailure:
-    '''A pending command failed. ``error`` is a :class:`CDPError` from the
+    '''A pending command failed. ``error`` is a :class:`CDPCommandError` from the
     browser, or the local exception raised while parsing the result.'''
 
     id: int
@@ -175,7 +175,7 @@ class Engine:
         if 'error' in msg:
             pending.gen.close()
             err = msg['error']
-            error = CDPError(
+            error = CDPCommandError(
                 code=err.get('code', 0),
                 message=err.get('message', ''),
                 data=err.get('data'),

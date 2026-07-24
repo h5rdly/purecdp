@@ -105,7 +105,7 @@ from purecdp.protocol import page, runtime
 
 async def main():
     async with await purecdp.launch(headless=True) as browser:
-        session = await browser.new_page()           # create target + attach
+        session = await browser.new_session()           # create target + attach
 
         await session.execute(page.enable())
         # subscribe BEFORE triggering, or you race the event
@@ -131,7 +131,7 @@ parsed — that's most of the throughput win).
 from purecdp.protocol import network
 
 async with await purecdp.launch() as browser:
-    session = await browser.new_page()
+    session = await browser.new_session()
     await session.execute(network.enable())
 
     stream = session.listen(network.ResponseReceived, buffer_size=4096)
@@ -205,6 +205,7 @@ purecdp-artifacts/tests.test_app.CartTests.test_checkout/
     console.log       # captured console messages (when any)
     js_errors.log     # uncaught page exceptions (when any)
     network.log       # recorded traffic (see below)
+    network.har       # the same capture as a HAR — open in devtools
 ```
 
 Green tests write nothing. Every capture is best-effort: a crashed renderer
@@ -357,6 +358,14 @@ llm = self.page.record(needle="/api/chat", default_timeout=120)   # slow route
 prices = self.page.record(needle="/api/prices")                   # page default is fine
 ```
 
+Exchanges carry the **wire** headers (`ex.request_headers` / `ex.response_headers`
+— the `*ExtraInfo` events merged in, so `Cookie`, `Origin`, `Sec-*` and
+`Set-Cookie` are all visible), plus `ex.timestamp` (epoch seconds) and
+`ex.duration`. The whole capture exports as a standard HAR — `rec.har()` for
+the dict, `rec.save_har("capture.har")` for a file any devtools or HAR viewer
+opens — making captures shareable and diffable. Failing tests get one for
+free: the artifacts dump writes `network.har` next to `network.log`.
+
 For a streamed (`text/event-stream`) response, `parse_sse` turns the captured
 body into events (any per-frame encoding — base64, JSON — is yours to decode):
 
@@ -425,7 +434,7 @@ import purecdp
 from purecdp.testing import Page, apply_stealth
 
 async with await purecdp.launch(stealth=True) as browser:  # AutomationControlled off, headless=new
-    session = await browser.new_page()
+    session = await browser.new_session()
     # skip Runtime.enable — enabling it is itself detectable (isAutomatedWithCDP)
     page = await Page.create(session, capture=False, track_network=False)
     await apply_stealth(page)                              # fingerprint init-scripts, BEFORE goto
@@ -588,7 +597,7 @@ from purecdp.testing import Page
 
 # discover the endpoint via /json/version on host/port …
 async with await purecdp.connect(host="127.0.0.1", port=9222) as browser:
-    session = await browser.new_page()
+    session = await browser.new_session()
     page = await Page.create(session)
     await page.goto("https://example.com")
 
@@ -605,7 +614,7 @@ Handy one-liners drawn from the `Page` surface.
 ```python
 # Isolated contexts (cheap per-scenario isolation — own cookies/storage)
 ctx = await browser.new_context()
-p1 = await Page.create(await browser.new_page(context=ctx))
+p1 = await Page.create(await browser.new_session(context=ctx))
 
 # Emulation
 await page.set_viewport(390, 844, device_scale_factor=3, mobile=True)

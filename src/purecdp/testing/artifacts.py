@@ -16,6 +16,7 @@ raised.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import time
@@ -158,11 +159,23 @@ async def dump_artifacts(
                 f.write(_format_network(recorders))
             return f'{total} exchanges ({len(recorders)} recorder(s))'
 
+        async def _har(page=page, sfx=sfx):
+            from .recorder import to_har
+            recorders = getattr(page, '_recorders', ())
+            exchanges = [e for r in recorders for e in r.exchanges]
+            if not exchanges:
+                return 'no exchanges (not written)'
+            with open(os.path.join(dest, f'network{sfx}.har'), 'w',
+                      encoding='utf-8') as f:
+                json.dump(to_har(exchanges), f, indent=2)
+            return f'{len(exchanges)} entries'
+
         for name, capture in ((f'screenshot{sfx}.png', _shot),
                               (f'page{sfx}.html', _html),
                               (f'console{sfx}.log', _console),
                               (f'js_errors{sfx}.log', _js_errors),
-                              (f'network{sfx}.log', _network)):
+                              (f'network{sfx}.log', _network),
+                              (f'network{sfx}.har', _har)):
             try:
                 manifest.append(f'{name}: {await capture()}')
             except BaseException as e:

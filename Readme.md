@@ -20,7 +20,7 @@ from purecdp.protocol import page, runtime
 
 async def main():
     async with await purecdp.launch() as browser:   # finds Chromium/Chrome/Brave
-        session = await browser.new_page()          # create target + attach
+        session = await browser.new_session()          # create target + attach
 
         await session.execute(page.enable())
         waiter = asyncio.create_task(session.wait_for(page.LoadEventFired))
@@ -109,7 +109,7 @@ import purecdp
 from purecdp.testing import Page, apply_stealth
 
 async with await purecdp.launch(stealth=True) as browser:   # AutomationControlled off, headless=new
-    session = await browser.new_page()
+    session = await browser.new_session()
     page = await Page.create(session, capture=False, track_network=False)  # no Runtime.enable leak
     await apply_stealth(page)                                # fingerprint init-scripts, before goto
     await page.goto("https://example.com")

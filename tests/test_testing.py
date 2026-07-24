@@ -38,11 +38,11 @@ class PageTestBase(unittest.IsolatedAsyncioTestCase):
         self.transport = FakeTransport(self.fake)
         self.conn = Connection(self.transport)
         await self.conn.open()
-        session = await purecdp.new_page(self.conn, 'about:blank')
+        session = await purecdp.new_session(self.conn, 'about:blank')
         self.page = await Page.create(session, default_timeout=5.0)
 
     async def asyncTearDown(self):
-        await self.page.aclose()
+        await self.page.stop()
         await self.conn.aclose()
         await super().asyncTearDown()
 
@@ -180,6 +180,65 @@ class InterceptTests(PageTestBase):
         await drain()
         failed = self.sent('Fetch.failRequest')[0]['params']
         assert failed == {'requestId': 'R9', 'errorReason': 'Aborted'}
+
+    async def test_route_accepts_predicate_callable(self):
+        async def handler(request):
+            await request.fulfill(body='ok', content_type='text/plain')
+
+        await self.page.route(lambda url: url.endswith('/pred'), handler)
+        self.transport.push(self.paused_event('R1', 'https://x/pred'))
+        self.transport.push(self.paused_event('R2', 'https://x/pred/nope'))
+        await drain()
+        assert self.sent('Fetch.fulfillRequest')[0]['params']['requestId'] == 'R1'
+        assert self.sent('Fetch.continueRequest')[0]['params']['requestId'] == 'R2'
+
+
+class HarExportTests(unittest.TestCase):
+    def test_to_har_structure_bodies_and_encoding(self):
+        import base64 as b64_mod
+        import json as json_mod
+        from purecdp.testing import Exchange, to_har
+
+        textual = Exchange(
+            url='https://x/q?a=1&b=two', method='POST',
+            request_body='{"ask": 1}', status=200, mime='application/json',
+            body=b'{"answer": 42}',
+            request_headers={'Content-Type': 'application/json',
+                             'Cookie': 's=1'},
+            response_headers={'Set-Cookie': 's=1'},
+            timestamp=1_700_000_000.0, duration=0.25)
+        binary = Exchange(url='https://x/img', method='GET', status=200,
+                          mime='image/png', body=b'\x89PNG\xff\xfe')
+        har = to_har([textual, binary])
+        json_mod.dumps(har)                          # fully serializable
+        log = har['log']
+        assert log['version'] == '1.2' and log['creator']['name'] == 'purecdp'
+        first, second = log['entries']
+        assert first['startedDateTime'].startswith('2023-11-14')
+        assert first['time'] == 250.0
+        assert first['request']['queryString'] == [
+            {'name': 'a', 'value': '1'}, {'name': 'b', 'value': 'two'}]
+        assert first['request']['postData'] == {
+            'mimeType': 'application/json', 'text': '{"ask": 1}'}
+        assert {'name': 'Cookie', 'value': 's=1'} in first['request']['headers']
+        assert {'name': 'Set-Cookie', 'value': 's=1'} \
+            in first['response']['headers']
+        assert first['response']['content']['text'] == '{"answer": 42}'
+        assert 'encoding' not in first['response']['content']
+        assert second['response']['content']['encoding'] == 'base64'
+        assert b64_mod.b64decode(
+            second['response']['content']['text']) == b'\x89PNG\xff\xfe'
+        assert second['time'] == -1                  # duration unknown
+
+
+class ErrorHierarchyTests(unittest.TestCase):
+    def test_every_purecdp_error_shares_the_base(self):
+        import purecdp.errors as errors
+        for name in ('CDPCommandError', 'CDPProtocolError', 'CDPConnectionClosed',
+                     'CDPSessionClosed', 'CDPTransportError', 'BrowserLaunchError'):
+            assert issubclass(getattr(errors, name), errors.PureCDPError), name
+        assert errors.CDPError is errors.CDPCommandError    # compat alias
+        assert purecdp.PureCDPError is errors.PureCDPError  # exported
 
     async def test_broken_handler_continues_and_warns(self):
         async def handler(request):
@@ -405,6 +464,87 @@ class InitScriptAndRecorderTests(PageTestBase):
         assert json_one.json == {'answer': 42}
         assert len(recorder.exchanges) == 2
 
+    async def test_headers_merge_extra_info_any_order(self):
+        recorder = self.page.record(needle='/query')
+        sid = self.page.session.session_id
+        self.fake.response_bodies['R1'] = {'body': '{}', 'base64Encoded': False}
+
+        def extra(method, request_id, headers):
+            self.transport.push({'method': method, 'sessionId': sid,
+                                 'params': {'requestId': request_id,
+                                            'headers': headers,
+                                            'associatedCookies': [],
+                                            'connectTiming': {'requestTime': 1.0},
+                                            'blockedCookies': [],
+                                            'resourceIPAddressSpace': 'Local',
+                                            'statusCode': 200}})
+
+        # request ExtraInfo arrives BEFORE the base event (CDP guarantees no
+        # order) and carries the wire-only headers
+        extra('Network.requestWillBeSentExtraInfo', 'R1',
+              {'Cookie': 'sid=abc', 'Origin': 'https://x'})
+        self.transport.push({
+            'method': 'Network.requestWillBeSent', 'sessionId': sid,
+            'params': {'requestId': 'R1', 'loaderId': 'L1',
+                       'documentURL': 'https://x/', 'timestamp': 1.0,
+                       'wallTime': 1234.5, 'initiator': {'type': 'other'},
+                       'redirectHasExtraInfo': False,
+                       'request': {'url': 'https://x/query', 'method': 'GET',
+                                   'headers': {'Accept': '*/*'},
+                                   'initialPriority': 'High',
+                                   'referrerPolicy': 'no-referrer'}}})
+        self.transport.push({
+            'method': 'Network.responseReceived', 'sessionId': sid,
+            'params': {'requestId': 'R1', 'loaderId': 'L1', 'timestamp': 2.0,
+                       'type': 'XHR', 'frameId': 'F-1', 'hasExtraInfo': True,
+                       'response': {'url': 'https://x/query', 'status': 200,
+                                    'statusText': 'OK',
+                                    'headers': {'Content-Type': 'application/json'},
+                                    'mimeType': 'application/json',
+                                    'charset': 'utf-8',
+                                    'connectionReused': False,
+                                    'connectionId': 1,
+                                    'encodedDataLength': 14,
+                                    'securityState': 'secure'}}})
+        # response ExtraInfo AFTER the base event — Set-Cookie lives ONLY here
+        extra('Network.responseReceivedExtraInfo', 'R1',
+              {'Set-Cookie': 'sid=abc; HttpOnly'})
+        self.transport.push({
+            'method': 'Network.loadingFinished', 'sessionId': sid,
+            'params': {'requestId': 'R1', 'timestamp': 3.0,
+                       'encodedDataLength': 14}})
+
+        exchange = await recorder.wait_for_next(0, timeout=2)
+        assert exchange.request_headers['Accept'] == '*/*'          # base
+        assert exchange.request_headers['Cookie'] == 'sid=abc'      # extra
+        assert exchange.request_headers['Origin'] == 'https://x'
+        assert exchange.response_headers['Content-Type'] == 'application/json'
+        assert exchange.response_headers['Set-Cookie'] == 'sid=abc; HttpOnly'
+        assert exchange.timestamp == 1234.5
+        assert exchange.duration == 2.0     # loadingFinished(3.0) - request(1.0)
+
+    async def test_extra_info_for_unmatched_requests_is_dropped(self):
+        recorder = self.page.record(needle='/query')
+        sid = self.page.session.session_id
+        self.transport.push({
+            'method': 'Network.requestWillBeSent', 'sessionId': sid,
+            'params': {'requestId': 'R7', 'loaderId': 'L1',
+                       'documentURL': 'https://x/', 'timestamp': 1.0,
+                       'wallTime': 1.0, 'initiator': {'type': 'other'},
+                       'redirectHasExtraInfo': False,
+                       'request': {'url': 'https://x/other', 'method': 'GET',
+                                   'headers': {}, 'initialPriority': 'High',
+                                   'referrerPolicy': 'no-referrer'}}})
+        self.transport.push({'method': 'Network.requestWillBeSentExtraInfo',
+                             'sessionId': sid,
+                             'params': {'requestId': 'R7',
+                                        'headers': {'Cookie': 'x'},
+                                        'associatedCookies': [],
+                                        'connectTiming': {'requestTime': 1.0}}})
+        await drain()
+        assert not recorder._early_request_extra    # dropped, not buffered
+        assert not recorder.exchanges
+
     async def test_expect_pins_position_at_arming(self):
         recorder = self.page.record(needle='/query')
         self._push_exchange('R0', 'https://x/query', '{"stale": true}')
@@ -497,10 +637,10 @@ class CaptureOptInTests(unittest.IsolatedAsyncioTestCase):
         transport = FakeTransport(fake)
         conn = Connection(transport)
         await conn.open()
-        session = await purecdp.new_page(conn, 'about:blank')
+        session = await purecdp.new_session(conn, 'about:blank')
         page = await Page.create(session, default_timeout=5.0, **create_kw)
         self.addAsyncCleanup(conn.aclose)
-        self.addAsyncCleanup(page.aclose)
+        self.addAsyncCleanup(page.stop)
         methods = lambda: [m['method'] for m in transport.sent]
         return fake, transport, page, methods
 

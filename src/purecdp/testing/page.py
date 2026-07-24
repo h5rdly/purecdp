@@ -506,7 +506,7 @@ class Page(ElementQueries, LiveFactories):
     async def element_for_ref(self, ref: str) -> Element:
         '''Resolve a snapshot ref (``e3``) to a live :class:`Element` — the
         escape hatch to the full element API. Raises LookupError for an unknown
-        ref (call :meth:`snapshot` first) and CDPError if the node is stale
+        ref (call :meth:`snapshot` first) and CDPCommandError if the node is stale
         (the DOM changed since the snapshot; re-snapshot).'''
         return await _agent.element_for_ref(self, ref)
 
@@ -678,6 +678,8 @@ class Page(ElementQueries, LiveFactories):
         stream = self.session.listen(
             network_proto.RequestWillBeSent,
             network_proto.ResponseReceived,
+            network_proto.RequestWillBeSentExtraInfo,
+            network_proto.ResponseReceivedExtraInfo,
             network_proto.LoadingFinished,
             network_proto.LoadingFailed,
             buffer_size=4096,
@@ -952,11 +954,13 @@ class Page(ElementQueries, LiveFactories):
 
     # -- interception --------------------------------------------------------
 
-    async def route(self, pattern: str, handler: Handler) -> None:
-        '''Intercept requests whose URL matches the fnmatch glob (note: '*'
-        crosses '/'). First matching route wins; its async handler gets an
-        InterceptedRequest and should fulfill/continue_/abort it. Unmatched
-        or unhandled requests are continued untouched.'''
+    async def route(self, pattern: str | typing.Callable[[str], bool],
+                    handler: Handler) -> None:
+        '''Intercept requests whose URL matches ``pattern`` — an fnmatch glob
+        (note: '*' crosses '/') or a ``callable(url) -> bool`` predicate, the
+        same form ``record()`` takes. First matching route wins; its async
+        handler gets an InterceptedRequest and should fulfill/continue_/abort
+        it. Unmatched or unhandled requests are continued untouched.'''
         self._routes.append(Route(pattern, handler))
         if not self._intercepting:
             self._intercepting = True
@@ -995,8 +999,10 @@ class Page(ElementQueries, LiveFactories):
 
     # -- lifecycle -----------------------------------------------------------
 
-    async def aclose(self) -> None:
-        '''Stop captures and interception pumps; leaves the page open.'''
+    async def stop(self) -> None:
+        '''Stop captures and interception pumps; leaves the page OPEN.
+        (Renamed from ``aclose`` — that name read as "close the page",
+        which this never did; use :meth:`close` for that.)'''
         for task in self._tasks:
             task.cancel()
         for task in self._tasks:
@@ -1009,7 +1015,7 @@ class Page(ElementQueries, LiveFactories):
 
     async def close(self) -> None:
         '''aclose() and close the underlying page target.'''
-        await self.aclose()
+        await self.stop()
         with suppress(Exception):
             await close_page(self.session.connection, self.session)
 
@@ -1038,7 +1044,7 @@ async def launched_page(
     browser = await launch(browser_path, headless=headless, pipe=pipe,
                            extra_args=extra_args)
     try:
-        session = await browser.new_page()
+        session = await browser.new_session()
         page = await Page.create(session, default_timeout=default_timeout)
         yield browser, page
     finally:

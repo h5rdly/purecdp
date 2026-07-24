@@ -53,7 +53,7 @@ def cdp_browser(cdp_loop):
 def cdp_page(cdp_browser, cdp_loop, request):
     async def make():
         context = await cdp_browser.new_context()
-        session = await cdp_browser.new_page(context=context)
+        session = await cdp_browser.new_session(context=context)
         return context, await Page.create(session)
 
     context, page = cdp_loop.run_until_complete(make())
@@ -74,7 +74,7 @@ def cdp_page(cdp_browser, cdp_loop, request):
                 exc=report.longreprtext))
 
     async def cleanup():
-        await page.aclose()
+        await page.stop()
         await context.aclose()
 
     cdp_loop.run_until_complete(cleanup())

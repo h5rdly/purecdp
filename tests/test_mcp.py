@@ -35,7 +35,7 @@ class MCPServerTests(unittest.IsolatedAsyncioTestCase):
         await self.conn.open()
 
         async def factory():
-            session = await purecdp.new_page(self.conn, 'about:blank')
+            session = await purecdp.new_session(self.conn, 'about:blank')
             return await Page.create(session, default_timeout=5.0)
 
         self.server = MCPServer(page_factory=factory)
@@ -73,7 +73,7 @@ class MCPServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_allow_eval_exposes_and_runs_evaluate(self):
         async def factory():
-            session = await purecdp.new_page(self.conn, 'about:blank')
+            session = await purecdp.new_session(self.conn, 'about:blank')
             return await Page.create(session, default_timeout=5.0)
         server = MCPServer(page_factory=factory, allow_eval=True)
         listed = await server.handle(

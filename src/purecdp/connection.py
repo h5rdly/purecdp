@@ -169,7 +169,7 @@ class Session:
 
     async def execute(self, cmd: CommandGenerator) -> typing.Any:
         '''Run one generated command on this session and return its typed
-        result. Raises CDPError if the browser reports an error.'''
+        result. Raises CDPCommandError if the browser reports an error.'''
         if self.closed and self.session_id is not None:
             raise CDPSessionClosed(self._closed_reason)
         return await self.connection._execute(cmd, self.session_id)
@@ -330,9 +330,17 @@ class Connection:
         return session
 
     async def attach(self, target_id: str) -> Session:
-        '''Attach to a target in flat mode and return its Session.'''
+        '''Attach to a target in flat mode and return its Session.
+
+        Idempotent per target: if a live session for this target already
+        exists (a prior attach, or auto-attach got there first), it is
+        returned instead of attaching again — a second CDP attach would
+        create a second session that duplicates every event.'''
         from .protocol import target as _target
 
+        for session in self._sessions.values():
+            if session.target_id == str(target_id) and not session.closed:
+                return session
         session_id = await self.execute(
             _target.attach_to_target(
                 target_id=_target.TargetID(str(target_id)), flatten=True

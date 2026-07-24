@@ -68,27 +68,45 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         transport = FakeTransport(fake)
         return fake, transport, Connection(transport)
 
-    async def test_new_page_attaches_with_target_info(self):
+    async def test_new_session_attaches_with_target_info(self):
         fake, transport, conn = self.make()
         async with conn:
-            session = await purecdp.new_page(conn, 'about:blank')
+            session = await purecdp.new_session(conn, 'about:blank')
             await drain()
             assert session.target_id == 'T-1'
             assert session.target_info is not None
             assert str(session.target_info.url) == 'about:blank'
             await session.execute(page.enable())  # session is usable
 
+    async def test_attach_is_idempotent_per_target(self):
+        # a second CDP attach would create a second session that duplicates
+        # every event (the auto-attach + explicit-attach combo); attach()
+        # must hand back the session it already holds instead.
+        fake, transport, conn = self.make()
+        async with conn:
+            session = await purecdp.new_session(conn, 'about:blank')
+            attaches = sum(1 for m in transport.sent
+                           if m['method'] == 'Target.attachToTarget')
+            again = await conn.attach(session.target_id)
+            assert again is session
+            assert sum(1 for m in transport.sent
+                       if m['method'] == 'Target.attachToTarget') == attaches
+            # a CLOSED session must not satisfy the dedupe
+            await purecdp.close_page(conn, session)
+            await drain()
+            assert session.closed
+
     async def test_close_page_ends_session_keeps_connection(self):
         fake, transport, conn = self.make()
         async with conn:
-            session = await purecdp.new_page(conn, 'about:blank')
+            session = await purecdp.new_session(conn, 'about:blank')
             await purecdp.close_page(conn, session)
             await drain()
             assert session.closed
             assert 'T-1' not in fake.targets
             assert not conn.closed
             # connection still fully usable
-            session2 = await purecdp.new_page(conn, 'about:blank')
+            session2 = await purecdp.new_session(conn, 'about:blank')
             assert session2.target_id == 'T-2'
 
     async def test_context_pages_and_dispose(self):
@@ -96,8 +114,8 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         async with conn:
             context = await purecdp.new_context(conn)
             assert context.context_id == 'CTX-1'
-            p1 = await context.new_page('about:blank')
-            p2 = await context.new_page('about:blank')
+            p1 = await context.new_session('about:blank')
+            p2 = await context.new_session('about:blank')
             assert fake.targets[p1.target_id]['ctx'] == 'CTX-1'
             assert fake.targets[p2.target_id]['ctx'] == 'CTX-1'
             await context.aclose()
@@ -156,7 +174,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_target_crash_closes_session_with_error(self):
         fake, transport, conn = self.make()
         async with conn:
-            session = await purecdp.new_page(conn, 'about:blank')
+            session = await purecdp.new_session(conn, 'about:blank')
             stream = session.listen()
             transport.push(fake.crash(session.target_id))
             await drain()
@@ -178,7 +196,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_target_info_changed_updates_session(self):
         fake, transport, conn = self.make()
         async with conn:
-            session = await purecdp.new_page(conn, 'about:blank')
+            session = await purecdp.new_session(conn, 'about:blank')
             await drain()
             transport.push(fake.info_changed(session.target_id, 'https://after'))
             await drain()
@@ -187,7 +205,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_detach_leaves_target_running(self):
         fake, transport, conn = self.make()
         async with conn:
-            session = await purecdp.new_page(conn, 'about:blank')
+            session = await purecdp.new_session(conn, 'about:blank')
             await session.detach()
             await drain()
             assert session.closed

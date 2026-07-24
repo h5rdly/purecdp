@@ -75,7 +75,7 @@ class CDPTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def new_page(self) -> Page:
         '''An additional Page in the same isolated context.'''
-        session = await self.browser.new_page(context=self.context)
+        session = await self.browser.new_session(context=self.context)
         page = await Page.create(session, default_timeout=self.DEFAULT_TIMEOUT)
         if self.ARTIFACTS_NETWORK and self._artifacts_on():
             page.record()

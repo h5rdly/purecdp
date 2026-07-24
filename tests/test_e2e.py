@@ -55,7 +55,7 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
     async def test_websocket_evaluate_and_navigate(self):
         async with asyncio.timeout(60):
             async with await purecdp.launch(extra_args=EXTRA_ARGS) as browser:
-                session = await browser.new_page()
+                session = await browser.new_session()
                 assert session.target_id is not None
 
                 # evaluate
@@ -82,7 +82,7 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
     async def test_pipe_evaluate(self):
         async with asyncio.timeout(60):
             async with await purecdp.launch(pipe=True, extra_args=EXTRA_ARGS) as browser:
-                session = await browser.new_page()
+                session = await browser.new_session()
                 result, exception_details = await session.execute(
                     runtime.evaluate(expression='1 + 1', return_by_value=True))
                 assert exception_details is None
@@ -95,8 +95,8 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
                 conn = browser.connection
                 async with await browser.new_context() as ctx_a:
                     async with await browser.new_context() as ctx_b:
-                        page_a = await browser.new_page(context=ctx_a)
-                        page_b = await browser.new_page(context=ctx_b)
+                        page_a = await browser.new_session(context=ctx_a)
+                        page_b = await browser.new_session(context=ctx_b)
                         # cookie isolation between contexts (Storage domain is
                         # browser-level and context-scoped)
                         await conn.execute(storage.set_cookies(
@@ -135,7 +135,7 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(60):
             async with await purecdp.launch(extra_args=EXTRA_ARGS) as browser:
                 conn = browser.connection
-                opener = await browser.new_page('data:text/html,opener')
+                opener = await browser.new_session('data:text/html,opener')
                 await conn.set_auto_attach(wait_for_debugger=True)
 
                 waiter = asyncio.create_task(conn.wait_for(

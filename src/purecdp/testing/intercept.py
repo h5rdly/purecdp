@@ -23,13 +23,16 @@ Handler = typing.Callable[['InterceptedRequest'], typing.Awaitable[None]]
 
 @dataclass
 class Route:
-    pattern: str  # fnmatch glob over the full URL; '*' crosses '/'
+    #: fnmatch glob over the full URL ('*' crosses '/'), or a
+    #: ``callable(url) -> bool`` — the same predicate form record() takes.
+    pattern: str | typing.Callable[[str], bool]
     handler: Handler
 
 
 def match_route(routes: list[Route], url: str) -> Route | None:
     for route in routes:
-        if fnmatch.fnmatch(url, route.pattern):
+        if (route.pattern(url) if callable(route.pattern)
+                else fnmatch.fnmatch(url, route.pattern)):
             return route
     return None
 

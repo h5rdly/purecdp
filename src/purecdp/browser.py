@@ -87,9 +87,9 @@ class BrowserContext:
         self.connection = connection
         self.context_id = context_id
 
-    async def new_page(self, url: str = 'about:blank'):
-        return await new_page(self.connection, url,
-                              browser_context_id=self.context_id)
+    async def new_session(self, url: str = 'about:blank'):
+        return await new_session(self.connection, url,
+                                 browser_context_id=self.context_id)
 
     async def aclose(self) -> None:
         from .protocol import browser as _browser
@@ -113,7 +113,7 @@ async def new_context(connection: Connection) -> BrowserContext:
     return BrowserContext(connection, str(context_id))
 
 
-async def new_page(
+async def new_session(
     connection: Connection,
     url: str = 'about:blank',
     *,
@@ -165,9 +165,12 @@ class Browser:
     async def new_context(self) -> BrowserContext:
         return await new_context(self.connection)
 
-    async def new_page(self, url: str = 'about:blank', *,
-                       context: BrowserContext | None = None):
-        return await new_page(
+    async def new_session(self, url: str = 'about:blank', *,
+                          context: BrowserContext | None = None):
+        '''Create a page target (optionally in a context) and attach — returns
+        the raw :class:`Session`; wrap it in ``testing.Page.create`` for the
+        high-level driver.'''
+        return await new_session(
             self.connection, url,
             browser_context_id=context.context_id if context else None)
 
@@ -243,6 +246,7 @@ async def launch(
     headless: bool = True,
     pipe: bool = False,
     stealth: bool = False,
+    ignore_https_errors: bool = False,
     user_data_dir: str | None = None,
     prefs: dict | None = None,
     extra_args: typing.Sequence[str] = (),
@@ -258,6 +262,9 @@ async def launch(
     ``prefs`` seeds the profile's ``Default/Preferences`` before start (dotted
     or nested keys) — the way to set options with no command-line flag, e.g.
     ``{"credentials_enable_service": False}`` to silence the password manager.
+
+    ``ignore_https_errors=True`` accepts invalid/self-signed certificates
+    (``--ignore-certificate-errors``) — for local-HTTPS and dev-proxy setups.
     '''
     path = browser_path or find_browser()
     if path is None:
@@ -273,6 +280,9 @@ async def launch(
     argv = [path, f'--user-data-dir={profile}', *DEFAULT_ARGS]
     if stealth:
         argv += STEALTH_ARGS
+    if ignore_https_errors:
+        # self-signed / local-HTTPS workflows (mkcert, dev proxies)
+        argv.append('--ignore-certificate-errors')
     if headless:
         # modern headless matches headful's fingerprint far better than old
         argv.append('--headless=new' if stealth else '--headless')

@@ -111,8 +111,8 @@ class DumpArtifactsTests(unittest.TestCase):
                                            exc=exc))
             names = sorted(os.listdir(dest))
             assert names == ['console.log', 'info.txt', 'js_errors.log',
-                             'network.log', 'page-2.html', 'page.html',
-                             'screenshot-2.png', 'screenshot.png']
+                             'network.har', 'network.log', 'page-2.html',
+                             'page.html', 'screenshot-2.png', 'screenshot.png']
             with open(os.path.join(dest, 'screenshot.png'), 'rb') as f:
                 assert f.read().startswith(b'\x89PNG')
             assert '[error] boom' in _read(dest, 'console.log')
@@ -120,6 +120,11 @@ class DumpArtifactsTests(unittest.TestCase):
             net = _read(dest, 'network.log')
             assert 'POST https://api.example/q -> 200' in net
             assert '{"ok": true}' in net and '{"q": 1}' in net
+            import json as json_mod
+            har = json_mod.loads(_read(dest, 'network.har'))
+            (entry,) = har['log']['entries']
+            assert entry['request']['url'] == 'https://api.example/q'
+            assert entry['response']['content']['text'] == '{"ok": true}'
             info = _read(dest, 'info.txt')
             assert 'test: pkg.Case.test_x' in info
             assert 'outcome: FAIL (AssertionError)' in info
