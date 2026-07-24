@@ -53,7 +53,7 @@ jobs:
           allow-prereleases: ${{ endsWith(matrix.python-version, 't') }}
 
       # Linux/Windows: a known-good Chrome for Testing.
-      - uses: browser-actions/setup-chrome@v1
+      - uses: browser-actions/setup-chrome@v2
         id: setup-chrome
         if: runner.os != 'macOS'
         with:
