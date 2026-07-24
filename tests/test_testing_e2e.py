@@ -403,6 +403,15 @@ class LiveE2ETests(CDPTestCase):
         assert await self.page.evaluate('window.n') == 2
         await btn.should(text='go2')
 
+    async def test_probe_observes_without_waiting_or_raising(self):
+        await self.page.goto(
+            'data:text/html,<button class=go disabled>Send</button>')
+        obs = await self.page.live('.go').probe()
+        assert obs['count'] == 1 and obs['present'] is True
+        assert obs['enabled'] is False and 'Send' in obs['text']
+        gone = await self.page.live('.missing').probe()
+        assert gone['count'] == 0 and gone['present'] is False   # no raise
+
     async def test_should_count_and_text_retry(self):
         await self.page.goto(
             'data:text/html,<ul id=list></ul><script>let i=0;'

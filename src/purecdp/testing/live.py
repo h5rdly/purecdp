@@ -333,10 +333,17 @@ class Live(LiveFactories):
         el = await self._wait_one(timeout)
         return await el.eval('(e) => e.value == null ? "" : String(e.value)')
 
+    async def probe(self) -> dict:
+        '''One-round-trip observation of the current matches — no waiting, no
+        raising: the soft-assertion counterpart of :meth:`should` for suites
+        that accumulate PASS/FAIL and keep going. Keys: ``count``, ``present``,
+        ``visible``, ``enabled``, ``checked``, ``text``, ``value`` (per-element
+        keys describe the first match; None/False-ish when there is none).'''
+        return await self._owner.evaluate(self._call('probe'), return_by_value=True)
+
     async def count(self) -> int:
         '''Number of matches right now (no waiting — can be 0).'''
-        obs = await self._owner.evaluate(self._call('probe'), return_by_value=True)
-        return int(obs['count'])
+        return int((await self.probe())['count'])
 
     # -- assertion -----------------------------------------------------------
 
@@ -361,8 +368,7 @@ class Live(LiveFactories):
         try:
             async with asyncio.timeout(to):
                 while True:
-                    obs = await self._owner.evaluate(
-                        self._call('probe'), return_by_value=True)
+                    obs = await self.probe()
                     if not _failing(conditions, obs):
                         return
                     await asyncio.sleep(0.05)

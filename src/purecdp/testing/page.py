@@ -660,12 +660,21 @@ class Page(ElementQueries, LiveFactories):
         exclude: str | None = None,
         predicate: typing.Callable[[str], bool] | None = None,
         record_preflights: bool = False,
+        default_timeout: float | None = None,
     ) -> NetworkRecorder:
         '''Start recording matching HTTP exchanges (see NetworkRecorder).
-        Subscribe before triggering; cleaned up with the page.'''
+        Subscribe before triggering; cleaned up with the page.
+
+        ``default_timeout`` is the recorder's own wait default for
+        ``expect()`` / ``wait_for_next()`` — an endpoint's latency profile has
+        nothing to do with the page's DOM default, so declare it once where
+        the endpoint is named (an LLM route might need 120, a preview
+        sub-second) instead of remembering ``timeout=`` at every call site.
+        Falls back to the page default when not set.'''
         recorder = NetworkRecorder(self, needle=needle, exclude=exclude,
                                    predicate=predicate,
-                                   record_preflights=record_preflights)
+                                   record_preflights=record_preflights,
+                                   default_timeout=default_timeout)
         stream = self.session.listen(
             network_proto.RequestWillBeSent,
             network_proto.ResponseReceived,

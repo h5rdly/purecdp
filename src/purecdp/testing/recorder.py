@@ -72,6 +72,7 @@ class _ExchangeExpectation:
         self._mark = mark
         self._json = json
         self._timeout = timeout
+        self._resolved: Exchange | None = None
 
     async def __aenter__(self) -> _ExchangeExpectation:
         return self
@@ -85,9 +86,28 @@ class _ExchangeExpectation:
         return self._recorder.exchanges[self._mark:]
 
     @property
+    def skipped(self) -> list[Exchange]:
+        '''The exchanges a ``json=True`` filter passed over before the one
+        ``.value`` resolved to — what a proxy error page looks like when you
+        want to log it. Empty until ``.value`` has resolved (and always empty
+        without ``json=True``, which skips nothing).'''
+        out: list[Exchange] = []
+        if self._resolved is not None:
+            for exchange in self.new:
+                if exchange is self._resolved:
+                    break
+                out.append(exchange)
+        return out
+
+    @property
     def value(self) -> typing.Awaitable[Exchange]:
-        return self._recorder.wait_for_next(
-            self._mark, json=self._json, timeout=self._timeout)
+        return self._resolve()
+
+    async def _resolve(self) -> Exchange:
+        if self._resolved is None:
+            self._resolved = await self._recorder.wait_for_next(
+                self._mark, json=self._json, timeout=self._timeout)
+        return self._resolved
 
 
 class NetworkRecorder:
@@ -108,12 +128,16 @@ class NetworkRecorder:
         exclude: str | None = None,
         predicate: typing.Callable[[str], bool] | None = None,
         record_preflights: bool = False,
+        default_timeout: float | None = None,
     ):
         self._page = page
         self._needle = needle
         self._exclude = exclude
         self._predicate = predicate
         self._record_preflights = record_preflights
+        #: This recorder's own wait default (None -> the page default). The
+        #: endpoint's latency profile, declared once at creation.
+        self.default_timeout = default_timeout
         self.exchanges: list[Exchange] = []
         self._pending: dict[str, Exchange] = {}
         self._appended = asyncio.Event()
@@ -145,9 +169,11 @@ class NetworkRecorder:
         current position, so the length-bookkeeping ``wait_for_next`` needs is
         done for you and nothing that lands in between is missed. ``json=True``
         resolves to the first new exchange whose body parses as JSON, skipping
-        those that don't (a dev proxy's interleaved HTML error page) — the
-        skipped ones still appear in ``.new`` and ``exchanges``. ``.new`` lists
-        everything captured since arming, no waiting.'''
+        those that don't (a dev proxy's interleaved HTML error page) — after
+        ``.value`` resolves, ``.skipped`` lists exactly what was passed over,
+        and everything stays in ``.new`` / ``exchanges``. Timeout: the
+        ``timeout`` argument, else the recorder's ``default_timeout``, else
+        the page default.'''
         return _ExchangeExpectation(self, len(self.exchanges),
                                     json=json, timeout=timeout)
 
@@ -159,9 +185,12 @@ class NetworkRecorder:
         needed. Burst-safe: exchanges landing together are returned one per
         call, oldest first. ``json=True`` returns the first whose body parses
         as JSON, skipping those that don't (they stay in ``exchanges``).
-        :meth:`expect` wraps this with the position captured for you.'''
+        :meth:`expect` wraps this with the position captured for you. Timeout
+        resolution: the ``timeout`` argument, else the recorder's
+        ``default_timeout``, else the page default.'''
         index = previous_count
-        async with asyncio.timeout(timeout or self._page.default_timeout):
+        async with asyncio.timeout(timeout or self.default_timeout
+                                   or self._page.default_timeout):
             while True:
                 while index < len(self.exchanges):
                     exchange = self.exchanges[index]

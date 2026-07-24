@@ -5,7 +5,7 @@ Runnable three ways: `python -m unittest`, `python tests/test_testing.py`,
 or `python -m pytest` — none require pytest. Plain asserts: don't run with -O.
 '''
 
-import asyncio, base64, pathlib, sys
+import asyncio, base64, pathlib, sys, time
 import unittest
 from unittest import mock
 
@@ -419,7 +419,30 @@ class InitScriptAndRecorderTests(PageTestBase):
         assert exchange.json == {'answer': 42}          # R0 pre-arm, R1 non-JSON
         assert [e.text for e in turn.new] == ['<html>proxy err</html>',
                                               '{"answer": 42}']
+        assert [e.text for e in turn.skipped] == ['<html>proxy err</html>']
         assert (await plain.value).text == '<html>proxy err</html>'
+        assert plain.skipped == []                      # json=False skips nothing
+
+    async def test_recorder_default_timeout_beats_page_default(self):
+        # the endpoint's latency profile lives on the recorder: with nothing
+        # recorded, a 0.05s recorder default must fire long before the page's
+        # (multi-second) default would.
+        recorder = self.page.record(needle='/nothing', default_timeout=0.05)
+        start = time.monotonic()
+        try:
+            await recorder.wait_for_next(0)
+        except TimeoutError:
+            assert time.monotonic() - start < 1
+        else:
+            raise AssertionError('expected TimeoutError from the recorder default')
+        # an explicit per-call timeout still wins over the recorder default
+        start = time.monotonic()
+        try:
+            await recorder.expect(timeout=0.01).value
+        except TimeoutError:
+            assert time.monotonic() - start < 1
+        else:
+            raise AssertionError('expected TimeoutError from the explicit timeout')
 
 
 class ConvenienceTests(PageTestBase):

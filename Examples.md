@@ -291,6 +291,10 @@ el = await loc.get()              # escape hatch to the eager Element API
 await loc.should(visible=True, text="Invalid")
 await loc.should(count=0)                        # asserts it's gone
 await loc.should(value="1000", enabled=True)
+
+# observe (one round trip, no waiting, no raising — for accumulate-and-continue
+# suites that record PASS/FAIL themselves instead of failing fast)
+obs = await loc.probe()   # {count, present, visible, enabled, checked, text, value}
 ```
 
 `query` / `query_all` / `Element` remain as the lower-level eager layer; `live` is
@@ -337,10 +341,21 @@ assert ex.status == 200
 
 `expect(json=True)` resolves to the first new exchange whose body parses as
 JSON, skipping interleaved non-JSON responses (a dev proxy's HTML error page)
-— the skipped ones stay in `rec.exchanges`, and `turn.new` lists everything
-captured since arming. The lower-level `rec.wait_for_next(previous_len)` is
-still there when you want to walk exchanges by index (burst-safe: exchanges
-landing together come back one per call, oldest first).
+— after `.value` resolves, `turn.skipped` lists exactly what was passed over
+(log it if you care), the skipped ones stay in `rec.exchanges`, and `turn.new`
+lists everything captured since arming. The lower-level
+`rec.wait_for_next(previous_len)` is still there when you want to walk
+exchanges by index (burst-safe: exchanges landing together come back one per
+call, oldest first).
+
+A recorder can carry its own wait default — an endpoint's latency profile has
+nothing to do with the page's DOM default, so declare it once where the
+endpoint is named instead of remembering `timeout=` at every `expect()`:
+
+```python
+llm = self.page.record(needle="/api/chat", default_timeout=120)   # slow route
+prices = self.page.record(needle="/api/prices")                   # page default is fine
+```
 
 For a streamed (`text/event-stream`) response, `parse_sse` turns the captured
 body into events (any per-frame encoding — base64, JSON — is yours to decode):
