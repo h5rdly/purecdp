@@ -11,6 +11,7 @@ import asyncio
 import importlib.util
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -136,6 +137,10 @@ class PytestPluginTests(unittest.TestCase):
         )
         env = dict(os.environ)
         env['PYTHONPATH'] = _SRC + os.pathsep + env.get('PYTHONPATH', '')
+        # hermetic: a pip-installed purecdp would auto-register the plugin via
+        # its pytest11 entry point and collide with the explicit -p below (and
+        # unrelated site plugins add their own noise) — load ONLY what we name.
+        env['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'
         if EXTRA:
             env['PURECDP_LAUNCH_ARGS'] = ' '.join(EXTRA)
         with tempfile.TemporaryDirectory() as tmp:
@@ -271,6 +276,41 @@ class DriveParityE2ETests(CDPTestCase):
         assert exchange.json == {'answer': 42}
         assert recorder.responses[-1] == {'answer': 42}
 
+    async def test_expect_json_skips_interleaved_non_json(self):
+        async def api(request):
+            if request.url.endswith('/err'):
+                await request.fulfill(body='<html>proxy err</html>',
+                                      content_type='text/html')
+            else:
+                await request.fulfill(json={'answer': 42})
+
+        await self.page.route('*stub.invalid*', api)
+        recorder = self.page.record(needle='stub.invalid')
+        await self.page.goto('data:text/html,expect')
+
+        turn = recorder.expect(json=True)               # armed BEFORE the trigger
+        # each body is consumed — an unread fetch response never finishes
+        # loading, so its exchange would never complete/record
+        await self.page.evaluate(
+            "fetch('https://stub.invalid/err').then(r => r.text())"
+            ".then(() => fetch('https://stub.invalid/query'))"
+            '.then(r => r.json())')
+        exchange = await turn.value
+        assert exchange.json == {'answer': 42}          # the HTML page was skipped
+        assert [e.url.rsplit('/', 1)[-1] for e in turn.new] == ['err', 'query']
+
+    async def test_query_containing_accepts_regex(self):
+        await self.page.goto(
+            'data:text/html,<div class=node>BRAND AND CO</div>'
+            '<div class=node>AND</div>')
+        exact = re.compile(r'^AND$')
+        el = await self.page.query('.node', containing=exact)
+        assert (await el.text()).strip() == 'AND'       # substring would match both
+        both = await self.page.query_all('.node', containing='and')
+        assert len(both) == 2
+        only = await self.page.query_all('.node', containing=exact)
+        assert len(only) == 1
+
 
 if __name__ == '__main__':
     unittest.main()
@@ -372,6 +412,20 @@ class LiveE2ETests(CDPTestCase):
             'if(++i>=3)clearInterval(t)},40)</script>')
         await self.page.live('.row').should(count=3)          # polls until 3 exist
         await self.page.live('.row').last.should(text='r2')
+
+    async def test_containing_pattern_matches_exactly(self):
+        # substring 'AND' hits both nodes; the anchored pattern (tested against
+        # the trimmed text) isolates the operator node — the react-flow case.
+        await self.page.goto(
+            'data:text/html,<div class=node> AND </div>'
+            "<div class=node>BRAND AND CO<button onclick='window.hit=1'>x"
+            '</button></div>')
+        exact = re.compile(r'^AND$')
+        await self.page.live('.node', containing='and').should(count=2)
+        await self.page.live('.node', containing=exact).should(count=1, text='AND')
+        await self.page.live('.node').containing(
+            re.compile(r'^BRAND', re.I)).live('button').click()
+        assert await self.page.evaluate('window.hit') == 1
 
     async def test_should_timeout_raises_expectation_error(self):
         from purecdp.testing import ExpectationError

@@ -50,14 +50,54 @@ class Exchange:
         return self.body.decode('utf-8', 'replace') if self.body else ''
 
 
+def _parses_as_json(exchange: Exchange) -> bool:
+    if exchange.body is None:
+        return False
+    try:
+        _json.loads(exchange.body)
+    except Exception:
+        return False
+    return True
+
+
+class _ExchangeExpectation:
+    '''Handle from :meth:`NetworkRecorder.expect`. ``await .value`` resolves to
+    the first exchange completed after arming; ``.new`` is every exchange
+    completed since arming (no waiting). Arming happens at creation, so it
+    works held as a plain object or as an ``async with`` around the trigger.'''
+
+    def __init__(self, recorder: NetworkRecorder, mark: int, *,
+                 json: bool, timeout: float | None):
+        self._recorder = recorder
+        self._mark = mark
+        self._json = json
+        self._timeout = timeout
+
+    async def __aenter__(self) -> _ExchangeExpectation:
+        return self
+
+    async def __aexit__(self, *exc_info: typing.Any) -> None:
+        return None
+
+    @property
+    def new(self) -> list[Exchange]:
+        '''Every exchange completed since arming, oldest first (no waiting).'''
+        return self._recorder.exchanges[self._mark:]
+
+    @property
+    def value(self) -> typing.Awaitable[Exchange]:
+        return self._recorder.wait_for_next(
+            self._mark, json=self._json, timeout=self._timeout)
+
+
 class NetworkRecorder:
     '''Records exchanges whose URL contains ``needle`` (minus ``exclude``
     matches), or matching a custom ``predicate(url)``. Create via
     ``page.record(...)`` so its pump is cleaned up with the page.
 
     ``exchanges`` holds *completed* exchanges, oldest first; ``requests`` and
-    ``responses`` are the JSON-parsed conveniences. Capture the length before
-    triggering, then ``await recorder.wait_for_next(previous_len)``.
+    ``responses`` are the JSON-parsed conveniences. To wait for a response,
+    arm ``recorder.expect()`` before the trigger and ``await .value`` after.
     '''
 
     def __init__(
@@ -93,15 +133,43 @@ class NetworkRecorder:
             return False
         return not (self._exclude and self._exclude in url)
 
+    def expect(self, *, json: bool = False, timeout: float | None = None
+               ) -> _ExchangeExpectation:
+        '''Arm a wait for the next exchange BEFORE triggering it::
+
+            turn = recorder.expect(json=True)
+            await page.press('Enter')             # the trigger
+            resp = (await turn.value).json
+
+        (``async with recorder.expect() as turn:`` works too.) Arming pins the
+        current position, so the length-bookkeeping ``wait_for_next`` needs is
+        done for you and nothing that lands in between is missed. ``json=True``
+        resolves to the first new exchange whose body parses as JSON, skipping
+        those that don't (a dev proxy's interleaved HTML error page) — the
+        skipped ones still appear in ``.new`` and ``exchanges``. ``.new`` lists
+        everything captured since arming, no waiting.'''
+        return _ExchangeExpectation(self, len(self.exchanges),
+                                    json=json, timeout=timeout)
+
     async def wait_for_next(
-        self, previous_count: int, *, timeout: float | None = None
+        self, previous_count: int, *,
+        json: bool = False, timeout: float | None = None,
     ) -> Exchange:
-        '''Return the newest exchange once more than previous_count exist.'''
+        '''The first exchange past ``previous_count``, waiting for it if
+        needed. Burst-safe: exchanges landing together are returned one per
+        call, oldest first. ``json=True`` returns the first whose body parses
+        as JSON, skipping those that don't (they stay in ``exchanges``).
+        :meth:`expect` wraps this with the position captured for you.'''
+        index = previous_count
         async with asyncio.timeout(timeout or self._page.default_timeout):
-            while len(self.exchanges) <= previous_count:
+            while True:
+                while index < len(self.exchanges):
+                    exchange = self.exchanges[index]
+                    index += 1
+                    if not json or _parses_as_json(exchange):
+                        return exchange
                 self._appended.clear()
                 await self._appended.wait()
-        return self.exchanges[-1]
 
     # -- pump (driven by page.record()) --------------------------------------
 

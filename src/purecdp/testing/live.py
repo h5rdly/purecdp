@@ -21,7 +21,7 @@ import json
 import re
 import typing
 
-from .element import Element, _elements_from_array
+from .element import Element, _elements_from_array, _js_regex
 
 if typing.TYPE_CHECKING:
     from .page import Page
@@ -72,6 +72,9 @@ _LIVE_JS = r'''
   const lc = (s) => (s || '').toLowerCase();
   const txt = (e) => (e.textContent || '').trim();
   const match = (s, q, exact) => exact ? (s || '').trim() === q : lc(s).includes(lc(q));
+  const mtext = (s, q) => (q && typeof q === 'object')
+    ? new RegExp(q.re, q.flags).test((s || '').trim())
+    : lc(s).includes(lc(q));
   const accName = (e) => {
     let n = e.getAttribute && e.getAttribute('aria-label');
     if (!n && e.labels && e.labels.length) n = e.labels[0].textContent;
@@ -91,7 +94,7 @@ _LIVE_JS = r'''
       let out = [];
       for (const r of roots) for (const x of r.querySelectorAll(s.sel)) out.push(x);
       els = [...new Set(out)];
-      if (s.containing) els = els.filter(e => match(txt(e), s.containing, false));
+      if (s.containing) els = els.filter(e => mtext(txt(e), s.containing));
       if (s.name) els = els.filter(e => lc(accName(e)).includes(lc(s.name)));
     } else if (s.kind === 'text') {
       const roots = els === null ? [document.documentElement] : els;
@@ -105,7 +108,7 @@ _LIVE_JS = r'''
       for (const r of roots) for (const x of r.querySelectorAll(LABELABLE)) pool.add(x);
       els = [...pool].filter(e => match(accName(e), s.q, s.exact));
     } else if (s.kind === 'filter') {
-      els = (els || []).filter(e => match(txt(e), s.containing, false));
+      els = (els || []).filter(e => mtext(txt(e), s.containing));
     } else if (s.kind === 'index') {
       const e = els === null ? null : els.at(s.n);
       els = e ? [e] : [];
@@ -136,6 +139,22 @@ class ExpectationError(AssertionError):
     AssertionError so it registers as a test *failure*, not an error.'''
 
 
+def _text_arg(q: str | re.Pattern | None) -> typing.Any:
+    '''Encode a text filter for the JSON steps recipe: a str passes through,
+    a ``re.Pattern`` becomes the ``{'re': source, 'flags': ...}`` form the
+    reducer turns back into a RegExp (tested against the trimmed text).'''
+    if isinstance(q, re.Pattern):
+        source, flags = _js_regex(q)
+        return {'re': source, 'flags': flags}
+    return q
+
+
+def _fmt_text_arg(v: typing.Any) -> str:
+    if isinstance(v, dict):
+        return f'/{v["re"]}/{v["flags"]}'
+    return repr(v)
+
+
 def _repr_steps(steps: list[dict]) -> str:
     parts = []
     for s in steps:
@@ -143,7 +162,7 @@ def _repr_steps(steps: list[dict]) -> str:
         if k == 'css':
             p = repr(s['sel'])
             if s.get('containing'):
-                p += f' containing {s["containing"]!r}'
+                p += f' containing {_fmt_text_arg(s["containing"])}'
             if s.get('name'):
                 p += f' name {s["name"]!r}'
             parts.append(p)
@@ -152,7 +171,7 @@ def _repr_steps(steps: list[dict]) -> str:
         elif k == 'label':
             parts.append(f'label {s["q"]!r}')
         elif k == 'filter':
-            parts.append(f'containing {s["containing"]!r}')
+            parts.append(f'containing {_fmt_text_arg(s["containing"])}')
         elif k == 'index':
             parts.append(f'[{s["n"]}]')
     return ' > '.join(parts)
@@ -167,14 +186,19 @@ class LiveFactories:
     def _live(self, step: dict) -> Live:
         return Live(self, [step])
 
-    def live(self, selector: str, *, containing: str | None = None) -> Live:
+    def live(self, selector: str, *,
+             containing: str | re.Pattern | None = None) -> Live:
         '''A lazy, re-resolving locator for element(s) matching ``selector`` —
         the ergonomic default for tests. It re-runs the query on every action
         and assertion (so it survives re-renders), auto-waits, and carries
-        :meth:`Live.should` assertions. On a Page/Frame the query starts at the
-        document; on a ``Live`` it scopes inside the current matches. ``query``
-        / ``query_all`` stay as the eager lower-level layer.'''
-        return self._live({'kind': 'css', 'sel': selector, 'containing': containing})
+        :meth:`Live.should` assertions. ``containing`` filters by text:
+        case-insensitive substring, or a ``re.Pattern`` tested against the
+        trimmed text (anchors give exact match). On a Page/Frame the query
+        starts at the document; on a ``Live`` it scopes inside the current
+        matches. ``query`` / ``query_all`` stay as the eager lower-level
+        layer.'''
+        return self._live({'kind': 'css', 'sel': selector,
+                           'containing': _text_arg(containing)})
 
     def get_by_test_id(self, test_id: str) -> Live:
         '''Locator for ``[data-testid="..."]``.'''
@@ -225,10 +249,11 @@ class Live(LiveFactories):
     def nth(self, i: int) -> Live:
         return self._live({'kind': 'index', 'n': i})
 
-    def containing(self, text: str) -> Live:
-        '''Filter the current matches to those whose textContent contains
-        ``text`` (case-insensitive).'''
-        return self._live({'kind': 'filter', 'containing': text})
+    def containing(self, text: str | re.Pattern) -> Live:
+        '''Filter the current matches by text: case-insensitive substring, or
+        a ``re.Pattern`` tested against the trimmed textContent (anchors give
+        exact match: ``re.compile(r'^AND$')``).'''
+        return self._live({'kind': 'filter', 'containing': _text_arg(text)})
 
     # -- resolution ----------------------------------------------------------
 

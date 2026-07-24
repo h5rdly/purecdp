@@ -358,6 +358,69 @@ class InitScriptAndRecorderTests(PageTestBase):
         assert recorder.requests == [{'ask': 1}]
         assert recorder.responses == [{'answer': 42}]
 
+    def _push_exchange(self, request_id: str, url: str, body: str) -> None:
+        '''Push a full request/response/finished series through the fake.'''
+        sid = self.page.session.session_id
+        self.fake.response_bodies[request_id] = {
+            'body': body, 'base64Encoded': False}
+        self.transport.push({
+            'method': 'Network.requestWillBeSent', 'sessionId': sid,
+            'params': {'requestId': request_id, 'loaderId': 'L1',
+                       'documentURL': 'https://x/', 'timestamp': 1.0,
+                       'wallTime': 1.0, 'initiator': {'type': 'other'},
+                       'redirectHasExtraInfo': False,
+                       'request': {'url': url, 'method': 'GET', 'headers': {},
+                                   'initialPriority': 'High',
+                                   'referrerPolicy': 'no-referrer'}}})
+        self.transport.push({
+            'method': 'Network.responseReceived', 'sessionId': sid,
+            'params': {'requestId': request_id, 'loaderId': 'L1',
+                       'timestamp': 2.0, 'type': 'XHR', 'frameId': 'F-1',
+                       'hasExtraInfo': False,
+                       'response': {'url': url, 'status': 200,
+                                    'statusText': 'OK', 'headers': {},
+                                    'mimeType': 'application/json',
+                                    'charset': 'utf-8',
+                                    'connectionReused': False,
+                                    'connectionId': 1,
+                                    'encodedDataLength': 14,
+                                    'securityState': 'secure'}}})
+        self.transport.push({
+            'method': 'Network.loadingFinished', 'sessionId': sid,
+            'params': {'requestId': request_id, 'timestamp': 3.0,
+                       'encodedDataLength': 14}})
+
+    async def test_wait_for_next_is_burst_safe_and_json_filters(self):
+        recorder = self.page.record(needle='/query')
+        # both exchanges complete before anyone waits — a burst
+        self._push_exchange('R1', 'https://x/query', '<html>proxy err</html>')
+        self._push_exchange('R2', 'https://x/query', '{"answer": 42}')
+
+        first = await recorder.wait_for_next(0, timeout=2)
+        assert first.text == '<html>proxy err</html>'   # oldest first, not newest
+        second = await recorder.wait_for_next(1, timeout=2)
+        assert second.json == {'answer': 42}
+        # json=True skips the non-JSON body but leaves it recorded
+        json_one = await recorder.wait_for_next(0, json=True, timeout=2)
+        assert json_one.json == {'answer': 42}
+        assert len(recorder.exchanges) == 2
+
+    async def test_expect_pins_position_at_arming(self):
+        recorder = self.page.record(needle='/query')
+        self._push_exchange('R0', 'https://x/query', '{"stale": true}')
+        await recorder.wait_for_next(0, timeout=2)      # R0 recorded pre-arm
+
+        async with recorder.expect(json=True, timeout=2) as turn:
+            plain = recorder.expect(timeout=2)          # CM-less arming works too
+            self._push_exchange('R1', 'https://x/query', '<html>proxy err</html>')
+            self._push_exchange('R2', 'https://x/query', '{"answer": 42}')
+
+        exchange = await turn.value
+        assert exchange.json == {'answer': 42}          # R0 pre-arm, R1 non-JSON
+        assert [e.text for e in turn.new] == ['<html>proxy err</html>',
+                                              '{"answer": 42}']
+        assert (await plain.value).text == '<html>proxy err</html>'
+
 
 class ConvenienceTests(PageTestBase):
     def paused_event(self, request_id, url):

@@ -67,7 +67,9 @@ class MyAppTests(CDPTestCase):
 `page.route()` request stubbing/rewriting/aborting. For traffic-level
 assertions there's `page.record()` (full request/response exchanges, with
 `parse_sse()` for streamed bodies) and `page.expect_download()` (capture a
-download's bytes without touching disk). And when a test fails, its pages
+download's bytes without touching disk); arm `recorder.expect()` before a
+click and `await .value` for the response it triggers (`json=True` skips
+interleaved non-JSON bodies). And when a test fails, its pages
 are dumped as diagnostic artifacts — screenshot, HTML, console, recorded
 traffic, traceback — under `purecdp-artifacts/<test id>/` before the browser
 closes; green tests write nothing.

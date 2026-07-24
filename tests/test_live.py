@@ -21,6 +21,7 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from purecdp.testing import ExpectationError, Live  # noqa: E402
+from purecdp.testing.element import _js_regex, _query_js  # noqa: E402
 from purecdp.testing.live import (  # noqa: E402
     _LIVE_JS, _CONDITIONS, _css_str, _failing, _role_css,
 )
@@ -65,6 +66,29 @@ class StepBuildingTests(unittest.TestCase):
                              {'kind': 'index', 'n': -1}]))
         assert '.card' in r and 'containing' in r and '[-1]' in r
 
+    def test_pattern_containing_encodes_as_regex_step(self):
+        base = Live(None, [])
+        exact = re.compile(r'^AND$', re.IGNORECASE)
+        step = base.live('.node', containing=exact)._steps[0]
+        assert step['containing'] == {'re': '^AND$', 'flags': 'i'}
+        refined = base.live('.node').containing(re.compile(r'\d+ of \d+'))
+        assert refined._steps[-1] == {
+            'kind': 'filter', 'containing': {'re': r'\d+ of \d+', 'flags': ''}}
+        # the recipe stays JSON-serializable, and the repr shows the pattern
+        import json as json_mod
+        json_mod.dumps(refined._steps)
+        assert '/^AND$/i' in repr(base.live('.node', containing=exact))
+
+    def test_js_regex_flag_mapping(self):
+        assert _js_regex(re.compile('x')) == ('x', '')
+        assert _js_regex(re.compile('x', re.I | re.M | re.S)) == ('x', 'ims')
+
+    def test_query_js_pattern_branch(self):
+        js = _query_js('document', '.node', re.compile(r'^AND$', re.I), 0)
+        assert 'new RegExp("^AND$", "i")' in js and '.trim()' in js
+        substr = _query_js('document', '.node', 'and', 0)
+        assert 'includes' in substr and 'RegExp' not in substr
+
 
 class ShouldLogicTests(unittest.TestCase):
     PRESENT = {'count': 2, 'present': True, 'text': 'Loading 5 samples',
@@ -108,6 +132,18 @@ class ResolverJsTests(unittest.TestCase):
     def test_live_js_is_valid_javascript(self):
         with tempfile.NamedTemporaryFile('w', suffix='.js', delete=False) as f:
             f.write('const f = ' + _LIVE_JS + ';\n')
+            path = f.name
+        try:
+            proc = subprocess.run(['node', '--check', path],
+                                  capture_output=True, text=True)
+            assert proc.returncode == 0, proc.stderr
+        finally:
+            pathlib.Path(path).unlink()
+
+    def test_query_js_with_pattern_is_valid_javascript(self):
+        js = _query_js('document', '.node', re.compile(r'^A "B"\.$', re.I), -1)
+        with tempfile.NamedTemporaryFile('w', suffix='.js', delete=False) as f:
+            f.write('const f = ' + js + ';\n')
             path = f.name
         try:
             proc = subprocess.run(['node', '--check', path],

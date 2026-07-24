@@ -63,9 +63,11 @@ async with launched_page() as (browser, page):
     await more.click()
 ```
 
-`query(...)` polls (riding out SPA re-renders), can filter by `containing=`
-(case-insensitive text, the `:has-text()` CDP never had), and picks by `index`
-(`-1` = newest, for apps that leave stale copies of a widget in the DOM).
+`query(...)` polls (riding out SPA re-renders), can filter by `containing=` —
+a case-insensitive substring (the `:has-text()` CDP never had) or a
+`re.Pattern` tested against the trimmed text (anchors give exact match) — and
+picks by `index` (`-1` = newest, for apps that leave stale copies of a widget
+in the DOM).
 
 ### Enumerating a set: `query_all`
 
@@ -269,6 +271,7 @@ Building blocks:
 ```python
 # construct
 page.live("css selector", containing="text")   # substring filter, case-insensitive
+page.live(".node", containing=re.compile(r"^AND$"))  # regex on the trimmed text (exact match via anchors)
 page.get_by_test_id("column-picker")            # [data-testid="..."]
 page.get_by_text("Continue")                    # innermost element with that text
 page.get_by_role("button", name="Continue")     # approximate ARIA role + accessible name
@@ -325,12 +328,19 @@ for URLs matching a filter — "assert on the traffic, not the DOM".
 
 ```python
 rec = self.page.record(needle="/api/track")
-before = len(rec.exchanges)
+turn = rec.expect()                          # arm BEFORE the trigger
 await self.page.click("#buy")
-ex = await rec.wait_for_next(before)         # blocks until the next match lands
+ex = await turn.value                        # blocks until the next match lands
 assert ex.request_json["event"] == "purchase"
 assert ex.status == 200
 ```
+
+`expect(json=True)` resolves to the first new exchange whose body parses as
+JSON, skipping interleaved non-JSON responses (a dev proxy's HTML error page)
+— the skipped ones stay in `rec.exchanges`, and `turn.new` lists everything
+captured since arming. The lower-level `rec.wait_for_next(previous_len)` is
+still there when you want to walk exchanges by index (burst-safe: exchanges
+landing together come back one per call, oldest first).
 
 For a streamed (`text/event-stream`) response, `parse_sse` turns the captured
 body into events (any per-frame encoding — base64, JSON — is yours to decode):
@@ -338,7 +348,7 @@ body into events (any per-frame encoding — base64, JSON — is yours to decode
 ```python
 from purecdp.testing import parse_sse
 
-ex = await rec.wait_for_next(before)
+ex = await turn.value
 for event in parse_sse(ex.text):
     if event.event == "done":
         break

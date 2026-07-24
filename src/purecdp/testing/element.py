@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import typing
 from contextlib import suppress
 
@@ -306,7 +307,7 @@ class Element:
         self,
         selector: str,
         *,
-        containing: str | None = None,
+        containing: str | re.Pattern | None = None,
         index: int = 0,
     ) -> Element | None:
         '''Single-shot scoped query inside this element (no polling); None
@@ -330,13 +331,14 @@ class Element:
         self,
         selector: str,
         *,
-        containing: str | None = None,
+        containing: str | re.Pattern | None = None,
     ) -> list[Element]:
         '''Every matching descendant inside this element, as held Elements
-        (single-shot — no polling), optionally filtered to those whose
-        textContent contains ``containing`` (case-insensitive). ``[]`` when
-        nothing matches. Use it to enumerate/filter a set (a node's buttons, a
-        widget's chips); for a single node use :meth:`query`.'''
+        (single-shot — no polling), optionally filtered by ``containing``
+        (case-insensitive substring, or a ``re.Pattern`` tested against the
+        trimmed text). ``[]`` when nothing matches. Use it to enumerate/filter
+        a set (a node's buttons, a widget's chips); for a single node use
+        :meth:`query`.'''
         function = _query_all_js('el', selector, containing)
         result, details = await self._page.session.execute(
             runtime_proto.call_function_on(
@@ -373,29 +375,53 @@ async def _elements_from_array(owner: typing.Any, array_object_id: str
     return [element for _, element in indexed]
 
 
-def _query_js(root: str, selector: str, containing: str | None, index: int) -> str:
+def _js_regex(pattern: re.Pattern) -> tuple[str, str]:
+    '''(source, flags) for ``new RegExp(...)`` from a Python pattern. Python
+    and JS regex syntax overlap on the subset tests use; the i/m/s flags
+    carry over, anything fancier is on the caller to keep JS-compatible.'''
+    flags = ''
+    if pattern.flags & re.IGNORECASE:
+        flags += 'i'
+    if pattern.flags & re.MULTILINE:
+        flags += 'm'
+    if pattern.flags & re.DOTALL:
+        flags += 's'
+    return pattern.pattern, flags
+
+
+def _containing_filter_js(containing: str | re.Pattern) -> str:
+    '''JS statement filtering ``els`` by text: case-insensitive substring for a
+    str, a RegExp test on the trimmed text for a ``re.Pattern`` (anchors work:
+    ``^AND$`` matches an element whose whole trimmed text is AND).'''
+    if isinstance(containing, re.Pattern):
+        source, flags = _js_regex(containing)
+        return (f' const rx = new RegExp({json.dumps(source)}, {json.dumps(flags)});'
+                ' els = els.filter(e =>'
+                " rx.test((e.textContent || '').trim()));")
+    return (f' const needle = {json.dumps(containing.lower())};'
+            ' els = els.filter(e =>'
+            " (e.textContent || '').toLowerCase().includes(needle));")
+
+
+def _query_js(root: str, selector: str, containing: str | re.Pattern | None,
+              index: int) -> str:
     '''Build '(root) => element-or-null' JS for a filtered, indexed query.'''
     parts = [f'(({root}) => {{',
              f' let els = [...{root}.querySelectorAll({json.dumps(selector)})];']
     if containing is not None:
-        parts.append(
-            f' const needle = {json.dumps(containing.lower())};'
-            ' els = els.filter(e =>'
-            " (e.textContent || '').toLowerCase().includes(needle));")
+        parts.append(_containing_filter_js(containing))
     parts.append(f' return els.at({index}) ?? null; }})')
     return ''.join(parts)
 
 
-def _query_all_js(root: str, selector: str, containing: str | None) -> str:
+def _query_all_js(root: str, selector: str,
+                  containing: str | re.Pattern | None) -> str:
     '''Build '(root) => Element[]' JS for a filtered query returning all
     matches (the array counterpart of :func:`_query_js`).'''
     parts = [f'(({root}) => {{',
              f' let els = [...{root}.querySelectorAll({json.dumps(selector)})];']
     if containing is not None:
-        parts.append(
-            f' const needle = {json.dumps(containing.lower())};'
-            ' els = els.filter(e =>'
-            " (e.textContent || '').toLowerCase().includes(needle));")
+        parts.append(_containing_filter_js(containing))
     parts.append(' return els; })')
     return ''.join(parts)
 
@@ -412,18 +438,21 @@ class ElementQueries:
         self,
         selector: str,
         *,
-        containing: str | None = None,
+        containing: str | re.Pattern | None = None,
         index: int = 0,
         timeout: float | None = None,
         poll: float = 0.05,
         required: bool = True,
     ) -> Element | None:
-        '''Wait for and hold an element: CSS selector, optionally filtered to
-        those whose textContent contains ``containing`` (case-insensitive —
-        the :has-text() CDP never had), picked by ``index`` (-1 = newest/last,
-        for apps that keep stale copies of widgets in the DOM). Polling rides
-        out framework re-renders; raises TimeoutError with the selector in
-        the message unless ``required=False`` (presence probes).'''
+        '''Wait for and hold an element: CSS selector, optionally filtered by
+        ``containing`` — a case-insensitive substring of the textContent (the
+        :has-text() CDP never had) or a ``re.Pattern`` tested against the
+        trimmed text (anchors give exact match: ``re.compile(r'^AND$')``;
+        keep patterns to the Python/JS-shared syntax) — picked by ``index``
+        (-1 = newest/last, for apps that keep stale copies of widgets in the
+        DOM). Polling rides out framework re-renders; raises TimeoutError with
+        the selector in the message unless ``required=False`` (presence
+        probes).'''
         js = _query_js('document', selector, containing, index)
         try:
             async with asyncio.timeout(timeout or self.default_timeout):
@@ -449,12 +478,12 @@ class ElementQueries:
         self,
         selector: str,
         *,
-        containing: str | None = None,
+        containing: str | re.Pattern | None = None,
     ) -> list[Element]:
         '''Every element matching ``selector`` as a held :class:`Element`
-        (single-shot — no polling), optionally filtered to those whose
-        textContent contains ``containing`` (case-insensitive). ``[]`` when
-        nothing matches.
+        (single-shot — no polling), optionally filtered by ``containing``
+        (case-insensitive substring, or a ``re.Pattern`` tested against the
+        trimmed text). ``[]`` when nothing matches.
 
         Use it to enumerate or filter a *set* — chips, rows, a node's buttons —
         e.g. ``[c for c in await page.query_all('button') if not await
