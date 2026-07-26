@@ -17,6 +17,7 @@ import typing
 from contextlib import suppress
 
 
+from ..errors import PureCDPError
 from ..protocol import dom as dom_proto
 from ..protocol import input as input_proto
 from ..protocol import page as page_proto
@@ -87,7 +88,7 @@ async (el, opts) => {
 '''.strip()
 
 
-class ActionabilityError(Exception):
+class ActionabilityError(PureCDPError):
     '''A trusted action's target never became actionable (connected, visible,
     enabled, stable, and un-obscured) within the timeout. ``reason`` names the
     check that was still failing when time ran out.'''

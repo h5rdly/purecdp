@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 
 from ..browser import Browser, close_page, launch
 from ..connection import EventStream, Session
-from ..errors import CDPConnectionClosed, CDPSessionClosed
+from ..errors import CDPConnectionClosed, CDPSessionClosed, PureCDPError
 from .. import _b64
 from ..protocol import browser as browser_proto
 from ..protocol import emulation as emulation_proto
@@ -71,11 +71,11 @@ KEYS = {
 }
 
 
-class NavigateError(Exception):
+class NavigateError(PureCDPError):
     '''Navigation failed (net error, bad URL, ...).'''
 
 
-class JSError(Exception):
+class JSError(PureCDPError):
     '''A JavaScript exception, surfaced from evaluate() or captured uncaught.'''
 
     def __init__(self, message: str, details: typing.Any = None):
@@ -102,7 +102,7 @@ class ConsoleMessage:
     text: str  # arguments stringified and space-joined
 
 
-class DownloadError(Exception):
+class DownloadError(PureCDPError):
     '''A download was canceled, or never completed within the timeout.'''
 
 

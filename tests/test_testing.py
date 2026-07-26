@@ -240,6 +240,18 @@ class ErrorHierarchyTests(unittest.TestCase):
         assert errors.CDPError is errors.CDPCommandError    # compat alias
         assert purecdp.PureCDPError is errors.PureCDPError  # exported
 
+    def test_testing_layer_exceptions_share_the_base(self):
+        # the whole family, so `except PureCDPError` catches anything we raise
+        from purecdp.errors import PureCDPError
+        from purecdp.testing import (JSError, NavigateError, DownloadError,
+                                     ExpectationError, ActionabilityError,
+                                     FrameNotFound)
+        for exc in (JSError, NavigateError, DownloadError, ExpectationError,
+                    ActionabilityError, FrameNotFound):
+            assert issubclass(exc, PureCDPError), exc.__name__
+        # ExpectationError still registers as a unittest FAILURE, not an error
+        assert issubclass(ExpectationError, AssertionError)
+
     async def test_broken_handler_continues_and_warns(self):
         async def handler(request):
             raise RuntimeError('oops')
@@ -417,26 +429,41 @@ class InitScriptAndRecorderTests(PageTestBase):
         assert recorder.requests == [{'ask': 1}]
         assert recorder.responses == [{'answer': 42}]
 
-    def _push_exchange(self, request_id: str, url: str, body: str) -> None:
-        '''Push a full request/response/finished series through the fake.'''
+    def _push_exchange(self, request_id: str, url: str, body: str, *,
+                       method: str = 'GET', status: int = 200,
+                       bodyless: bool = False, failed: str | None = None
+                       ) -> None:
+        '''Push a full request/response/finished series through the fake.
+        ``bodyless`` makes getResponseBody error like Chrome does for a 204/
+        preflight; ``failed`` pushes loadingFailed instead of finished.'''
         sid = self.page.session.session_id
-        self.fake.response_bodies[request_id] = {
-            'body': body, 'base64Encoded': False}
+        if bodyless:
+            self.fake.no_body.add(request_id)
+        else:
+            self.fake.response_bodies[request_id] = {
+                'body': body, 'base64Encoded': False}
         self.transport.push({
             'method': 'Network.requestWillBeSent', 'sessionId': sid,
             'params': {'requestId': request_id, 'loaderId': 'L1',
                        'documentURL': 'https://x/', 'timestamp': 1.0,
                        'wallTime': 1.0, 'initiator': {'type': 'other'},
                        'redirectHasExtraInfo': False,
-                       'request': {'url': url, 'method': 'GET', 'headers': {},
+                       'request': {'url': url, 'method': method, 'headers': {},
                                    'initialPriority': 'High',
                                    'referrerPolicy': 'no-referrer'}}})
+        if failed is not None:
+            self.transport.push({
+                'method': 'Network.loadingFailed', 'sessionId': sid,
+                'params': {'requestId': request_id, 'timestamp': 3.0,
+                           'type': 'XHR', 'errorText': failed,
+                           'canceled': False}})
+            return
         self.transport.push({
             'method': 'Network.responseReceived', 'sessionId': sid,
             'params': {'requestId': request_id, 'loaderId': 'L1',
                        'timestamp': 2.0, 'type': 'XHR', 'frameId': 'F-1',
                        'hasExtraInfo': False,
-                       'response': {'url': url, 'status': 200,
+                       'response': {'url': url, 'status': status,
                                     'statusText': 'OK', 'headers': {},
                                     'mimeType': 'application/json',
                                     'charset': 'utf-8',
@@ -448,6 +475,36 @@ class InitScriptAndRecorderTests(PageTestBase):
             'method': 'Network.loadingFinished', 'sessionId': sid,
             'params': {'requestId': request_id, 'timestamp': 3.0,
                        'encodedDataLength': 14}})
+
+    async def test_bodyless_success_is_not_a_body_error(self):
+        # the pybiss libel: a 204 preflight has no body, so getResponseBody
+        # errors "No resource ..." — that must NOT read as a failed request.
+        recorder = self.page.record(needle='/query', record_preflights=True)
+        self._push_exchange('R1', 'https://x/query/getsigner', '',
+                            method='OPTIONS', status=204, bodyless=True)
+        exchange = await recorder.wait_for_next(0, timeout=2)
+        assert exchange.status == 204
+        assert exchange.body is None
+        assert exchange.body_error is None     # the fix: not stamped
+        assert exchange.failed is None         # nothing failed
+
+    async def test_load_failure_sets_failed_not_body_error(self):
+        recorder = self.page.record(needle='/query')
+        self._push_exchange('R1', 'https://x/query', '',
+                            failed='net::ERR_CONNECTION_REFUSED')
+        exchange = await recorder.wait_for_next(0, timeout=2)
+        assert exchange.failed == 'net::ERR_CONNECTION_REFUSED'
+        assert exchange.body_error is None     # split: load failure != body error
+
+    async def test_missing_body_on_200_still_flags_body_error(self):
+        # a 200 that genuinely can't yield its body IS worth surfacing
+        recorder = self.page.record(needle='/query')
+        self._push_exchange('R1', 'https://x/query', '',
+                            status=200, bodyless=True)
+        exchange = await recorder.wait_for_next(0, timeout=2)
+        assert exchange.body_error is not None
+        assert 'No resource' in exchange.body_error
+        assert exchange.failed is None
 
     async def test_wait_for_next_is_burst_safe_and_json_filters(self):
         recorder = self.page.record(needle='/query')

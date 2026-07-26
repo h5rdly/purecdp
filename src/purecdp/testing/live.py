@@ -21,6 +21,7 @@ import json
 import re
 import typing
 
+from ..errors import PureCDPError
 from .element import Element, _elements_from_array, _js_regex
 
 if typing.TYPE_CHECKING:
@@ -134,7 +135,7 @@ _LIVE_JS = r'''
 '''.strip()
 
 
-class ExpectationError(AssertionError):
+class ExpectationError(AssertionError, PureCDPError):
     '''A :meth:`Live.should` condition never held within the timeout. Subclasses
     AssertionError so it registers as a test *failure*, not an error.'''
 

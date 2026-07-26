@@ -112,6 +112,9 @@ class FakeBrowser:
         #: requestId -> {'body': ..., 'base64Encoded': bool} for
         #: Network.getResponseBody.
         self.response_bodies: dict[str, dict] = {}
+        #: request_ids for which getResponseBody errors "No resource ..." —
+        #: what Chrome returns for a bodyless response (204/304, preflight).
+        self.no_body: set[str] = set()
         #: If set, Page.navigate responds with this errorText.
         self.navigate_error: str | None = None
         #: Canned AXNode JSON dicts returned by Accessibility.getFullAXTree.
@@ -224,9 +227,19 @@ class FakeBrowser:
             result = (self.call_results.pop(0) if self.call_results
                       else {'result': {'type': 'undefined'}})
             return [ok(result)]
+        if method == 'Page.captureScreenshot':
+            # a 1x1 PNG, enough to prove the bytes round-trip
+            return [ok({'data': (
+                'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk'
+                '+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==')})]
         if method == 'Network.getResponseBody':
+            request_id = params['requestId']
+            if request_id in self.no_body:  # what Chrome does for bodyless responses
+                return [{'id': msg_id, 'error': {
+                    'code': -32000,
+                    'message': 'No resource with given identifier found'}}]
             body = self.response_bodies.get(
-                params['requestId'], {'body': '', 'base64Encoded': False})
+                request_id, {'body': '', 'base64Encoded': False})
             return [ok(body)]
         if method == 'Accessibility.getFullAXTree':
             return [ok({'nodes': self.ax_nodes})]

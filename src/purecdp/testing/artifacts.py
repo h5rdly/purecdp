@@ -63,7 +63,9 @@ def _format_network(recorders: typing.Iterable) -> str:
             lines.append(f'{e.method} {e.url} -> {status} {e.mime or ""}')
             if e.request_body:
                 lines.append(f'  request: {_clip(e.request_body)}')
-            if e.body_error:
+            if e.failed:
+                lines.append(f'  <request failed: {e.failed}>')
+            elif e.body_error:
                 lines.append(f'  body: <unavailable: {e.body_error}>')
             elif e.body:
                 lines.append(f'  body: {_clip(e.text)}')

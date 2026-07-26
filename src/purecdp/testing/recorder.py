@@ -40,7 +40,14 @@ class Exchange:
     status: int | None = None
     mime: str | None = None
     body: bytes | None = None
-    body_error: str | None = None  # why body is None, when it failed
+    #: The request/load itself failed (a Network.loadingFailed: net error,
+    #: blocked, aborted). None when the request completed — check this, not
+    #: ``body_error``, to ask "did this request fail?".
+    failed: str | None = None
+    #: A body was expected but could not be fetched (evicted, session gone).
+    #: NOT set for a legitimately bodyless response — a 204/304, a HEAD, or a
+    #: redirect has no body by design, so ``body`` is None and this stays None.
+    body_error: str | None = None
     #: Request headers as sent (base + requestWillBeSentExtraInfo).
     request_headers: dict = field(default_factory=dict)
     #: Response headers as received (base + responseReceivedExtraInfo;
@@ -116,7 +123,9 @@ def to_har(exchanges: typing.Iterable[Exchange]) -> dict:
         except UnicodeDecodeError:
             content['text'] = _b64.b64encode(body).decode('ascii')
             content['encoding'] = 'base64'
-        if exchange.body_error:
+        if exchange.failed:
+            content['comment'] = f'request failed: {exchange.failed}'
+        elif exchange.body_error:
             content['comment'] = f'body unavailable: {exchange.body_error}'
         time_ms = (round(exchange.duration * 1000, 3)
                    if exchange.duration is not None else -1)
@@ -142,6 +151,18 @@ def to_har(exchanges: typing.Iterable[Exchange]) -> dict:
     return {'log': {'version': '1.2',
                     'creator': {'name': 'purecdp', 'version': __version__},
                     'entries': entries}}
+
+
+def _body_expected(exchange: Exchange) -> bool:
+    '''Whether a successful response should have carried a body. 204/304, a
+    HEAD or OPTIONS (CORS preflight) request, and redirects (3xx) are bodyless
+    by design, so a failed getResponseBody on them is "no body", not an error.'''
+    if exchange.method.upper() in ('HEAD', 'OPTIONS'):
+        return False
+    status = exchange.status
+    if status is None:
+        return True  # no ResponseReceived seen — assume a body was expected
+    return status not in (204, 304) and not (300 <= status < 400)
 
 
 def _parses_as_json(exchange: Exchange) -> bool:
@@ -253,6 +274,16 @@ class NetworkRecorder:
     @property
     def responses(self) -> list[typing.Any]:
         return [e.json for e in self.exchanges]
+
+    def set_filter(self, *, needle: str = '', exclude: str | None = None,
+                   predicate: typing.Callable[[str], bool] | None = None) -> None:
+        '''Change what this recorder captures GOING FORWARD (already-captured
+        exchanges and their indices are untouched). Lets a long-lived recorder
+        be narrowed after the fact — e.g. an MCP agent scoping to '/api' once it
+        sees asset noise.'''
+        self._needle = needle
+        self._exclude = exclude
+        self._predicate = predicate
 
     def _matches(self, url: str) -> bool:
         if self._predicate is not None:
@@ -403,7 +434,7 @@ class NetworkRecorder:
         if exchange._started is not None:  # same monotonic clock as the start
             exchange.duration = max(0.0, float(event.timestamp) - exchange._started)
         if failed is not None:
-            exchange.body_error = failed
+            exchange.failed = failed          # the request itself failed
         else:
             try:
                 body, is_b64 = await self._page.session.execute(
@@ -412,7 +443,11 @@ class NetworkRecorder:
                 exchange.body = (_b64.b64decode(body) if is_b64
                                  else body.encode())
             except Exception as exc:  # a lost body must not kill the pump
-                exchange.body_error = repr(exc)
+                # a bodyless response (204/304, HEAD, redirect) has nothing to
+                # fetch — getResponseBody reports "No resource ..." and that is
+                # NOT an error; only flag it when a body was actually expected.
+                if _body_expected(exchange):
+                    exchange.body_error = repr(exc)
         exchange._finished = True
         self.exchanges.append(exchange)
         self._appended.set()

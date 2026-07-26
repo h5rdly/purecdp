@@ -362,10 +362,6 @@ class DriveParityE2ETests(CDPTestCase):
         assert len(only) == 1
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 @unittest.skipUnless(purecdp.find_browser(), 'no Chromium-based browser found')
 class LaunchedPageTests(unittest.IsolatedAsyncioTestCase):
     async def test_launched_page_one_liner(self):
@@ -1317,3 +1313,132 @@ class ArtifactsE2ETests(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+
+@unittest.skipUnless(purecdp.find_browser(), 'no Chromium-based browser found')
+class MCPAgentLoopE2ETests(unittest.IsolatedAsyncioTestCase):
+    '''M15 native driving: the act -> requests -> request(select) loop an agent
+    runs over MCP, end to end against a real browser. Proves "assert on the wire,
+    not the DOM" is reachable with zero Python — including the wire Set-Cookie.'''
+
+    @classmethod
+    def setUpClass(cls):
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html')
+                self.end_headers()
+                self.wfile.write(
+                    b"<button id=b onclick=\"fetch('/api/q',{method:'POST',"
+                    b"body:'{}'}).then(r=>r.json()).then(j=>{"
+                    b"document.body.insertAdjacentHTML('beforeend',"
+                    b"'<p id=done>'+j.status+'</p>')})\">Go</button>")
+
+            def do_POST(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Set-Cookie', 'sid=xyz')
+                self.end_headers()
+                self.wfile.write(
+                    b'{"selections": {"filters": {"logic": "AND", '
+                    b'"children": [1, 2]}}, "status": "ok"}')
+
+            def log_message(self, *a):
+                pass
+
+        cls.httpd = ThreadingHTTPServer(('127.0.0.1', 0), H)
+        cls.port = cls.httpd.server_address[1]
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    async def _rpc(self, server, _tool, **args):
+        resp = await server.handle({
+            'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+            'params': {'name': _tool, 'arguments': args}})
+        return resp['result']['content'][0]['text']
+
+    async def test_native_act_requests_request_loop(self):
+        from purecdp.mcp import MCPServer
+        server = MCPServer(launch_kwargs={'headless': True, 'extra_args': EXTRA})
+        try:
+            async with asyncio.timeout(60):
+                nav = await self._rpc(
+                    server, 'navigate', url=f'http://127.0.0.1:{self.port}/')
+                assert '[network cursor:' in nav
+                ref = next(l.split('[')[-1].rstrip(']')
+                           for l in nav.splitlines()
+                           if '[e' in l and 'button' in l.lower())
+                await self._rpc(server, 'act', ref=ref, action='click')
+                # the click fired a POST; poll requests until it lands
+                async def seen():
+                    out = await self._rpc(server, 'requests', contains='/api')
+                    return None if '(no matching' in out else out
+                reqs = None
+                async with asyncio.timeout(10):
+                    while not reqs:
+                        reqs = await seen()
+                        if not reqs:
+                            await asyncio.sleep(0.1)
+                assert 'POST' in reqs and '/api/q -> 200' in reqs
+                rid = int(reqs.split(']')[0].strip('['))
+                # semantic projection: just the filters subtree, whole and valid
+                detail = await self._rpc(server, 'request', id=rid,
+                                         select='selections.filters')
+                assert '"logic": "AND"' in detail and '"children"' in detail
+                # the wire Set-Cookie is reachable natively (M14 headers)
+                hdrs = await self._rpc(server, 'request', id=rid, part='headers')
+                assert 'Set-Cookie' in hdrs and 'sid=xyz' in hdrs
+        finally:
+            await server.aclose()
+
+    async def test_mock_stubs_an_endpoint(self):
+        from purecdp.mcp import MCPServer
+        server = MCPServer(launch_kwargs={'headless': True, 'extra_args': EXTRA},
+                           allow_mock=True)
+        try:
+            async with asyncio.timeout(60):
+                await self._rpc(server, 'navigate',
+                                url=f'http://127.0.0.1:{self.port}/')
+                # stub the endpoint the button hits, forcing a different status
+                await self._rpc(server, 'mock', url='*/api/q',
+                                json={'status': 'STUBBED'}, status=200)
+                await self._rpc(server, 'act', by='text', name='Go')
+                await self._rpc(server, 'wait',
+                                **{'for': 'text', 'text': 'STUBBED'})
+                reqs = await self._rpc(server, 'requests', contains='/api/q')
+                rid = int(reqs.split(']')[0].strip('['))
+                got = await self._rpc(server, 'request', id=rid, select='status')
+                assert 'STUBBED' in got     # the canned response, not the server's
+        finally:
+            await server.aclose()
+
+    async def test_act_by_description_and_screenshot(self):
+        from purecdp.mcp import MCPServer
+        import base64
+        server = MCPServer(launch_kwargs={'headless': True, 'extra_args': EXTRA})
+        try:
+            async with asyncio.timeout(60):
+                await self._rpc(server, 'navigate',
+                                url=f'http://127.0.0.1:{self.port}/')
+                # click by description — no snapshot ref needed
+                await self._rpc(server, 'act', by='text', name='Go',
+                                action='click')
+                # the click set document.title from the POST response
+                await self._rpc(server, 'wait', **{'for': 'text', 'text': 'ok'})
+                # screenshot comes back as an image content block
+                resp = await server.handle({
+                    'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                    'params': {'name': 'screenshot', 'arguments': {}}})
+                block = resp['result']['content'][0]
+                assert block['type'] == 'image'
+                assert base64.b64decode(block['data']).startswith(b'\x89PNG')
+        finally:
+            await server.aclose()
+
+
+if __name__ == '__main__':
+    unittest.main()

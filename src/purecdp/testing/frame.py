@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import typing
 
+from ..errors import PureCDPError
 from ..protocol import runtime as runtime_proto
 from . import _agent
 from .element import Element, ElementQueries
@@ -30,7 +31,7 @@ if typing.TYPE_CHECKING:
     from .page import Page
 
 
-class FrameNotFound(Exception):
+class FrameNotFound(PureCDPError):
     '''No cross-origin iframe matched, or it never attached in time.'''
 
 

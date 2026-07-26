@@ -65,11 +65,13 @@ class MyAppTests(CDPTestCase):
 `query`/`query_all` (held elements, text-filtered, stale-copy-proof),
 `screenshot`, always-on `page.console` / `page.js_errors` capture, and
 `page.route()` request stubbing/rewriting/aborting. For traffic-level
-assertions there's `page.record()` (full request/response exchanges, with
-`parse_sse()` for streamed bodies) and `page.expect_download()` (capture a
+assertions there's `page.record()` (full request/response exchanges — the
+*wire* headers, `Cookie` / `Origin` / `Set-Cookie` included, plus bodies, and
+`parse_sse()` for streamed ones) and `page.expect_download()` (capture a
 download's bytes without touching disk); arm `recorder.expect()` before a
 click and `await .value` for the response it triggers (`json=True` skips
-interleaved non-JSON bodies). And when a test fails, its pages
+interleaved non-JSON bodies), and `recorder.save_har()` writes the whole
+capture as a HAR any devtools opens. And when a test fails, its pages
 are dumped as diagnostic artifacts — screenshot, HTML, console, recorded
 traffic, traceback — under `purecdp-artifacts/<test id>/` before the browser
 closes; green tests write nothing.
@@ -157,9 +159,22 @@ An optional MCP server exposes this to any Model Context Protocol host — no
 extra dependency, stdlib JSON-RPC over stdio:
 
 ```sh
-python -m purecdp.mcp            # tools: navigate, snapshot, act, evaluate
+python -m purecdp.mcp            # navigate/snapshot/act + network/wait/seed tools
 python -m purecdp.mcp --stealth  # low-observability launch
+python -m purecdp.mcp --allow-eval   # also expose the JS evaluate tool
+python -m purecdp.mcp --allow-mock   # also expose the response-stubbing tool
 ```
+
+Beyond driving the DOM, the server exposes the recorder so an agent can *assert
+on the wire*: after `act`, the returned cursor feeds `requests(since=cursor)` to
+see what the click fired, then `request(id, select="a.b")` reads just that part
+of the response body (semantic projection, so a huge body doesn't flood the
+agent's context). `act` targets an element by snapshot ref *or* by description
+(`by=text`/`role`/`testid`/`label`); `snapshot` returns the ref-tagged outline
+or (`format="json"`) a flat list of `{ref, role, name}` rows; `screenshot`
+returns a PNG image block for visual state; plus `wait` (until visible/hidden/
+count/text), `seed_storage` / `set_cookie` (plant an auth session before
+navigating), `record` (narrow capture), and `mock` (stub an endpoint, opt-in).
 
 ## Layout
 

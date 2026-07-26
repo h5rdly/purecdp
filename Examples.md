@@ -47,6 +47,13 @@ asyncio.run(main())
 or rejection. `wait=` is `"load"` (default), `"idle"` (load + network quiet), or
 `"none"` (return as soon as navigation starts).
 
+Every exception purecdp raises — `JSError`, `NavigateError`, `DownloadError`,
+`ExpectationError`, `ActionabilityError`, `CDPCommandError`,
+`CDPConnectionClosed`, and the rest — inherits `PureCDPError`, so
+`except PureCDPError:` catches anything from the library. (`ExpectationError`
+also inherits `AssertionError`, so a failed `.should(...)` still registers as a
+test *failure*.)
+
 ### Waiting, clicking, reading
 
 ```python
@@ -120,6 +127,11 @@ async def main():
 
 asyncio.run(main())
 ```
+
+`launch()` takes the knobs a local run usually needs: `headless=`, `pipe=True`
+(a debug pipe instead of a websocket), `stealth=True` (see below),
+`ignore_https_errors=True` (accept self-signed / local-HTTPS certs), a
+persistent `user_data_dir=`, and `extra_args=[...]` for anything else.
 
 ### Event streams
 
@@ -315,7 +327,9 @@ class CartTests(CDPTestCase):
         await self.page.wait_for_selector("#empty-state")
 ```
 
-For full control over a request, use `route()` directly:
+For full control over a request, use `route()` directly. Its pattern is an
+fnmatch glob or a `callable(url) -> bool` predicate (the same form `record()`
+takes), so a match rule too fiddly for a glob is just a function:
 
 ```python
 async def handler(request):
@@ -324,6 +338,7 @@ async def handler(request):
     else:
         await request.abort()                # or request.continue_(url=...)
 await self.page.route("*/api/orders", handler)
+await self.page.route(lambda u: u.endswith("/track") and "beacon" not in u, handler)
 ```
 
 ### Assert on the traffic itself
@@ -365,6 +380,17 @@ Exchanges carry the **wire** headers (`ex.request_headers` / `ex.response_header
 the dict, `rec.save_har("capture.har")` for a file any devtools or HAR viewer
 opens — making captures shareable and diffable. Failing tests get one for
 free: the artifacts dump writes `network.har` next to `network.log`.
+
+To ask whether a request went wrong, check `ex.failed` (a net error / abort /
+block, from the browser) — **not** `ex.body_error`. A bodyless response (a 204
+preflight, a 304, a HEAD) simply has no body to fetch, so `ex.body` is `None`
+and *neither* field is set; `body_error` fires only when a body was expected
+but couldn't be retrieved:
+
+```python
+assert not ex.failed                 # the request itself succeeded
+assert ex.status == 204              # a preflight — bodyless, and that's fine
+```
 
 For a streamed (`text/event-stream`) response, `parse_sse` turns the captured
 body into events (any per-frame encoding — base64, JSON — is yours to decode):
