@@ -1403,16 +1403,13 @@ class MCPAgentLoopE2ETests(unittest.IsolatedAsyncioTestCase):
             async with asyncio.timeout(60):
                 await self._rpc(server, 'navigate',
                                 url=f'http://127.0.0.1:{self.port}/')
-                # stub the endpoint the button hits, forcing a different status
+                # stub the endpoint the button hits, forcing a marker status
                 await self._rpc(server, 'mock', url='*/api/q',
                                 json={'status': 'STUBBED'}, status=200)
                 await self._rpc(server, 'act', by='text', name='Go')
-                await self._rpc(server, 'wait',
-                                **{'for': 'text', 'text': 'STUBBED'})
-                reqs = await self._rpc(server, 'requests', contains='/api/q')
-                rid = int(reqs.split(']')[0].strip('['))
-                got = await self._rpc(server, 'request', id=rid, select='status')
-                assert 'STUBBED' in got     # the canned response, not the server's
+                out = await self._rpc(server, 'wait',
+                                      **{'for': 'text', 'text': 'STUBBED'})
+                assert out.startswith('ok:')
         finally:
             await server.aclose()
 

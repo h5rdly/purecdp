@@ -282,7 +282,9 @@ TOOLS: list[dict] = [
                        'app whose backend is down, or force an error path. Give '
                        'json (an object) or body (a string) and optional status. '
                        'Stacks: call repeatedly, first match wins. Off by default '
-                       '(start with --allow-mock).',
+                       '(start with --allow-mock). Note: a mocked (fulfilled) '
+                       'request may not appear in `requests` — check the page '
+                       'effect, not the recorder.',
         'inputSchema': {
             'type': 'object',
             'properties': {
