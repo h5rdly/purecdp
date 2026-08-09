@@ -58,16 +58,27 @@ class PageE2ETests(CDPTestCase):
         else:
             raise AssertionError('expected NavigateError')
         # a server that accepts then drops — whichever CDP path Chrome takes
-        # (errorText or a silent error-page commit), the net error surfaces
+        # (errorText or a silent error-page commit), the net error surfaces.
+        # Chrome RETRIES a connection that closed before any bytes, so the
+        # dropper must kill EVERY attempt (a one-shot leaves the retry hanging
+        # in the backlog until goto's own timeout — the first CI failure mode),
+        # and SO_LINGER(0) makes each close an unambiguous RST.
         import socket
+        import struct
         server = socket.create_server(('127.0.0.1', 0))
         port = server.getsockname()[1]
 
-        def drop_one():
-            conn, _ = server.accept()
-            conn.close()
+        def drop_all():
+            while True:
+                try:
+                    conn, _ = server.accept()
+                except OSError:      # server closed — test is done
+                    return
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                struct.pack('ii', 1, 0))
+                conn.close()
 
-        t = threading.Thread(target=drop_one, daemon=True)
+        t = threading.Thread(target=drop_all, daemon=True)
         t.start()
         try:
             await self.page.goto(f'http://127.0.0.1:{port}/', timeout=15)
@@ -429,6 +440,7 @@ class DriveParityE2ETests(CDPTestCase):
             assert '<p>hdrs</p>' in entries[0]['response']['content']['text']
         finally:
             httpd.shutdown()
+            httpd.server_close()
 
     async def test_redacted_recording_never_captures_the_secret(self):
         class H(BaseHTTPRequestHandler):
@@ -495,6 +507,7 @@ class DriveParityE2ETests(CDPTestCase):
                        if h['name'].lower() == 'cookie')
         finally:
             httpd.shutdown()
+            httpd.server_close()
 
     async def test_close_target_by_id(self):
         session = await self.browser.new_session(context=self.context)
