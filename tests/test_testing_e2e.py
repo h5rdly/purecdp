@@ -140,14 +140,14 @@ class PageE2ETests(CDPTestCase):
             raise AssertionError('expected TimeoutError')
 
     async def test_wait_for_visible_axis(self):
-        # the spinner is HIDDEN (not removed) after 150ms — the SPA pattern
-        # existence checks lie about; visible=False sees through it
-        await self.page.goto(
-            'data:text/html,<div class=spinner>loading</div>'
-            '<script>setTimeout(() => {'
-            "  document.querySelector('.spinner').style.display = 'none';"
-            '}, 150)</script>')
+        # the spinner gets HIDDEN (not removed) — the SPA pattern existence
+        # checks lie about; visible=False sees through it. Hidden on OUR
+        # signal, not a timer: a slow runner outlives any timer window and
+        # then the visible=True phase is unobservable (the win-3.14t flake)
+        await self.page.goto('data:text/html,<div class=spinner>loading</div>')
         await self.page.wait_for('.spinner', visible=True)   # rendered now
+        await self.page.evaluate(
+            "document.querySelector('.spinner').style.display = 'none'")
         await self.page.wait_for('.spinner', visible=False)  # hidden, not gone
         assert await self.page.query_count('.spinner') == 1  # still in the DOM
 

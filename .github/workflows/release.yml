@@ -35,7 +35,7 @@ jobs:
           echo "tag=$tag  package=$pkg"
           test "$tag" = "$pkg" || { echo "::error::tag v$tag != package version $pkg — bump purecdp.__version__"; exit 1; }
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: purecdp-dist
           path: dist/
@@ -49,7 +49,7 @@ jobs:
       contents: write   # create the GitHub Release
       id-token: write   # PyPI trusted publishing (OIDC) — no API token/secret needed
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: purecdp-dist
           path: dist/
