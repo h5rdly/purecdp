@@ -32,14 +32,64 @@ def _raw_command(method: str, params: dict | None = None):
     return result
 
 
-async def snapshot(host: typing.Any, *, depth: int | None = None) -> Snapshot:
+def _scope_to_dialog(wire_nodes: list) -> tuple[list, bool]:
+    '''Filter raw AX wire nodes to the DEEPEST open dialog/alertdialog
+    subtree — "what's actionable in the dialog that's actually open", instead
+    of everything default-scoping to the document. (The AX tree also gets
+    clickables right that naive DOM walks miss: role=button on a div, an
+    ``<a href="javascript:">``.) Returns (nodes, found); not found -> the
+    original list, untouched.'''
+    def role_of(node: dict) -> str:
+        role = node.get('role') or {}
+        return str(role.get('value', ''))
+
+    by_id = {str(n.get('nodeId')): n for n in wire_nodes}
+    dialogs = [n for n in wire_nodes
+               if role_of(n) in ('dialog', 'alertdialog')
+               and not n.get('ignored')]
+    if not dialogs:
+        return wire_nodes, False
+    parent = {str(c): str(n.get('nodeId'))
+              for n in wire_nodes for c in (n.get('childIds') or [])}
+
+    def depth_of(node_id: str) -> int:
+        depth = 0
+        while node_id in parent:
+            node_id = parent[node_id]
+            depth += 1
+        return depth
+
+    target = max(dialogs, key=lambda n: depth_of(str(n.get('nodeId'))))
+    keep: set[str] = set()
+    stack = [str(target.get('nodeId'))]
+    while stack:
+        node_id = stack.pop()
+        if node_id in keep or node_id not in by_id:
+            continue
+        keep.add(node_id)
+        stack.extend(str(c) for c in (by_id[node_id].get('childIds') or []))
+    return [n for n in wire_nodes if str(n.get('nodeId')) in keep], True
+
+
+async def snapshot(host: typing.Any, *, depth: int | None = None,
+                   scope: str | None = None) -> Snapshot:
+    if scope not in (None, 'dialog'):
+        raise ValueError(f"scope must be None or 'dialog', not {scope!r}")
     params = {} if depth is None else {'depth': depth}
     # Read the AX nodes straight off the wire: build_from_wire needs only a few
     # fields, so parsing every node into a typed AXNode (then flattening it
     # right back) is pure overhead — sizeable on large trees.
     result = await host.session.execute(
         _raw_command('Accessibility.getFullAXTree', params))
-    snap = build_from_wire(result.get('nodes', []))
+    nodes = result.get('nodes', [])
+    note = ''
+    if scope == 'dialog':
+        nodes, found = _scope_to_dialog(nodes)
+        if not found:
+            note = '(no open dialog — showing the full page)\n'
+    snap = build_from_wire(nodes)
+    if note:
+        snap.text = note + snap.text
     host._snapshot_refs = dict(snap.refs)
     host._snapshot_owners = {}  # single frame — every ref resolves on host
     return snap

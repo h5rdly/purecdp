@@ -72,7 +72,16 @@ KEYS = {
 
 
 class NavigateError(PureCDPError):
-    '''Navigation failed (net error, bad URL, ...).'''
+    '''Navigation failed (net error, bad URL, ...). ``net_error`` is Chrome's
+    raw error string verbatim (e.g. ``'net::ERR_CONNECTION_TIMED_OUT'`` — the
+    same vocabulary as ``Exchange.failed``) when known; ``url`` is the
+    navigation target.'''
+
+    def __init__(self, message: str, *, url: str | None = None,
+                 net_error: str | None = None):
+        super().__init__(message)
+        self.url = url
+        self.net_error = net_error
 
 
 class JSError(PureCDPError):
@@ -220,6 +229,8 @@ class Page(ElementQueries, LiveFactories):
         self._track_network = False
         self._inflight: set[str] = set()
         self._last_network_activity = 0.0
+        self._doc_requests: dict[str, str] = {}  # Document request_id -> frame_id
+        self._doc_failures: dict[str, str] = {}  # frame_id -> net error string
         self._tasks: list[asyncio.Task] = []
         self._streams: list[EventStream] = []
         #: NetworkRecorders started via record(); artifacts-on-failure dumps them.
@@ -324,10 +335,25 @@ class Page(ElementQueries, LiveFactories):
                         JSError.from_details(event.exception_details))
                 elif isinstance(event, network_proto.RequestWillBeSent):
                     self._inflight.add(str(event.request_id))
+                    if (event.type is not None and str(event.type) == 'Document'
+                            and event.frame_id is not None):
+                        self._doc_requests[str(event.request_id)] = \
+                            str(event.frame_id)
                     self._touch_network()
                 elif isinstance(event, (network_proto.LoadingFinished,
                                         network_proto.LoadingFailed)):
-                    self._inflight.discard(str(event.request_id))
+                    request_id = str(event.request_id)
+                    self._inflight.discard(request_id)
+                    frame_id = self._doc_requests.pop(request_id, None)
+                    if (frame_id is not None
+                            and isinstance(event, network_proto.LoadingFailed)
+                            and not event.canceled):
+                        # a document's load failed — goto() checks this to turn
+                        # a silently-committed chrome-error:// page into a
+                        # NavigateError that carries the net error. Canceled
+                        # loads (ERR_ABORTED: a replaced/interrupted navigation)
+                        # are not failures.
+                        self._doc_failures[frame_id] = str(event.error_text)
                     self._touch_network()
 
     def _touch_network(self) -> None:
@@ -347,6 +373,7 @@ class Page(ElementQueries, LiveFactories):
         if wait not in ('load', 'idle', 'none'):
             raise ValueError(f'wait must be load/idle/none, not {wait!r}')
         to = timeout or self.default_timeout
+        frame_id = None
         try:
             async with asyncio.timeout(to):
                 waiter = None
@@ -355,11 +382,17 @@ class Page(ElementQueries, LiveFactories):
                         self.session.wait_for(page_proto.LoadEventFired))
                     await asyncio.sleep(0)
                 try:
+                    # clear BEFORE the browser can even receive the navigate:
+                    # any document failure recorded after this belongs to it
+                    # (clearing after would race the pump and could eat it)
+                    self._doc_failures.clear()
                     result = await self.session.execute(page_proto.navigate(url=url))
+                    frame_id = str(result[0])
                     error_text = result[2]
                     if error_text:
                         raise NavigateError(
-                            f'navigation to {url!r} failed: {error_text}')
+                            f'navigation to {url!r} failed: {error_text}',
+                            url=url, net_error=error_text)
                     if waiter is not None:
                         await waiter
                         waiter = None
@@ -374,6 +407,20 @@ class Page(ElementQueries, LiveFactories):
             raise TimeoutError(
                 f'goto({url!r}) timed out after {to}s waiting for '
                 f'{wait!r}{hint}') from None
+        if wait != 'none' and frame_id is not None:
+            # navigate can commit to chrome-error://chromewebdata/ WITHOUT
+            # returning errorText (e.g. a server that accepts, then stalls) —
+            # the load event fires on Chrome's error page and the failure
+            # would pass silently. The capture pump recorded the document's
+            # loadingFailed; two ticks let it drain events already queued.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            net_error = self._doc_failures.pop(frame_id, None)
+            if net_error:
+                raise NavigateError(
+                    f'navigation to {url!r} failed: {net_error} '
+                    '(the browser rendered its error page)',
+                    url=url, net_error=net_error)
 
     async def wait_for_network_idle(
         self, *, idle_time: float = 0.5, timeout: float | None = None
@@ -496,15 +543,11 @@ class Page(ElementQueries, LiveFactories):
                     return
                 await asyncio.sleep(poll)
 
-    async def wait_for_selector(
-        self, selector: str, *, timeout: float | None = None, poll: float = 0.05
-    ) -> None:
-        '''Poll until document.querySelector(selector) matches something.'''
-        await self.wait_for_function(
-            f'document.querySelector({json.dumps(selector)}) !== null',
-            timeout=timeout, poll=poll)
+    # wait_for_selector was REMOVED in 0.7.0 — it was existence-only, i.e.
+    # wait_for(selector). wait_for() adds the rendered axis (visible=) and
+    # every other should() condition; see ElementQueries.wait_for.
 
-    # query/query_count/query_all and live()/get_by_* are inherited —
+    # query/query_count/query_all/wait_for and live()/get_by_* are inherited —
     # ElementQueries (element.py) and LiveFactories (live.py), shared with Frame.
 
     # -- cross-origin frames (M10 Phase 1) -----------------------------------
@@ -562,7 +605,8 @@ class Page(ElementQueries, LiveFactories):
         self._dismissers.extend(selectors)
 
     async def snapshot(
-        self, *, depth: int | None = None, cross_frame: bool = False
+        self, *, depth: int | None = None, cross_frame: bool = False,
+        scope: str | None = None,
     ) -> Snapshot:
         '''A compact, ref-tagged accessibility outline for an LLM to act on —
         ``str(snapshot)`` is the text to show the model, and every actionable
@@ -577,11 +621,19 @@ class Page(ElementQueries, LiveFactories):
         this page (see frame()); the default (False) is the plain single-frame
         snapshot with zero extra cost.
 
+        ``scope='dialog'`` narrows to the DEEPEST open ``dialog``/
+        ``alertdialog`` subtree — "what's fillable/clickable in the modal
+        that's actually open". No dialog open -> the full page, with a
+        leading note line saying so.
+
         Prefer this over feeding raw HTML/screenshots to a model: it's small,
         stable, and names controls the way a human sees them.'''
         if cross_frame:
+            if scope is not None:
+                raise ValueError(
+                    'scope= is not supported with cross_frame=True yet')
             return await _agent.stitched_snapshot(self, depth=depth)
-        return await _agent.snapshot(self, depth=depth)
+        return await _agent.snapshot(self, depth=depth, scope=scope)
 
     async def element_for_ref(self, ref: str) -> Element:
         '''Resolve a snapshot ref (``e3``) to a live :class:`Element` — the

@@ -16,6 +16,8 @@ import tempfile
 import typing
 from contextlib import suppress
 
+from urllib.parse import urlsplit
+
 from .connection import Connection
 from .discovery import get_version
 from .errors import BrowserLaunchError
@@ -90,6 +92,13 @@ class BrowserContext:
     async def new_session(self, url: str = 'about:blank'):
         return await new_session(self.connection, url,
                                  browser_context_id=self.context_id)
+
+    async def new_page(self, url: str = 'about:blank', **page_kw):
+        '''A new tab in this context as a ready ``testing.Page`` — see
+        :meth:`Browser.new_page`.'''
+        from .testing.page import Page  # lazy: testing sits above this module
+
+        return await Page.create(await self.new_session(url), **page_kw)
 
     async def aclose(self) -> None:
         from .protocol import browser as _browser
@@ -169,10 +178,25 @@ class Browser:
                           context: BrowserContext | None = None):
         '''Create a page target (optionally in a context) and attach — returns
         the raw :class:`Session`; wrap it in ``testing.Page.create`` for the
-        high-level driver.'''
+        high-level driver (or use :meth:`new_page`, which does both).'''
         return await new_session(
             self.connection, url,
             browser_context_id=context.context_id if context else None)
+
+    async def new_page(self, url: str = 'about:blank', *,
+                       context: BrowserContext | None = None, **page_kw):
+        '''A new tab as a ready ``testing.Page`` — ``new_session()`` +
+        ``Page.create()`` in one call. ``page_kw`` forwards to
+        :meth:`testing.Page.create` (``default_timeout``, ``capture``,
+        ``track_network``). The page dies with the browser; ``page.stop()``
+        only for early teardown.
+
+        (History: 0.4.0 removed a ``new_page`` that returned a raw Session —
+        the name lied. This one returns an actual Page.)'''
+        from .testing.page import Page  # lazy: testing sits above this module
+
+        session = await self.new_session(url, context=context)
+        return await Page.create(session, **page_kw)
 
     async def close_page(self, session) -> None:
         await close_page(self.connection, session)
@@ -343,9 +367,20 @@ async def connect(
     browserless / Skyvern cloud session, or a local ``chromium
     --remote-debugging-port=9222``.
 
-    Pass a browser-level ``ws://…/devtools/browser/…`` ``endpoint`` directly, or
-    give ``host``/``port`` and the endpoint is discovered via ``/json/version``.
+    Accepted ``endpoint`` forms: a browser-level ``ws://…/devtools/browser/…``
+    URL (used directly), or the ``http://host:port`` everyone tries first —
+    resolved to the websocket endpoint via ``/json/version``, exactly like
+    passing ``host``/``port``.
     '''
+    if endpoint is not None and endpoint.startswith(('http://', 'https://')):
+        parsed = urlsplit(endpoint)
+        host = parsed.hostname or host
+        port = parsed.port or port
+        endpoint = None
+    if endpoint is not None and not endpoint.startswith(('ws://', 'wss://')):
+        raise ValueError(
+            f'unsupported endpoint {endpoint!r} — pass a ws:// browser '
+            'endpoint, an http://host:port debugging address, or host=/port=')
     if endpoint is None:
         version = await get_version(host, port, timeout=timeout)
         endpoint = version['webSocketDebuggerUrl']

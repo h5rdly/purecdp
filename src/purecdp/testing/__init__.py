@@ -7,7 +7,7 @@
 '''
 
 from .artifacts import dump_artifacts
-from .element import ActionabilityError, Element
+from .element import ActionabilityError, Element, QueryTimeout
 from .frame import Frame, FrameNotFound
 from .live import ExpectationError, Live
 from .human import HumanCursor, human_scroll, human_type
@@ -46,6 +46,7 @@ __all__ = [
     'human_scroll',
     'Element',
     'ActionabilityError',
+    'QueryTimeout',
     'Live',
     'ExpectationError',
     'Frame',

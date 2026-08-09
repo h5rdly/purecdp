@@ -123,10 +123,17 @@ TOOLS: list[dict] = [
         'description': "Return the current page's accessibility snapshot. "
                        'format="text" (default) is an indented outline where each '
                        'control has a ref like e3; format="json" is a flat list of '
-                       '{ref, role, name, ...} for programmatic reasoning.',
+                       '{ref, role, name, ...} for programmatic reasoning. '
+                       'scope="dialog" narrows to the open modal dialog — use it '
+                       'when a dialog is up, instead of hunting its controls in '
+                       'the full page.',
         'inputSchema': {
             'type': 'object',
-            'properties': {'format': {'type': 'string', 'default': 'text'}},
+            'properties': {
+                'format': {'type': 'string', 'default': 'text'},
+                'scope': {'type': 'string',
+                          'description': '"dialog" = only the open modal'},
+            },
         },
     },
     {
@@ -453,7 +460,7 @@ class MCPServer:
             await page.goto(args['url'])
             return self._with_cursor(await page.snapshot())
         if name == 'snapshot':
-            snap = await page.snapshot()
+            snap = await page.snapshot(scope=args.get('scope') or None)
             if args.get('format') == 'json':
                 rows = [{k: v for k, v in
                          {'ref': n.get('ref'), 'role': n.get('role'),

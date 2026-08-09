@@ -36,10 +36,12 @@ asyncio.run(main())
 ```
 
 `purecdp.launch(pipe=True)` uses `--remote-debugging-pipe` instead of a websocket.
-`purecdp.connect(port=9222)` attaches to a browser someone else started — notably
-a browser a *human* just logged into (password, MFA), so an agent can inherit the
-authenticated session while the credentials never touch the automation; a
-`new_session()` tab shares the profile's cookies, so it's signed in from birth.
+`browser.new_page()` is the one-call convenience — a new tab as a ready
+`testing.Page`. `purecdp.connect("http://127.0.0.1:9222")` (or `host=`/`port=`,
+or a `ws://` endpoint) attaches to a browser someone else started — notably a
+browser a *human* just logged into (password, MFA), so an agent can inherit the
+authenticated session while the credentials never touch the automation; a new
+tab shares the profile's cookies, so it's signed in from birth.
 `browser.new_context()` gives an isolated cookies/storage context (cheap per-test
 isolation); `connection.set_auto_attach()` auto-attaches popups/workers/OOPIFs,
 resuming paused targets automatically.
@@ -59,14 +61,15 @@ class MyAppTests(CDPTestCase):
                                   content_type="application/json")
         await self.page.route("*/api/*", api)
         await self.page.goto("https://myapp.example/", wait="idle")
-        await self.page.wait_for_selector("#empty-state")
+        await self.page.wait_for("#empty-state")
         assert not self.page.js_errors
 ```
 
 `Page` gives you `goto` (load/idle waits), `evaluate` (promises awaited,
 `JSError` raised; values pass as *arguments* —
 `evaluate("(a, b) => a + b", x, y)` — never interpolated into JS source),
-`wait_for_selector`/`wait_for_function`, `click`,
+`wait_for(selector, **conditions)` (present / `visible=False` gone-or-hidden /
+`count=0` absent — the `should()` vocabulary), `wait_for_function`, `click`,
 `query`/`query_all` (held elements, text-filtered, stale-copy-proof),
 `screenshot`, always-on `page.console` / `page.js_errors` capture, and
 `page.route()` request stubbing/rewriting/aborting. For traffic-level
@@ -179,7 +182,8 @@ see what the click fired, then `request(id, select="a.b")` reads just that part
 of the response body (semantic projection, so a huge body doesn't flood the
 agent's context). `act` targets an element by snapshot ref *or* by description
 (`by=text`/`role`/`testid`/`label`); `snapshot` returns the ref-tagged outline
-or (`format="json"`) a flat list of `{ref, role, name}` rows; `screenshot`
+or (`format="json"`) a flat list of `{ref, role, name}` rows, and
+(`scope="dialog"`) narrows to the open modal's controls; `screenshot`
 returns a PNG image block for visual state; plus `wait` (until visible/hidden/
 count/text), `seed_storage` / `set_cookie` (plant an auth session before
 navigating), `record` (narrow capture), and `mock` (stub an endpoint, opt-in).

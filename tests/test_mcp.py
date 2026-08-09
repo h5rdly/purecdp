@@ -105,6 +105,12 @@ class MCPServerTests(unittest.IsolatedAsyncioTestCase):
                 if m['method'] == 'Runtime.callFunctionOn']
         assert sent[0]['params']['arguments'] == [{'value': 2}, {'value': 3}]
 
+    async def test_snapshot_scope_dialog_passes_through(self):
+        result = await self.call('snapshot', scope='dialog')
+        text = result['content'][0]['text']
+        assert text.startswith('(no open dialog')   # fake tree has no dialog
+        assert not result.get('isError')
+
     async def test_navigate_returns_snapshot_text(self):
         result = await self.call('navigate', url='https://x/')
         text = result['content'][0]['text']

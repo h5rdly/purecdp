@@ -48,8 +48,8 @@ _SET_VALUE = (
     " el.dispatchEvent(new Event('change', { bubbles: true })); }"
 )
 
-#: In-browser actionability poll (Playwright's contract, one round-trip): loop
-#: until the element is connected, has a visible box, is enabled, has stopped
+#: In-browser actionability poll: 
+#: loop until the element is connected, has a visible box, is enabled, has stopped
 #: moving (bounding box unchanged across animation frames), and is the top
 #: element at its own centre — or the deadline passes. Runs the whole wait in
 #: the page so a flaky control costs one CDP call, not one per frame.
@@ -96,6 +96,94 @@ class ActionabilityError(PureCDPError):
     def __init__(self, message: str, reason: str):
         super().__init__(message)
         self.reason = reason
+
+
+class QueryTimeout(TimeoutError, PureCDPError):
+    '''No element matched within the timeout — and the message says what WAS
+    there, because "selector timed out" alone means a screenshot hunt. Three
+    forms: the selector matches *nothing*; it matches but *none are visible*
+    (SPAs hide rather than remove — a different bug than absence); or the
+    ``containing`` text missed and the message lists the visible candidates'
+    texts. Still a ``TimeoutError`` (existing handlers keep working) and a
+    ``PureCDPError`` (the family catch is universal).'''
+
+    def __init__(self, message: str, *, selector: str = '',
+                 containing: typing.Any = None, matched: int = 0,
+                 visible_count: int = 0,
+                 candidates: typing.Sequence[str] = ()):
+        super().__init__(message)
+        self.selector = selector
+        self.containing = containing
+        self.matched = matched                #: bare-selector match count
+        self.visible_count = visible_count    #: of those, how many rendered
+        self.candidates = list(candidates)    #: visible matches' texts (capped)
+
+
+#: On-failure-only diagnostic: what does the BARE selector match, how many of
+#: those are rendered, and what do the first few say. Never runs on success.
+_NEAR_MISS_CANDIDATES = 8
+_NEAR_MISS_CHARS = 48
+
+
+def _near_miss_js(selector: str) -> str:
+    return (
+        '(() => {'
+        f' const els = [...document.querySelectorAll({json.dumps(selector)})];'
+        ' const vis = els.filter(e => {'
+        '   const b = e.getBoundingClientRect();'
+        '   return b.width > 0 && b.height > 0 && e.getClientRects().length; });'
+        ' return {total: els.length, visible: vis.length,'
+        f'  texts: vis.slice(0, {_NEAR_MISS_CANDIDATES}).map(e =>'
+        "   (e.textContent || '').trim().replace(/\\s+/g, ' ')"
+        f'   .slice(0, {_NEAR_MISS_CHARS}))}};'
+        ' })()'
+    )
+
+
+async def _near_miss(owner: typing.Any, selector: str
+                     ) -> tuple[int, int, list[str]] | None:
+    '''Run the diagnostic pass; None when the page can't answer (best-effort —
+    a broken page still gets the plain timeout message).'''
+    try:
+        diag = await owner.evaluate(_near_miss_js(selector))
+    except Exception:
+        return None
+    if not isinstance(diag, dict):
+        return None
+    return (int(diag.get('total', 0)), int(diag.get('visible', 0)),
+            [str(t) for t in diag.get('texts', [])])
+
+
+def _near_miss_tail(selector: str, containing: typing.Any, index: int | None,
+                    diag: tuple[int, int, list[str]]) -> str:
+    '''The " — what was actually there" clause of a QueryTimeout message.
+    ``index`` is None when the caller has no index axis (Live chains) — then
+    visible-but-missed falls through to the candidate list.'''
+    total, visible, texts = diag
+    if total == 0:
+        return ' — selector matches nothing'
+    if visible == 0:
+        return f' — {total} match but none are visible (hidden or zero-size)'
+    if containing is None and index is not None:
+        return (f' — {total} match, {visible} visible; '
+                f'is index={index} out of range?')
+    return (f' — {visible} visible {selector!r}: '
+            + ' | '.join(repr(t) for t in texts))
+
+
+async def _query_timeout(owner: typing.Any, selector: str,
+                         containing: typing.Any, index: int,
+                         where: str, timeout: float) -> QueryTimeout:
+    detail = f' containing {containing!r}' if containing is not None else ''
+    base = f'no element for {selector!r}{detail}{where} within {timeout}s'
+    diag = await _near_miss(owner, selector)
+    if diag is None:
+        return QueryTimeout(base, selector=selector, containing=containing)
+    total, visible, texts = diag
+    return QueryTimeout(
+        base + _near_miss_tail(selector, containing, index, diag),
+        selector=selector, containing=containing, matched=total,
+        visible_count=visible, candidates=texts)
 
 
 class Element:
@@ -150,7 +238,7 @@ class Element:
         '''Block until this node is *actionable* — connected, has a visible box,
         enabled, has stopped moving (bounding box steady across animation
         frames), and is the top element at its own centre (not covered) — or
-        raise :class:`ActionabilityError`. The Playwright-style safety gate that
+        raise :class:`ActionabilityError`. The safety gate that
         trusted input needs on animated / late-mounting pages. The whole wait
         runs in the browser (one CDP round-trip). Pass ``hit=False`` for actions
         that don't dispatch a pointer (a value write, focus). ``timeout``
@@ -214,18 +302,35 @@ class Element:
         await self.eval('(el) => el.focus()')
 
     async def type(
-        self, text: str, *, stable: bool = False, timeout: float | None = None
+        self, text: str, *, insert: bool = False, stable: bool = False,
+        timeout: float | None = None
     ) -> None:
-        '''Focus this element and type with real input events
-        (Input.insertText) — what forms and controlled inputs expect from a
-        user; follow with ``page.press('Enter')`` to submit.
+        '''Focus this element and type ``text`` with REAL per-key events —
+        keydown/keyup for every character (at machine speed, no cadence), so
+        anything listening to keys (autocomplete-on-keydown, shortcut
+        handlers) fires exactly as for a human typist. Follow with
+        ``page.press('Enter')`` to submit.
+
+        ``insert=True`` pastes the whole text via one ``Input.insertText``
+        instead: ONE ``input`` event, ZERO key events — fast bulk entry, but
+        key listeners silently never fire while ``.value`` looks perfect
+        (maddening to debug; that is why it is not the default). See also
+        ``set_value`` (React-safe instant setter, no real events at all) and
+        ``page.human_type`` (real keys + human cadence).
 
         ``stable=True`` first waits for the field to be visible, enabled, and
         settled before focusing.'''
         if stable:
             await self.wait_actionable(hit=False, timeout=timeout)
         await self.focus()
-        await self._page.session.execute(input_proto.insert_text(text))
+        if insert:
+            await self._page.session.execute(input_proto.insert_text(text))
+            return
+        for ch in text:
+            await self._page.session.execute(input_proto.dispatch_key_event(
+                type='keyDown', text=ch, key=ch))
+            await self._page.session.execute(input_proto.dispatch_key_event(
+                type='keyUp', key=ch))
 
     async def scroll_into_view(self) -> None:
         await self.eval(
@@ -451,8 +556,9 @@ class ElementQueries:
         trimmed text (anchors give exact match: ``re.compile(r'^AND$')``;
         keep patterns to the Python/JS-shared syntax) — picked by ``index``
         (-1 = newest/last, for apps that keep stale copies of widgets in the
-        DOM). Polling rides out framework re-renders; raises TimeoutError with
-        the selector in the message unless ``required=False`` (presence
+        DOM). Polling rides out framework re-renders; raises
+        :class:`QueryTimeout` — whose message says what WAS there (near-miss
+        candidates, hidden matches) — unless ``required=False`` (presence
         probes).'''
         js = _query_js('document', selector, containing, index)
         try:
@@ -465,11 +571,37 @@ class ElementQueries:
                     await asyncio.sleep(poll)
         except TimeoutError:
             if required:
-                detail = f' containing {containing!r}' if containing else ''
-                raise TimeoutError(
-                    f'no element for {selector!r}{detail}{self._where} within '
-                    f'{timeout or self.default_timeout}s') from None
+                raise (await _query_timeout(
+                    self, selector, containing, index, self._where,
+                    timeout or self.default_timeout)) from None
             return None
+
+    async def wait_for(self, selector: str, *,
+                       containing: str | re.Pattern | None = None,
+                       timeout: float | None = None,
+                       **conditions: typing.Any) -> None:
+        '''Wait until ``selector`` satisfies ``conditions`` — the same
+        vocabulary as :meth:`Live.should` (``visible`` / ``text`` / ``value``
+        / ``count`` / ``enabled`` / ``checked``); with none, waits for
+        presence (at least one match, hidden counts).
+
+        The two axes: **``count`` is the exists axis, ``visible`` the
+        rendered axis.** SPAs hide rather than remove, so existence checks
+        lie about what a user can see::
+
+            await page.wait_for('.results')                 # present
+            await page.wait_for('.spinner', visible=False)  # gone OR hidden
+            await page.wait_for('.spinner', count=0)        # strictly absent
+            await page.wait_for('.modal', visible=True)     # actually rendered
+
+        Presence failures raise :class:`QueryTimeout` (with the near-miss
+        diagnosis); condition failures raise ``ExpectationError`` with the
+        observed values.'''
+        if not conditions:
+            await self.query(selector, containing=containing, timeout=timeout)
+            return
+        await self.live(selector, containing=containing).should(
+            timeout=timeout, **conditions)
 
     async def query_count(self, selector: str) -> int:
         return int(await self.evaluate(

@@ -117,8 +117,17 @@ class FakeBrowser:
         self.no_body: set[str] = set()
         #: If set, Page.navigate responds with this errorText.
         self.navigate_error: str | None = None
+        #: If set, Page.navigate SUCCEEDS (no errorText) but the document's
+        #: load fails with this net error before loadEventFired — modeling
+        #: Chrome committing to chrome-error://chromewebdata/ silently.
+        self.navigate_silent_failure: str | None = None
         #: Canned AXNode JSON dicts returned by Accessibility.getFullAXTree.
         self.ax_nodes: list[dict] = []
+        #: Optional callable(expression) -> raw Runtime.evaluate result dict,
+        #: or None to fall through to evaluate_results — lets a test answer
+        #: only SPECIFIC expressions (e.g. the near-miss diagnostic) while
+        #: unrelated polling keeps getting the undefined default.
+        self.evaluate_hook = None
 
     def _target_info(self, tid: str) -> dict:
         t = self.targets[tid]
@@ -208,16 +217,48 @@ class FakeBrowser:
             return [ok()]
         if method == 'Page.navigate':
             self._n += 1
-            result = {'frameId': f'F-{self._n}', 'loaderId': f'L-{self._n}'}
+            frame_id = f'F-{self._n}'
+            result = {'frameId': frame_id, 'loaderId': f'L-{self._n}'}
             if self.navigate_error:
                 result['errorText'] = self.navigate_error
                 return [ok(result)]
+            replies = [ok(result)]
+            if self.navigate_silent_failure:
+                # what Chrome sends when it commits to its error page without
+                # returning errorText: the document request fails, THEN the
+                # error page's load event fires
+                request_id = f'R-NAV-{self._n}'
+                for event in (
+                    {'method': 'Network.requestWillBeSent',
+                     'params': {'requestId': request_id, 'loaderId': f'L-{self._n}',
+                                'documentURL': params['url'], 'timestamp': 1.0,
+                                'wallTime': 1.0, 'initiator': {'type': 'other'},
+                                'redirectHasExtraInfo': False, 'type': 'Document',
+                                'frameId': frame_id,
+                                'request': {'url': params['url'], 'method': 'GET',
+                                            'headers': {},
+                                            'initialPriority': 'VeryHigh',
+                                            'referrerPolicy': 'no-referrer'}}},
+                    {'method': 'Network.loadingFailed',
+                     'params': {'requestId': request_id, 'timestamp': 2.0,
+                                'type': 'Document',
+                                'errorText': self.navigate_silent_failure,
+                                'canceled': False}},
+                ):
+                    if sid:
+                        event['sessionId'] = sid
+                    replies.append(event)
             event = {'method': 'Page.loadEventFired',
                      'params': {'timestamp': float(self._n)}}
             if sid:
                 event['sessionId'] = sid
-            return [ok(result), event]
+            replies.append(event)
+            return replies
         if method == 'Runtime.evaluate':
+            if self.evaluate_hook is not None:
+                hooked = self.evaluate_hook(params.get('expression', ''))
+                if hooked is not None:
+                    return [ok(hooked)]
             result = (self.evaluate_results.pop(0) if self.evaluate_results
                       else {'result': {'type': 'undefined'}})
             return [ok(result)]

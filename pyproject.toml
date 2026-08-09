@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "purecdp"
-dynamic = ["version"]                                # single source: purecdp.__version__
+dynamic = ["version"]                                # purecdp.__version__
 description = "Vanilla Python Chrome DevTools Protocol. Optional dependencies for accelerated performance"
 readme = "Readme.md"   # exact on-disk case — GitHub's Linux runner is case-sensitive
 license = "0BSD"

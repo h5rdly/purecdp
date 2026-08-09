@@ -47,6 +47,37 @@ class PageE2ETests(CDPTestCase):
         assert await self.page.evaluate('6 * 7') == 42
         assert await self.page.evaluate("Promise.resolve('later')") == 'later'
 
+    async def test_goto_failure_carries_net_error(self):
+        from purecdp.testing import NavigateError
+        # a refused connection — the classic errorText path
+        try:
+            await self.page.goto('http://127.0.0.1:1/', timeout=15)
+        except NavigateError as exc:
+            assert exc.net_error and exc.net_error.startswith('net::ERR_')
+            assert exc.url == 'http://127.0.0.1:1/'
+        else:
+            raise AssertionError('expected NavigateError')
+        # a server that accepts then drops — whichever CDP path Chrome takes
+        # (errorText or a silent error-page commit), the net error surfaces
+        import socket
+        server = socket.create_server(('127.0.0.1', 0))
+        port = server.getsockname()[1]
+
+        def drop_one():
+            conn, _ = server.accept()
+            conn.close()
+
+        t = threading.Thread(target=drop_one, daemon=True)
+        t.start()
+        try:
+            await self.page.goto(f'http://127.0.0.1:{port}/', timeout=15)
+        except NavigateError as exc:
+            assert exc.net_error and exc.net_error.startswith('net::ERR_')
+        else:
+            raise AssertionError('expected NavigateError')
+        finally:
+            server.close()
+
     async def test_evaluate_with_args(self):
         assert await self.page.evaluate('(a, b) => a + b', 2, 3) == 5
         # async functions await like promise expressions do
@@ -81,13 +112,13 @@ class PageE2ETests(CDPTestCase):
         else:
             raise AssertionError('expected JSError from rejection')
 
-    async def test_wait_for_selector_and_click(self):
+    async def test_wait_for_and_click(self):
         await self.page.goto(
             'data:text/html,<button onclick=\"window.clicked=1\">go</button>'
             '<script>setTimeout(() => {'
             "  const d = document.createElement('div'); d.id = 'late';"
             '  document.body.appendChild(d); }, 100)</script>')
-        await self.page.wait_for_selector('#late')
+        await self.page.wait_for('#late')
         await self.page.click('button')
         assert await self.page.evaluate('window.clicked') == 1
         try:
@@ -96,6 +127,37 @@ class PageE2ETests(CDPTestCase):
             assert '#nope' in str(exc)
         else:
             raise AssertionError('expected TimeoutError')
+
+    async def test_wait_for_visible_axis(self):
+        # the spinner is HIDDEN (not removed) after 150ms — the SPA pattern
+        # existence checks lie about; visible=False sees through it
+        await self.page.goto(
+            'data:text/html,<div class=spinner>loading</div>'
+            '<script>setTimeout(() => {'
+            "  document.querySelector('.spinner').style.display = 'none';"
+            '}, 150)</script>')
+        await self.page.wait_for('.spinner', visible=True)   # rendered now
+        await self.page.wait_for('.spinner', visible=False)  # hidden, not gone
+        assert await self.page.query_count('.spinner') == 1  # still in the DOM
+
+    async def test_type_fires_real_key_events(self):
+        # NB: no '#' inside a data: URL — it starts the fragment
+        await self.page.goto(
+            'data:text/html,<input id=i>'
+            '<script>window.__keys = [];'
+            "document.getElementById('i').addEventListener('keydown',"
+            ' e => window.__keys.push(e.key))</script>')
+        el = await self.page.query('#i')
+        await el.type('ab')
+        assert await self.page.evaluate('window.__keys') == ['a', 'b']
+        assert await el.eval('(el) => el.value') == 'ab'
+        # insert=True: value lands, but key listeners never fire — the
+        # documented trade-off, proven
+        await el.eval("(el) => { el.value = ''; window.__keys = []; }")
+        el2 = await self.page.query('#i')
+        await el2.type('cd', insert=True)
+        assert await self.page.evaluate('window.__keys') == []
+        assert await el2.eval('(el) => el.value') == 'cd'
 
     async def test_console_and_error_capture(self):
         await self.page.evaluate("console.log('hello', 42)")
@@ -439,6 +501,46 @@ class DriveParityE2ETests(CDPTestCase):
         target_id = session.target_id
         assert await self.browser.close_target(target_id) is True
         await eventually(lambda: session.closed)
+
+    async def test_query_timeout_says_what_was_there(self):
+        from purecdp.testing import QueryTimeout
+        await self.page.goto(
+            'data:text/html,'
+            '<button class=chip>Search orders</button>'
+            '<button class=chip>Settings</button>'
+            '<div id=modal style="display:none">hidden thing</div>')
+        # wrong text -> the visible candidates are listed
+        try:
+            await self.page.query('.chip', containing='Missing', timeout=0.4)
+        except QueryTimeout as exc:
+            assert "'Search orders'" in str(exc) and "'Settings'" in str(exc)
+            assert exc.matched == 2 and exc.visible_count == 2
+        else:
+            raise AssertionError('expected QueryTimeout')
+        # present but hidden -> distinguished from absent (note: a bare query
+        # MATCHES hidden elements, so this form fires when the text filter
+        # also missed — the near-miss then reports the matches are invisible)
+        try:
+            await self.page.query('#modal', containing='zzz', timeout=0.4)
+        except QueryTimeout as exc:
+            assert 'none are visible' in str(exc)
+            assert exc.matched == 1 and exc.visible_count == 0
+        else:
+            raise AssertionError('expected QueryTimeout')
+        # absent -> says so
+        try:
+            await self.page.query('#nope', timeout=0.4)
+        except QueryTimeout as exc:
+            assert 'selector matches nothing' in str(exc)
+        else:
+            raise AssertionError('expected QueryTimeout')
+        # the Live path (what MCP act-by-description uses) carries it too
+        try:
+            await self.page.get_by_role('button', name='Missing').get(timeout=0.4)
+        except QueryTimeout as exc:
+            assert "'Search orders'" in str(exc)
+        else:
+            raise AssertionError('expected QueryTimeout')
 
     async def test_query_containing_accepts_regex(self):
         await self.page.goto(
@@ -934,6 +1036,22 @@ class AgentSurfaceE2ETests(CDPTestCase):
             '<button onclick=\"window.clicked=1;return false\">Sign in</button>'
             '</form>')
 
+    async def test_dialog_scoped_snapshot(self):
+        await self.page.goto(
+            'data:text/html,<button>Outer</button>'
+            '<dialog open><input aria-label=Amount>'
+            '<button>Charge</button></dialog>')
+        snap = await self.page.snapshot(scope='dialog')
+        assert 'Charge' in snap.text and 'Amount' in snap.text
+        assert 'Outer' not in snap.text
+        full = await self.page.snapshot()
+        assert 'Outer' in full.text
+        # no dialog open -> full page with the note
+        await self.page.goto('data:text/html,<button>Alone</button>')
+        snap = await self.page.snapshot(scope='dialog')
+        assert snap.text.startswith('(no open dialog')
+        assert 'Alone' in snap.text
+
     async def test_snapshot_lists_controls_with_refs(self):
         await self.page.goto(self.FORM)
         snap = await self.page.snapshot()
@@ -967,7 +1085,7 @@ class AgentSurfaceE2ETests(CDPTestCase):
 
 
 class ActionabilityE2ETests(CDPTestCase):
-    '''The Playwright-style actionability gate on real, obstructed pages.'''
+    ''' Actionability gate on real, obstructed pages '''
 
     EXTRA_ARGS = EXTRA
 
@@ -1055,6 +1173,24 @@ class ConnectE2ETests(CDPTestCase):
             await other.aclose()
         # closing the connected client must leave the real browser running
         assert self.browser.process.returncode is None
+
+    async def test_connect_by_http_endpoint(self):
+        # the form everyone tries first — resolved via /json/version
+        port, _ = self._endpoint_parts()
+        other = await purecdp.connect(f'http://127.0.0.1:{port}')
+        try:
+            page = await other.new_page('data:text/html,<title>http-form</title>')
+            assert await page.title() == 'http-form'
+        finally:
+            await other.aclose()
+
+    async def test_connect_rejects_unknown_scheme_clearly(self):
+        try:
+            await purecdp.connect('ftp://127.0.0.1:9222')
+        except ValueError as exc:
+            assert 'ws://' in str(exc) and 'http://' in str(exc)
+        else:
+            raise AssertionError('expected ValueError')
 
     async def test_connect_by_endpoint_url(self):
         port, path = self._endpoint_parts()

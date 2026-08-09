@@ -22,7 +22,8 @@ import re
 import typing
 
 from ..errors import PureCDPError
-from .element import Element, _elements_from_array, _js_regex
+from .element import (Element, QueryTimeout, _elements_from_array, _js_regex,
+                      _near_miss, _near_miss_tail)
 
 if typing.TYPE_CHECKING:
     from .page import Page
@@ -284,7 +285,26 @@ class Live(LiveFactories):
                         return el
                     await asyncio.sleep(0.05)
         except TimeoutError:
-            raise TimeoutError(f'no element for {self!r} within {to}s') from None
+            raise (await self._query_timeout(to)) from None
+
+    async def _query_timeout(self, to: float) -> QueryTimeout:
+        '''The near-miss-enriched failure — when the base step is a CSS query
+        (live()/get_by_test_id/get_by_role), say what the bare selector DID
+        match; text/label bases keep the plain message.'''
+        base = f'no element for {self!r} within {to}s'
+        step = self._steps[0] if self._steps else {}
+        if step.get('kind') != 'css':
+            return QueryTimeout(base)
+        selector = step['sel']
+        containing = step.get('name') or step.get('containing')
+        diag = await _near_miss(self._owner, selector)
+        if diag is None:
+            return QueryTimeout(base, selector=selector, containing=containing)
+        total, visible, texts = diag
+        return QueryTimeout(
+            base + _near_miss_tail(selector, containing, None, diag),
+            selector=selector, containing=containing, matched=total,
+            visible_count=visible, candidates=texts)
 
     async def get(self, *, timeout: float | None = None) -> Element:
         '''Resolve NOW to a one-shot :class:`Element` — the escape hatch to the
@@ -369,7 +389,9 @@ class Live(LiveFactories):
         try:
             async with asyncio.timeout(to):
                 while True:
-                    obs = await self.probe()
+                    # a probe can come back empty (page mid-navigation) —
+                    # that's "not met yet", never a crash
+                    obs = await self.probe() or {}
                     if not _failing(conditions, obs):
                         return
                     await asyncio.sleep(0.05)

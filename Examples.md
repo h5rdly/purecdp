@@ -48,7 +48,9 @@ or rejection. `wait=` is `"load"` (default), `"idle"` (load + network quiet), or
 `"none"` (return as soon as navigation starts). Prefer `"load"` on public
 pages: `"idle"` is for apps you control — a third-party-heavy page (ads,
 analytics, long-polls) may never go network-quiet, and the timeout will tell
-you so.
+you so. A failed navigation raises `NavigateError` carrying Chrome's raw net
+error (`exc.net_error`, e.g. `net::ERR_CONNECTION_TIMED_OUT`) — including when
+Chrome silently commits to its own error page instead of reporting one.
 
 ### Passing values into `evaluate` — as arguments, never by interpolation
 
@@ -88,9 +90,9 @@ test *failure*.)
 
 ```python
 async with launched_page() as (browser, page):
-    await page.goto("https://news.ycombinator.com", wait="idle")
+    await page.goto("https://news.ycombinator.com", wait="load")
 
-    await page.wait_for_selector(".titleline")
+    await page.wait_for(".titleline")
     first = await page.text(".titleline a")          # textContent of the first match
     count = await page.query_count(".titleline")
     print(count, "stories; top:", first)
@@ -105,6 +107,38 @@ a case-insensitive substring (the `:has-text()` CDP never had) or a
 `re.Pattern` tested against the trimmed text (anchors give exact match) — and
 picks by `index` (`-1` = newest, for apps that leave stale copies of a widget
 in the DOM).
+
+### `wait_for`: appear, disappear, or any state in between
+
+One method, the same condition vocabulary as `.should()`. The two axes to
+know: **`count` is the exists axis, `visible` is the rendered axis** — SPAs
+*hide* rather than remove, so existence checks lie about what a user can see:
+
+```python
+await page.wait_for(".results")                    # present (hidden counts)
+await page.wait_for(".spinner", visible=False)     # no VISIBLE match (gone or hidden)
+await page.wait_for(".spinner", count=0)           # strictly absent from the DOM
+await page.wait_for(".modal", visible=True)        # actually rendered
+await page.wait_for(".row", count=3, text="done")  # any should() combination
+```
+
+### When a query fails, the error tells you what WAS there
+
+A timed-out `query`/`wait_for`/locator raises `QueryTimeout` (still a
+`TimeoutError`, also a `PureCDPError`) whose message is the diagnosis, not a
+shrug — three forms:
+
+```text
+no '.chip' containing 'Search' within 5s — 4 visible '.chip':
+'Search orders' | 'Search help' | 'Orders' | 'Settings'   # wrong text: near-misses listed
+no element for '#submit' within 5s — 2 match but none are visible …  # hidden ≠ absent
+no element for '#submit' within 5s — selector matches nothing        # actually absent
+```
+
+Structured too (`exc.matched`, `exc.visible_count`, `exc.candidates`) — and
+since the MCP `act`-by-description tool rides the same path, an agent's failed
+click comes back with the candidate captions instead of "timed out" (the error
+text is all the model sees).
 
 ### Enumerating a set: `query_all`
 
@@ -234,6 +268,23 @@ async def test_title(cdp_page):
     assert await cdp_page.title() == "hi"
 ```
 
+### Typing: which call fires which events
+
+The classic silent failure: a framework autocompletes on `keydown`, you write
+into the field some fast way, `.value` looks perfect — and the fetch never
+fires, because nothing ever pressed a key. Know what each call emits:
+
+| call | key events | input events | speed | use when |
+|---|---|---|---|---|
+| `set_value` | none | synthetic `input`+`change` | instant | controlled (React) inputs, bulk state |
+| `el.type(text, insert=True)` | none | one real `input` | 1 round trip | big text, key events unwanted |
+| `el.type(text)` | per char | per char | fast | **default** — anything listening to keys |
+| `page.human_type` | per char | per char | human cadence | stealth / behavioral realism |
+| `page.press("Enter")` | one | if printable | — | submit, shortcuts |
+
+`type()` sends real per-key events by default (0.7.0 — the surprising
+behavior became the opt-in, not the default).
+
 ### Failures leave artifacts behind
 
 When a `CDPTestCase` test (or a pytest `cdp_page` test) fails, purecdp dumps
@@ -354,7 +405,7 @@ class CartTests(CDPTestCase):
             "/api/user/": lambda path: {"id": path.rsplit("/", 1)[-1]},
         })
         await self.page.goto("https://shop.example/cart", wait="idle")
-        await self.page.wait_for_selector("#empty-state")
+        await self.page.wait_for("#empty-state")
 ```
 
 For full control over a request, use `route()` directly. Its pattern is an
@@ -691,18 +742,22 @@ starts nor owns the browser: `aclose()` just detaches and leaves it running.
 
 ```python
 import purecdp
-from purecdp.testing import Page
 
 # the human ran:  brave --remote-debugging-port=9222   and logged in
-async with await purecdp.connect(host="127.0.0.1", port=9222) as browser:
-    session = await browser.new_session()     # NEW tab, but the SAME profile:
-    page = await Page.create(session)         # cookies/session already there
+async with await purecdp.connect("http://127.0.0.1:9222") as browser:
+    page = await browser.new_page()           # NEW tab, but the SAME profile:
     await page.goto("https://portal.example/dashboard")   # in, no login flow
 
-# … or pass a browser-level ws:// endpoint straight through
-# (Chrome-in-Docker, a browserless/cloud session):
+# equivalent endpoint forms: host=/port= kwargs, or a browser-level ws://
+# URL straight through (Chrome-in-Docker, a browserless/cloud session):
+browser = await purecdp.connect(host="127.0.0.1", port=9222)
 browser = await purecdp.connect("ws://127.0.0.1:9222/devtools/browser/abc123")
 ```
+
+`new_page()` is `new_session()` + `Page.create()` in one call (kwargs forward:
+`default_timeout`, `capture`, `track_network`; also on contexts —
+`browser.new_page(context=ctx)`). Keep the two-step when you want the raw
+`Session`.
 
 `new_session()` beats hunting for "the tab the user logged in on" by URL —
 a fresh tab in the same profile shares its cookies, and no other script is

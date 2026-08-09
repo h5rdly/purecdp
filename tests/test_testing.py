@@ -111,8 +111,25 @@ class NavigationTests(PageTestBase):
             await self.page.goto('https://nope.invalid/')
         except NavigateError as exc:
             assert 'ERR_NAME_NOT_RESOLVED' in str(exc)
+            assert exc.net_error == 'net::ERR_NAME_NOT_RESOLVED'  # structured
+            assert exc.url == 'https://nope.invalid/'
         else:
             raise AssertionError('expected NavigateError')
+
+    async def test_goto_detects_silent_error_page(self):
+        # navigate can commit to chrome-error:// WITHOUT errorText (a server
+        # that accepts then stalls) — the document loadingFailed must surface
+        self.fake.navigate_silent_failure = 'net::ERR_CONNECTION_TIMED_OUT'
+        try:
+            await self.page.goto('https://egov.example/')
+        except NavigateError as exc:
+            assert exc.net_error == 'net::ERR_CONNECTION_TIMED_OUT'
+            assert 'error page' in str(exc)
+        else:
+            raise AssertionError('expected NavigateError')
+        # the failure is consumed — a following good goto is clean
+        self.fake.navigate_silent_failure = None
+        await self.page.goto('https://x/')
 
     async def test_goto_timeout_names_the_wait_state(self):
         # an in-flight request keeps 'idle' from ever arriving; the timeout
@@ -136,6 +153,45 @@ class NavigationTests(PageTestBase):
             assert "try wait='load'" in str(exc)
         else:
             raise AssertionError('expected TimeoutError')
+
+
+class NewPageTests(unittest.IsolatedAsyncioTestCase):
+    '''browser.new_page() — new_session + Page.create in one honest call.'''
+
+    async def test_new_page_returns_armed_page(self):
+        from purecdp.browser import Browser
+        fake = FakeBrowser()
+        transport = FakeTransport(fake)
+        conn = Connection(transport)
+        await conn.open()
+        browser = Browser(None, conn, '', False)
+        page = await browser.new_page(default_timeout=3.0)
+        try:
+            assert isinstance(page, Page)
+            assert page.default_timeout == 3.0        # kwargs forward
+            assert any(m['method'] == 'Page.enable' for m in transport.sent)
+        finally:
+            await page.stop()
+            await conn.aclose()
+
+    async def test_new_page_in_context(self):
+        from purecdp.browser import Browser
+        fake = FakeBrowser()
+        transport = FakeTransport(fake)
+        conn = Connection(transport)
+        await conn.open()
+        browser = Browser(None, conn, '', False)
+        ctx = await browser.new_context()
+        page = await browser.new_page(context=ctx)
+        page2 = await ctx.new_page()                  # context's own method too
+        try:
+            for target in fake.targets.values():
+                assert target['ctx'] == ctx.context_id
+            assert isinstance(page2, Page)
+        finally:
+            await page.stop()
+            await page2.stop()
+            await conn.aclose()
 
 
 class EvaluateTests(PageTestBase):
@@ -164,12 +220,36 @@ class EvaluateTests(PageTestBase):
         await self.page.wait_for_function('window.ready', poll=0.001)
         assert len(self.sent('Runtime.evaluate')) == 3
 
-    async def test_wait_for_selector_builds_expression(self):
-        self.fake.evaluate_results.append(
-            {'result': {'type': 'boolean', 'value': True}})
-        await self.page.wait_for_selector('#late')
-        sent = self.sent('Runtime.evaluate')[-1]['params']['expression']
-        assert 'document.querySelector("#late")' in sent
+    async def test_wait_for_presence_polls_the_query(self):
+        # no conditions -> presence via the waiting query (hidden counts)
+        self.fake.evaluate_results += [NULL, NULL, OBJ]
+        await self.page.wait_for('#late', timeout=2)
+        assert len(self.sent('Runtime.evaluate')) == 3
+
+    async def test_wait_for_conditions_delegate_to_should(self):
+        def probe(count, visible):
+            return {'result': {'type': 'object', 'value': {
+                'count': count, 'present': count > 0, 'text': None,
+                'value': None, 'visible': visible, 'enabled': None,
+                'checked': None}}}
+        # visible=False satisfied by a hidden match...
+        self.fake.evaluate_results.append(probe(1, False))
+        await self.page.wait_for('.spinner', visible=False, timeout=2)
+        # ...and by no match at all (gone OR hidden — the spinner intent)
+        self.fake.evaluate_results.append(probe(0, False))
+        await self.page.wait_for('.spinner', visible=False, timeout=2)
+        # count=0 is the STRICT absence axis
+        self.fake.evaluate_results.append(probe(0, False))
+        await self.page.wait_for('.spinner', count=0, timeout=2)
+
+    async def test_wait_for_condition_failure_is_expectation_error(self):
+        from purecdp.testing import ExpectationError
+        try:
+            await self.page.wait_for('.x', visible=True, timeout=0.15)
+        except ExpectationError as exc:
+            assert 'visible' in str(exc)
+        else:
+            raise AssertionError('expected ExpectationError')
 
 
 class EvaluateArgsTests(PageTestBase):
@@ -382,6 +462,85 @@ class ErrorHierarchyTests(unittest.TestCase):
 
 OBJ = {'result': {'type': 'object', 'subtype': 'node', 'objectId': 'OBJ-1'}}
 NULL = {'result': {'type': 'object', 'subtype': 'null', 'value': None}}
+
+
+def _diag(total, visible, texts=()):
+    '''Canned near-miss diagnostic, answered ONLY for the diagnostic pass
+    (matched by its unique 'total: els.length' marker) so the query's own
+    polling keeps timing out on the undefined default.'''
+    value = {'total': total, 'visible': visible, 'texts': list(texts)}
+    return lambda expr: ({'result': {'type': 'object', 'value': value}}
+                         if 'total: els.length' in expr else None)
+
+
+class QueryDiagnosticsTests(PageTestBase):
+    '''QueryTimeout: the message says what WAS there (near-miss + typed
+    absence), and the structured fields carry it for programmatic use.'''
+
+    async def test_matches_nothing(self):
+        self.fake.evaluate_hook = _diag(0, 0)
+        try:
+            await self.page.query('#gone', timeout=0.12)
+        except purecdp.testing.QueryTimeout as exc:
+            assert 'selector matches nothing' in str(exc)
+            assert exc.matched == 0 and exc.candidates == []
+            assert isinstance(exc, TimeoutError)          # old handlers work
+            assert isinstance(exc, purecdp.PureCDPError)  # family catch works
+        else:
+            raise AssertionError('expected QueryTimeout')
+
+    async def test_present_but_hidden_is_distinguished(self):
+        self.fake.evaluate_hook = _diag(3, 0)
+        try:
+            await self.page.query('#submit', timeout=0.12)
+        except purecdp.testing.QueryTimeout as exc:
+            assert '3 match but none are visible' in str(exc)
+            assert exc.matched == 3 and exc.visible_count == 0
+        else:
+            raise AssertionError('expected QueryTimeout')
+
+    async def test_containing_miss_lists_candidates(self):
+        self.fake.evaluate_hook = _diag(
+            4, 4, ['Search orders', 'Search help', 'Orders', 'Settings'])
+        try:
+            await self.page.query('.chip', containing='Missing', timeout=0.12)
+        except purecdp.testing.QueryTimeout as exc:
+            assert "containing 'Missing'" in str(exc)
+            assert "'Search orders' | 'Search help'" in str(exc)
+            assert exc.candidates == ['Search orders', 'Search help',
+                                      'Orders', 'Settings']
+            assert exc.containing == 'Missing'
+        else:
+            raise AssertionError('expected QueryTimeout')
+
+    async def test_index_out_of_range_hint(self):
+        self.fake.evaluate_hook = _diag(2, 2, ['a', 'b'])
+        try:
+            await self.page.query('.row', index=5, timeout=0.12)
+        except purecdp.testing.QueryTimeout as exc:
+            assert 'is index=5 out of range?' in str(exc)
+        else:
+            raise AssertionError('expected QueryTimeout')
+
+    async def test_broken_page_still_gets_plain_message(self):
+        # diagnostic pass fails (undefined default) -> plain message, no crash
+        try:
+            await self.page.query('#gone', timeout=0.12)
+        except purecdp.testing.QueryTimeout as exc:
+            assert "no element for '#gone'" in str(exc)
+            assert exc.matched == 0
+        else:
+            raise AssertionError('expected QueryTimeout')
+
+    async def test_live_failures_carry_the_near_miss(self):
+        self.fake.evaluate_hook = _diag(2, 2, ['Draft', 'Sent'])
+        try:
+            await self.page.live('.msg').containing('Missing').get(timeout=0.12)
+        except purecdp.testing.QueryTimeout as exc:
+            assert "'Draft' | 'Sent'" in str(exc)      # candidates surfaced
+            assert exc.selector == '.msg'
+        else:
+            raise AssertionError('expected QueryTimeout')
 
 
 class ElementTests(PageTestBase):
@@ -795,6 +954,49 @@ class PrivateRecordingTests(PageTestBase):
         assert entries[1]['response']['content']['text'] == 'hi'
 
 
+class DialogScopeTests(PageTestBase):
+    '''snapshot(scope="dialog") — only the open modal's controls.'''
+
+    def _dialog_tree(self):
+        self.fake.ax_nodes = [
+            ax('1', role='RootWebArea', name='Shop', children=['2', '3']),
+            ax('2', role='button', name='Outer button', backend=10),
+            ax('3', role='dialog', name='Top-up', backend=11,
+               children=['4', '5']),
+            ax('4', role='textbox', name='Amount', backend=12),
+            ax('5', role='dialog', name='Confirm', backend=13, children=['6']),
+            ax('6', role='button', name='Yes, charge me', backend=14),
+        ]
+
+    async def test_scopes_to_the_deepest_open_dialog(self):
+        self._dialog_tree()
+        snap = await self.page.snapshot(scope='dialog')
+        assert 'Yes, charge me' in snap.text        # inside the deepest dialog
+        assert 'Amount' not in snap.text            # outer dialog's control
+        assert 'Outer button' not in snap.text      # page-level control
+        # its refs act as usual
+        assert any(m['name'] == 'Yes, charge me' for m in snap.meta.values())
+
+    async def test_no_dialog_falls_back_to_full_page_with_note(self):
+        self.fake.ax_nodes = [
+            ax('1', role='RootWebArea', name='Shop', children=['2']),
+            ax('2', role='button', name='Outer button', backend=10),
+        ]
+        snap = await self.page.snapshot(scope='dialog')
+        assert snap.text.startswith('(no open dialog')
+        assert 'Outer button' in snap.text
+
+    async def test_scope_rejects_unknown_and_cross_frame(self):
+        self._dialog_tree()
+        for bad in ({'scope': 'modal'}, {'scope': 'dialog', 'cross_frame': True}):
+            try:
+                await self.page.snapshot(**bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'expected ValueError for {bad}')
+
+
 class ConvenienceTests(PageTestBase):
     def paused_event(self, request_id, url):
         return {
@@ -848,13 +1050,25 @@ class ConvenienceTests(PageTestBase):
                      for m in self.sent('Fetch.continueRequest')]
         assert continued == ['R3']
 
-    async def test_element_type_focuses_then_inserts(self):
+    async def test_element_type_sends_real_keys_by_default(self):
+        # 0.7.0 flip: per-key keydown/keyup, so key listeners actually fire
         self.fake.evaluate_results.append(OBJ)
         element = await self.page.query('input')
-        await element.type('hello')
+        await element.type('hi')
         focus_call = self.sent('Runtime.callFunctionOn')[-1]['params']
         assert 'el.focus()' in focus_call['functionDeclaration']
+        keys = [m['params'] for m in self.sent('Input.dispatchKeyEvent')]
+        assert [(k['type'], k.get('text') or k['key']) for k in keys] == [
+            ('keyDown', 'h'), ('keyUp', 'h'),
+            ('keyDown', 'i'), ('keyUp', 'i')]
+        assert not self.sent('Input.insertText')
+
+    async def test_element_type_insert_mode_pastes(self):
+        self.fake.evaluate_results.append(OBJ)
+        element = await self.page.query('input')
+        await element.type('hello', insert=True)
         assert self.sent('Input.insertText')[0]['params'] == {'text': 'hello'}
+        assert not self.sent('Input.dispatchKeyEvent')
 
 
 class CaptureOptInTests(unittest.IsolatedAsyncioTestCase):
