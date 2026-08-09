@@ -13,27 +13,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # purecdp drives a REAL Chromium; on CI it runs headless without user
-  # namespaces, so every launch needs --no-sandbox. Both vars matter:
-  # CDPTestCase reads $PURECDP_LAUNCH_ARGS, the raw-launch e2e tests
-  # (test_e2e / test_testing_e2e) read $PURECDP_E2E_ARGS. Setting both covers
-  # every launch path. Without a browser these tests skip cleanly, so the leg
-  # that installs one is what makes them actually run.
-  # --enable-unsafe-swiftshader gives headless glibc Chrome a software WebGL
-  # context so the stealth WebGL test verifies its spoof instead of skipping
-  # (recent Chrome gates SwiftShader behind it). Harmless where WebGL is still
-  # absent — that test then skips on its own.
   PURECDP_E2E_ARGS: --no-sandbox --enable-unsafe-swiftshader
   PURECDP_LAUNCH_ARGS: --no-sandbox --enable-unsafe-swiftshader
 
 jobs:
-  # Linux + Windows install Chrome for Testing; macOS installs Chromium via
-  # Homebrew WITH --no-quarantine. (The runner's Chrome-for-Testing stalls
-  # headless launch on macOS — a Gatekeeper-quarantine symptom: a quarantined
-  # .app's first launch triggers a notarization check that hangs a headless
-  # process. Stripping the quarantine xattr is the fix.) All three then run the
-  # FULL suite incl. browser e2e. Fallback if macOS still misbehaves: set
-  # PURECDP_NO_BROWSER on it (find_browser -> None) to run the pure suite only.
   test-standard:
     name: Test (${{ matrix.os }}, ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
@@ -59,17 +42,11 @@ jobs:
         with:
           chrome-version: stable
 
-      # macOS: (1) Chromium via Homebrew, then strip the Gatekeeper quarantine
-      # xattr so it launches headless without a first-launch notarization stall
-      # (modern brew dropped --no-quarantine, so remove the attr explicitly);
-      # (2) alias 127.0.0.2/.3 on lo0 — the cross-origin OOPIF tests use them as
-      # distinct sites, but macOS (BSD) only routes 127.0.0.1 by default, so the
-      # cross-site iframes hang the parent's load event (same as FreeBSD).
       - name: Set up browser + loopback (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install --cask chromium
-          sudo xattr -dr com.apple.quarantine "/Applications/Chromium.app" || true
+          brew install --cask google-chrome || true
+          sudo xattr -dr com.apple.quarantine "/Applications/Google Chrome.app" || true
           sudo ifconfig lo0 alias 127.0.0.2 up || true
           sudo ifconfig lo0 alias 127.0.0.3 up || true
 
@@ -77,21 +54,17 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "macOS" ]; then
-            echo "CDP_BROWSER=/Applications/Chromium.app/Contents/MacOS/Chromium" >> "$GITHUB_ENV"
+            echo "CDP_BROWSER=/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" >> "$GITHUB_ENV"
           else
             echo "CDP_BROWSER=${{ steps.setup-chrome.outputs.chrome-path }}" >> "$GITHUB_ENV"
           fi
 
-      # Import + browser discovery — a clear one-line story.
       - name: Sanity — import and browser discovery
         shell: bash
         run: |
           export PYTHONPATH="$PWD/src"
           python -c "import purecdp; print('purecdp', purecdp.__version__, '| browser:', purecdp.find_browser())"
 
-      # Actually launch + close the browser: turns a broken/stalling browser
-      # (incl. a still-misbehaving macOS Chromium) into a fast, clear failure
-      # here instead of a silent death in the test step.
       - name: Launch smoke
         shell: bash
         timeout-minutes: 3
@@ -99,13 +72,6 @@ jobs:
           export PYTHONPATH="$PWD/src"
           python -c "import asyncio, purecdp; loop = asyncio.new_event_loop(); b = loop.run_until_complete(purecdp.launch(extra_args=('--no-sandbox',))); loop.run_until_complete(b.aclose()); print('launch smoke: OK')"
 
-      # Zero runtime deps: `discover` runs the whole suite straight from the
-      # checkout. faulthandler.dump_traceback_later() is a PORTABLE watchdog —
-      # after 600s it dumps EVERY thread's traceback and hard-exits, so a wedged
-      # browser/test becomes a diagnosis on every OS (the mac/Windows legs had
-      # none before — only Linux got `timeout -s ABRT`, so a hang there died
-      # silently at the 20-min wall). verbosity=2 also names each test as it
-      # starts. NEVER add -O — the tests use plain `assert`.
       - name: Run tests
         timeout-minutes: 20
         run: >-
@@ -114,9 +80,6 @@ jobs:
           sys.exit(not unittest.TextTestRunner(verbosity=2).run(
           unittest.defaultTestLoader.discover('tests')).wasSuccessful())"
 
-      # CDPTestCase dumps screenshot/console/HTML/traffic per failing test into
-      # purecdp-artifacts/ — ship them with the run so a red leg is diagnosable
-      # from the Actions UI without a rerun.
       - name: Upload failure artifacts
         if: failure()
         uses: actions/upload-artifact@v4
@@ -125,9 +88,6 @@ jobs:
           path: purecdp-artifacts/
           if-no-files-found: ignore
 
-  # Alpine / musl — apk's musl-native Chromium. The glibc Chrome-for-Testing
-  # binary the standard leg uses cannot run here, which is exactly why this leg
-  # earns its keep: it exercises purecdp against musl and a musl browser.
   test-alpine:
     name: Test (Alpine/musl)
     runs-on: ubuntu-latest
@@ -141,9 +101,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # chromium + the runtime libs it pulls; a font (ttf-freefont) because
-      # headless Chromium still aborts without one; git so actions/checkout uses
-      # git rather than the slower REST download.
       - name: Install musl Chromium
         run: apk add --no-cache chromium nss freetype harfbuzz ca-certificates ttf-freefont git
 
@@ -165,13 +122,6 @@ jobs:
           path: purecdp-artifacts/
           if-no-files-found: ignore
 
-  # FreeBSD — the FULL suite incl. browser e2e, against a real Chromium in the VM
-  # (a non-Linux, non-glibc host). FreeBSD Chromium needs procfs + fdescfs
-  # mounted and headless flags; the cross-origin OOPIF tests use 127.0.0.2/.3 as
-  # distinct sites, which FreeBSD's lo0 doesn't route by default (Linux treats
-  # all of 127/8 as loopback), so alias them. Root-needing setup goes in
-  # `prepare` (guaranteed root); `run` just sets env and runs. Same recipe as
-  # tests/freebsd_gauntlet.py (the local QEMU counterpart).
   test-freebsd:
     name: Test (FreeBSD)
     runs-on: ubuntu-latest
