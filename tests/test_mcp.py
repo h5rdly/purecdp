@@ -88,6 +88,23 @@ class MCPServerTests(unittest.IsolatedAsyncioTestCase):
         assert resp['result']['content'][0]['text'] == '2'
         assert not resp['result'].get('isError')
 
+    async def test_evaluate_args_use_call_function_on(self):
+        async def factory():
+            session = await purecdp.new_session(self.conn, 'about:blank')
+            return await Page.create(session, default_timeout=5.0)
+        server = MCPServer(page_factory=factory, allow_eval=True)
+        self.fake.evaluate_results = [           # the globalThis anchor
+            {'result': {'type': 'object', 'objectId': 'G-1'}}]
+        self.fake.call_results = [{'result': {'type': 'number', 'value': 5}}]
+        resp = await server.handle({
+            'jsonrpc': '2.0', 'id': 9, 'method': 'tools/call',
+            'params': {'name': 'evaluate', 'arguments': {
+                'expression': '(a, b) => a + b', 'args': [2, 3]}}})
+        assert resp['result']['content'][0]['text'] == '5'
+        sent = [m for m in self.transport.sent
+                if m['method'] == 'Runtime.callFunctionOn']
+        assert sent[0]['params']['arguments'] == [{'value': 2}, {'value': 3}]
+
     async def test_navigate_returns_snapshot_text(self):
         result = await self.call('navigate', url='https://x/')
         text = result['content'][0]['text']

@@ -48,6 +48,16 @@ class Exchange:
     #: NOT set for a legitimately bodyless response — a 204/304, a HEAD, or a
     #: redirect has no body by design, so ``body`` is None and this stays None.
     body_error: str | None = None
+    #: Bodies were deliberately NOT captured — ``record(bodies=False)`` or a
+    #: ``redact=`` hit. A choice, not a failure: ``body_error`` stays None.
+    #: Byte counts survive in ``request_body_size`` / ``body_size``.
+    redacted: bool = False
+    #: Sizes recorded when the bytes themselves were withheld (redacted):
+    #: the request body's length, and the response's TOTAL wire length
+    #: (headers + body as received — CDP's encodedDataLength; the split
+    #: isn't observable without fetching the body we chose not to fetch).
+    request_body_size: int | None = None
+    body_size: int | None = None
     #: Request headers as sent (base + requestWillBeSentExtraInfo).
     request_headers: dict = field(default_factory=dict)
     #: Response headers as received (base + responseReceivedExtraInfo;
@@ -60,19 +70,28 @@ class Exchange:
     duration: float | None = None
     _started: float | None = field(default=None, repr=False)  # CDP monotonic
     _finished: bool = field(default=False, repr=False)
+    _masked: bool = field(default=False, repr=False)  # redact= hit: scrub headers too
+
+    def _guard_redacted(self, side: str) -> None:
+        if self.redacted:
+            raise ValueError(f'{side} body not captured (redacted) for '
+                             f'{self.method} {self.url}')
 
     @property
     def request_json(self) -> typing.Any:
         '''Request body parsed as JSON ({} when absent).'''
+        self._guard_redacted('request')
         return _json.loads(self.request_body) if self.request_body else {}
 
     @property
     def json(self) -> typing.Any:
         '''Response body parsed as JSON (None when absent).'''
+        self._guard_redacted('response')
         return _json.loads(self.body) if self.body else None
 
     @property
     def text(self) -> str:
+        self._guard_redacted('response')
         return self.body.decode('utf-8', 'replace') if self.body else ''
 
 
@@ -82,6 +101,17 @@ def _header(headers: dict, name: str) -> str:
         if key.lower() == name:
             return str(value)
     return ''
+
+
+#: Header values scrubbed on a ``redact=`` exchange — on such an exchange the
+#: session cookie is as much a credential as the body it accompanies.
+_CREDENTIAL_HEADERS = frozenset(
+    {'authorization', 'proxy-authorization', 'cookie', 'set-cookie'})
+
+
+def _mask_credentials(headers: dict) -> dict:
+    return {key: ('<redacted>' if key.lower() in _CREDENTIAL_HEADERS else value)
+            for key, value in headers.items()}
 
 
 def _har_headers(headers: dict) -> list[dict]:
@@ -109,7 +139,8 @@ def to_har(exchanges: typing.Iterable[Exchange]) -> dict:
                             parse_qsl(urlsplit(exchange.url).query)],
             'headersSize': -1,
             'bodySize': (len(exchange.request_body.encode())
-                         if exchange.request_body else 0),
+                         if exchange.request_body
+                         else exchange.request_body_size or 0),
         }
         if exchange.request_body:
             request['postData'] = {
@@ -117,14 +148,19 @@ def to_har(exchanges: typing.Iterable[Exchange]) -> dict:
                 'text': exchange.request_body,
             }
         body = exchange.body or b''
-        content = {'size': len(body), 'mimeType': exchange.mime or ''}
-        try:
-            content['text'] = body.decode('utf-8')
-        except UnicodeDecodeError:
-            content['text'] = _b64.b64encode(body).decode('ascii')
-            content['encoding'] = 'base64'
+        body_size = (exchange.body_size if exchange.redacted
+                     and exchange.body_size is not None else len(body))
+        content = {'size': body_size, 'mimeType': exchange.mime or ''}
+        if not exchange.redacted:  # a redacted body has no text, only a size
+            try:
+                content['text'] = body.decode('utf-8')
+            except UnicodeDecodeError:
+                content['text'] = _b64.b64encode(body).decode('ascii')
+                content['encoding'] = 'base64'
         if exchange.failed:
             content['comment'] = f'request failed: {exchange.failed}'
+        elif exchange.redacted:
+            content['comment'] = 'body redacted'
         elif exchange.body_error:
             content['comment'] = f'body unavailable: {exchange.body_error}'
         time_ms = (round(exchange.duration * 1000, 3)
@@ -142,7 +178,7 @@ def to_har(exchanges: typing.Iterable[Exchange]) -> dict:
                 'content': content,
                 'redirectURL': '',
                 'headersSize': -1,
-                'bodySize': len(body),
+                'bodySize': body_size,
             },
             'cache': {},
             'timings': {'send': 0, 'wait': time_ms, 'receive': 0},
@@ -233,6 +269,17 @@ class NetworkRecorder:
     ``exchanges`` holds *completed* exchanges, oldest first; ``requests`` and
     ``responses`` are the JSON-parsed conveniences. To wait for a response,
     arm ``recorder.expect()`` before the trigger and ``await .value`` after.
+
+    Privacy levers — both withhold bodies AT CAPTURE, the secret never enters
+    the process (see :attr:`Exchange.redacted`):
+
+    - ``bodies=False`` — metadata-only recording, recorder-wide: URL, method,
+      status, headers, timing and byte counts, no bodies on either side (and
+      no getResponseBody round-trip per exchange).
+    - ``redact=lambda url: '/payment' in url`` — matching exchanges are fully
+      private: no bodies AND credential header values (Authorization, Cookie,
+      Set-Cookie) masked. On a secret-bearing exchange the session cookie is
+      as much a credential as the body.
     '''
 
     def __init__(
@@ -244,12 +291,16 @@ class NetworkRecorder:
         predicate: typing.Callable[[str], bool] | None = None,
         record_preflights: bool = False,
         default_timeout: float | None = None,
+        bodies: bool = True,
+        redact: typing.Callable[[str], bool] | None = None,
     ):
         self._page = page
         self._needle = needle
         self._exclude = exclude
         self._predicate = predicate
         self._record_preflights = record_preflights
+        self._bodies = bodies
+        self._redact = redact
         #: This recorder's own wait default (None -> the page default). The
         #: endpoint's latency profile, declared once at creation.
         self.default_timeout = default_timeout
@@ -266,6 +317,13 @@ class NetworkRecorder:
         # ExtraInfo is dropped instead of buffered forever.
         self._unmatched: set[str] = set()
         self._appended = asyncio.Event()
+
+    def __await__(self):
+        '''``await page.record()`` works (and is a no-op returning the
+        recorder) — record() is sync on an otherwise all-async Page, and this
+        kills the first-contact TypeError instead of teaching a lesson.'''
+        return self
+        yield  # pragma: no cover — unreachable; makes this a generator
 
     @property
     def requests(self) -> list[typing.Any]:
@@ -378,20 +436,33 @@ class NetworkRecorder:
             self._early_request_extra.pop(request_id, None)
             self._early_response_extra.pop(request_id, None)
             return
+        # privacy decision happens HERE, before the secret is ever stored:
+        # postData arrives unconditionally on the base event, so a redacted
+        # request body is dropped at capture, not scrubbed after the fact
+        masked = self._redact is not None and self._redact(event.request.url)
+        private = masked or not self._bodies
+        post_data = event.request.post_data
         exchange = Exchange(
             url=event.request.url,
             method=event.request.method,
-            request_body=event.request.post_data,
+            request_body=None if private else post_data,
             request_headers=dict(event.request.headers or {}),
             timestamp=float(event.wall_time),
             _started=float(event.timestamp),
+            redacted=private,
+            _masked=masked,
         )
+        if private and post_data is not None:
+            exchange.request_body_size = len(post_data.encode())
         # ExtraInfo may already have arrived (CDP guarantees no order);
         # its headers are the wire truth, so they win on key collisions.
         exchange.request_headers.update(
             self._early_request_extra.pop(request_id, {}))
         exchange.response_headers.update(
             self._early_response_extra.pop(request_id, {}))
+        if masked:
+            exchange.request_headers = _mask_credentials(exchange.request_headers)
+            exchange.response_headers = _mask_credentials(exchange.response_headers)
         self._pending[request_id] = exchange
         self._by_id[request_id] = exchange
 
@@ -404,6 +475,9 @@ class NetworkRecorder:
             exchange.response_headers = {
                 **dict(event.response.headers or {}),
                 **exchange.response_headers}
+            if exchange._masked:
+                exchange.response_headers = _mask_credentials(
+                    exchange.response_headers)
 
     def _on_request_extra(self, event) -> None:
         request_id = str(event.request_id)
@@ -412,6 +486,9 @@ class NetworkRecorder:
         exchange = self._by_id.get(request_id)
         if exchange is not None:
             exchange.request_headers.update(dict(event.headers or {}))
+            if exchange._masked:  # ExtraInfo is where Cookie actually arrives
+                exchange.request_headers = _mask_credentials(
+                    exchange.request_headers)
         else:  # ExtraInfo beat the base event — buffer until it arrives
             self._early_request_extra.setdefault(request_id, {}).update(
                 dict(event.headers or {}))
@@ -423,6 +500,9 @@ class NetworkRecorder:
         exchange = self._by_id.get(request_id)
         if exchange is not None:
             exchange.response_headers.update(dict(event.headers or {}))
+            if exchange._masked:  # Set-Cookie only ever arrives via ExtraInfo
+                exchange.response_headers = _mask_credentials(
+                    exchange.response_headers)
         else:
             self._early_response_extra.setdefault(request_id, {}).update(
                 dict(event.headers or {}))
@@ -435,6 +515,10 @@ class NetworkRecorder:
             exchange.duration = max(0.0, float(event.timestamp) - exchange._started)
         if failed is not None:
             exchange.failed = failed          # the request itself failed
+        elif exchange.redacted:
+            # deliberately no getResponseBody: the bytes never enter the
+            # process. The wire length still lands — metadata is the point.
+            exchange.body_size = int(event.encoded_data_length)
         else:
             try:
                 body, is_b64 = await self._page.session.execute(

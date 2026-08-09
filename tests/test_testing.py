@@ -49,6 +49,56 @@ class PageTestBase(unittest.IsolatedAsyncioTestCase):
     def sent(self, method):
         return [m for m in self.transport.sent if m['method'] == method]
 
+    def _push_exchange(self, request_id: str, url: str, body: str, *,
+                       method: str = 'GET', status: int = 200,
+                       bodyless: bool = False, failed: str | None = None,
+                       post: str | None = None,
+                       headers: dict | None = None) -> None:
+        '''Push a full request/response/finished series through the fake.
+        ``bodyless`` makes getResponseBody error like Chrome does for a 204/
+        preflight; ``failed`` pushes loadingFailed instead of finished.'''
+        sid = self.page.session.session_id
+        if bodyless:
+            self.fake.no_body.add(request_id)
+        else:
+            self.fake.response_bodies[request_id] = {
+                'body': body, 'base64Encoded': False}
+        request = {'url': url, 'method': method, 'headers': headers or {},
+                   'initialPriority': 'High', 'referrerPolicy': 'no-referrer'}
+        if post is not None:
+            request['postData'] = post
+        self.transport.push({
+            'method': 'Network.requestWillBeSent', 'sessionId': sid,
+            'params': {'requestId': request_id, 'loaderId': 'L1',
+                       'documentURL': 'https://x/', 'timestamp': 1.0,
+                       'wallTime': 1.0, 'initiator': {'type': 'other'},
+                       'redirectHasExtraInfo': False,
+                       'request': request}})
+        if failed is not None:
+            self.transport.push({
+                'method': 'Network.loadingFailed', 'sessionId': sid,
+                'params': {'requestId': request_id, 'timestamp': 3.0,
+                           'type': 'XHR', 'errorText': failed,
+                           'canceled': False}})
+            return
+        self.transport.push({
+            'method': 'Network.responseReceived', 'sessionId': sid,
+            'params': {'requestId': request_id, 'loaderId': 'L1',
+                       'timestamp': 2.0, 'type': 'XHR', 'frameId': 'F-1',
+                       'hasExtraInfo': False,
+                       'response': {'url': url, 'status': status,
+                                    'statusText': 'OK', 'headers': {},
+                                    'mimeType': 'application/json',
+                                    'charset': 'utf-8',
+                                    'connectionReused': False,
+                                    'connectionId': 1,
+                                    'encodedDataLength': 14,
+                                    'securityState': 'secure'}}})
+        self.transport.push({
+            'method': 'Network.loadingFinished', 'sessionId': sid,
+            'params': {'requestId': request_id, 'timestamp': 3.0,
+                       'encodedDataLength': 14}})
+
 
 class NavigationTests(PageTestBase):
     async def test_goto_waits_for_load(self):
@@ -63,6 +113,29 @@ class NavigationTests(PageTestBase):
             assert 'ERR_NAME_NOT_RESOLVED' in str(exc)
         else:
             raise AssertionError('expected NavigateError')
+
+    async def test_goto_timeout_names_the_wait_state(self):
+        # an in-flight request keeps 'idle' from ever arriving; the timeout
+        # must say WHAT it was waiting for, plus the third-party-pages hint
+        self.transport.push({
+            'method': 'Network.requestWillBeSent',
+            'sessionId': self.page.session.session_id,
+            'params': {'requestId': 'R1', 'loaderId': 'L1',
+                       'documentURL': 'https://x/', 'timestamp': 1.0,
+                       'wallTime': 1.0, 'initiator': {'type': 'other'},
+                       'redirectHasExtraInfo': False,
+                       'request': {'url': 'https://ads.example/beacon',
+                                   'method': 'GET', 'headers': {},
+                                   'initialPriority': 'High',
+                                   'referrerPolicy': 'no-referrer'}}})
+        await drain()
+        try:
+            await self.page.goto('https://x/', wait='idle', timeout=0.05)
+        except TimeoutError as exc:
+            assert "waiting for 'idle'" in str(exc)
+            assert "try wait='load'" in str(exc)
+        else:
+            raise AssertionError('expected TimeoutError')
 
 
 class EvaluateTests(PageTestBase):
@@ -97,6 +170,60 @@ class EvaluateTests(PageTestBase):
         await self.page.wait_for_selector('#late')
         sent = self.sent('Runtime.evaluate')[-1]['params']['expression']
         assert 'document.querySelector("#late")' in sent
+
+
+class EvaluateArgsTests(PageTestBase):
+    '''With positional args, evaluate() goes through Runtime.callFunctionOn —
+    values travel as CallArguments, never interpolated into JS source.'''
+
+    ANCHOR = {'result': {'type': 'object', 'className': 'Window',
+                         'objectId': 'G-1'}}
+
+    async def test_args_route_through_call_function_on(self):
+        self.fake.evaluate_results.append(self.ANCHOR)
+        self.fake.call_results.append({'result': {'type': 'number', 'value': 5}})
+        assert await self.page.evaluate('(a, b) => a + b', 2, 3) == 5
+        params = self.sent('Runtime.callFunctionOn')[0]['params']
+        assert '(a, b) => a + b' in params['functionDeclaration']
+        assert params['arguments'] == [{'value': 2}, {'value': 3}]
+        assert params['objectId'] == 'G-1'
+        # the globalThis anchor is per-call and released afterwards
+        assert self.sent('Runtime.evaluate')[-1]['params']['expression'] == 'globalThis'
+        assert self.sent('Runtime.releaseObject')[0]['params']['objectId'] == 'G-1'
+
+    async def test_element_arg_becomes_a_handle(self):
+        from purecdp.testing.element import Element
+        self.fake.evaluate_results.append(self.ANCHOR)
+        self.fake.call_results.append({'result': {'type': 'string', 'value': 'A'}})
+        el = Element(self.page, 'OBJ-9')
+        assert await self.page.evaluate('(el) => el.tagName', el) == 'A'
+        params = self.sent('Runtime.callFunctionOn')[0]['params']
+        assert params['arguments'] == [{'objectId': 'OBJ-9'}]
+
+    async def test_non_serializable_arg_raises_typeerror(self):
+        try:
+            await self.page.evaluate('(x) => x', object())
+        except TypeError as exc:
+            assert 'argument 0' in str(exc)
+        else:
+            raise AssertionError('expected TypeError')
+
+    async def test_not_a_function_gets_a_hint(self):
+        self.fake.evaluate_results.append(self.ANCHOR)
+        self.fake.call_results.append({
+            'result': {'type': 'object'},
+            'exceptionDetails': {
+                'exceptionId': 1, 'text': 'Uncaught', 'lineNumber': 1,
+                'columnNumber': 1, 'exception': {
+                    'type': 'object', 'subtype': 'error',
+                    'description': 'TypeError: 2+3 is not a function'}}})
+        try:
+            await self.page.evaluate('2+3', 1)
+        except JSError as exc:
+            assert any('function declaration' in n
+                       for n in getattr(exc, '__notes__', []))
+        else:
+            raise AssertionError('expected JSError')
 
 
 class CaptureTests(PageTestBase):
@@ -251,24 +378,6 @@ class ErrorHierarchyTests(unittest.TestCase):
             assert issubclass(exc, PureCDPError), exc.__name__
         # ExpectationError still registers as a unittest FAILURE, not an error
         assert issubclass(ExpectationError, AssertionError)
-
-    async def test_broken_handler_continues_and_warns(self):
-        async def handler(request):
-            raise RuntimeError('oops')
-
-        await self.page.route('*', handler)
-        # patch warnings.warn at the call site (context/thread independent) rather than 
-        # catch_warnings, which can miss it on the free-threaded build.
-        
-        with mock.patch('warnings.warn') as warn:
-            self.transport.push(self.paused_event('R5', 'https://x/thing'))
-            await drain()
-        assert any('route handler failed' in str(c.args[0]) for c in warn.call_args_list if c.args)
-        assert self.sent('Fetch.continueRequest')[0]['params']['requestId'] == 'R5'
-
-
-if __name__ == '__main__':
-    unittest.main()
 
 
 OBJ = {'result': {'type': 'object', 'subtype': 'node', 'objectId': 'OBJ-1'}}
@@ -428,53 +537,6 @@ class InitScriptAndRecorderTests(PageTestBase):
         assert len(recorder.exchanges) == 1  # the excluded one never recorded
         assert recorder.requests == [{'ask': 1}]
         assert recorder.responses == [{'answer': 42}]
-
-    def _push_exchange(self, request_id: str, url: str, body: str, *,
-                       method: str = 'GET', status: int = 200,
-                       bodyless: bool = False, failed: str | None = None
-                       ) -> None:
-        '''Push a full request/response/finished series through the fake.
-        ``bodyless`` makes getResponseBody error like Chrome does for a 204/
-        preflight; ``failed`` pushes loadingFailed instead of finished.'''
-        sid = self.page.session.session_id
-        if bodyless:
-            self.fake.no_body.add(request_id)
-        else:
-            self.fake.response_bodies[request_id] = {
-                'body': body, 'base64Encoded': False}
-        self.transport.push({
-            'method': 'Network.requestWillBeSent', 'sessionId': sid,
-            'params': {'requestId': request_id, 'loaderId': 'L1',
-                       'documentURL': 'https://x/', 'timestamp': 1.0,
-                       'wallTime': 1.0, 'initiator': {'type': 'other'},
-                       'redirectHasExtraInfo': False,
-                       'request': {'url': url, 'method': method, 'headers': {},
-                                   'initialPriority': 'High',
-                                   'referrerPolicy': 'no-referrer'}}})
-        if failed is not None:
-            self.transport.push({
-                'method': 'Network.loadingFailed', 'sessionId': sid,
-                'params': {'requestId': request_id, 'timestamp': 3.0,
-                           'type': 'XHR', 'errorText': failed,
-                           'canceled': False}})
-            return
-        self.transport.push({
-            'method': 'Network.responseReceived', 'sessionId': sid,
-            'params': {'requestId': request_id, 'loaderId': 'L1',
-                       'timestamp': 2.0, 'type': 'XHR', 'frameId': 'F-1',
-                       'hasExtraInfo': False,
-                       'response': {'url': url, 'status': status,
-                                    'statusText': 'OK', 'headers': {},
-                                    'mimeType': 'application/json',
-                                    'charset': 'utf-8',
-                                    'connectionReused': False,
-                                    'connectionId': 1,
-                                    'encodedDataLength': 14,
-                                    'securityState': 'secure'}}})
-        self.transport.push({
-            'method': 'Network.loadingFinished', 'sessionId': sid,
-            'params': {'requestId': request_id, 'timestamp': 3.0,
-                       'encodedDataLength': 14}})
 
     async def test_bodyless_success_is_not_a_body_error(self):
         # the pybiss libel: a 204 preflight has no body, so getResponseBody
@@ -641,6 +703,97 @@ class InitScriptAndRecorderTests(PageTestBase):
         else:
             raise AssertionError('expected TimeoutError from the explicit timeout')
 
+    async def test_await_record_returns_the_recorder(self):
+        # everything else on Page is awaited; the first call to record()
+        # always gets awaited too — tolerate it instead of TypeError-ing
+        recorder = self.page.record(needle='/q')
+        assert (await recorder) is recorder
+
+
+class PrivateRecordingTests(PageTestBase):
+    '''record(bodies=False) / redact= — bodies withheld AT CAPTURE (the
+    secret never enters the process), metadata and sizes intact.'''
+
+    async def test_bodies_false_is_metadata_only(self):
+        recorder = self.page.record(needle='/query', bodies=False)
+        self._push_exchange('R1', 'https://x/query', '{"answer": 42}',
+                            method='POST', post='{"ask": 1}',
+                            headers={'Cookie': 'sid=abc'})
+        exchange = await recorder.wait_for_next(0, timeout=2)
+        assert exchange.redacted is True
+        assert exchange.body is None and exchange.request_body is None
+        assert exchange.body_error is None       # a choice, not a failure
+        assert exchange.status == 200 and exchange.mime == 'application/json'
+        assert exchange.request_body_size == len('{"ask": 1}')
+        assert exchange.body_size == 14          # LoadingFinished wire length
+        # metadata mode: no body fetch at all, headers left intact
+        assert not self.sent('Network.getResponseBody')
+        assert exchange.request_headers['Cookie'] == 'sid=abc'
+
+    async def test_redacted_json_raises_clearly(self):
+        recorder = self.page.record(needle='/query', bodies=False)
+        self._push_exchange('R1', 'https://x/query', '{}', post='{"n": 1}')
+        exchange = await recorder.wait_for_next(0, timeout=2)
+        for prop in ('json', 'text', 'request_json'):
+            try:
+                getattr(exchange, prop)
+            except ValueError as exc:
+                assert 'redacted' in str(exc)
+            else:
+                raise AssertionError(f'expected ValueError from .{prop}')
+
+    async def test_redact_masks_credential_headers(self):
+        recorder = self.page.record(
+            redact=lambda url: '/pay' in url)
+        self._push_exchange(
+            'R1', 'https://x/pay', '{"ok": true}', method='POST',
+            post='{"pan": "4111111111111111"}',
+            headers={'Authorization': 'Bearer tok', 'X-Trace': 'keep-me'})
+        self._push_exchange('R2', 'https://x/other', '{"fine": 1}')
+        pay = await recorder.wait_for_next(0, timeout=2)
+        other = await recorder.wait_for_next(1, timeout=2)
+        assert pay.redacted and pay.request_body is None
+        assert pay.request_headers['Authorization'] == '<redacted>'
+        assert pay.request_headers['X-Trace'] == 'keep-me'   # only credentials
+        # Set-Cookie arrives late via ExtraInfo — masked on arrival too
+        self.transport.push({
+            'method': 'Network.responseReceivedExtraInfo',
+            'sessionId': self.page.session.session_id,
+            'params': {'requestId': 'R1',
+                       'headers': {'Set-Cookie': 'sid=s3cret'},
+                       'blockedCookies': [], 'resourceIPAddressSpace': 'Local',
+                       'statusCode': 200}})
+        await drain()
+        assert pay.response_headers['Set-Cookie'] == '<redacted>'
+        # the non-matching exchange is untouched
+        assert not other.redacted
+        assert other.json == {'fine': 1}
+
+    async def test_json_filter_skips_redacted(self):
+        recorder = self.page.record(redact=lambda url: '/pay' in url)
+        turn = recorder.expect(json=True, timeout=2)
+        self._push_exchange('R1', 'https://x/pay', '{"secret": 1}')
+        self._push_exchange('R2', 'https://x/ok', '{"answer": 42}')
+        exchange = await turn.value
+        assert exchange.url == 'https://x/ok'
+        assert [e.url for e in turn.skipped] == ['https://x/pay']
+
+    async def test_har_export_respects_redaction(self):
+        from purecdp.testing.recorder import Exchange, to_har
+        redacted = Exchange(
+            url='https://x/pay', method='POST', status=200,
+            mime='application/json', redacted=True,
+            request_body_size=9, body_size=14, timestamp=1.0)
+        plain = Exchange(url='https://x/ok', method='GET', status=200,
+                         mime='text/plain', body=b'hi', timestamp=1.0)
+        entries = to_har([redacted, plain])['log']['entries']
+        assert entries[0]['response']['content'] == {
+            'size': 14, 'mimeType': 'application/json',
+            'comment': 'body redacted'}
+        assert entries[0]['request']['bodySize'] == 9
+        assert 'postData' not in entries[0]['request']
+        assert entries[1]['response']['content']['text'] == 'hi'
+
 
 class ConvenienceTests(PageTestBase):
     def paused_event(self, request_id, url):
@@ -660,6 +813,22 @@ class ConvenienceTests(PageTestBase):
                    self.sent('Page.addScriptToEvaluateOnNewDocument')]
         assert 'sessionStorage.setItem("oidc.user", "{\\"tok\\": 1}");' in sources[0]
         assert 'localStorage.setItem("theme", "dark");' in sources[1]
+
+    async def test_broken_handler_continues_and_warns(self):
+        # was stranded in a sync TestCase (never awaited = never ran); lives
+        # here now, next to paused_event
+        async def handler(request):
+            raise RuntimeError('oops')
+
+        await self.page.route('*', handler)
+        # patch warnings.warn at the call site (context/thread independent)
+        # rather than catch_warnings, which can miss it on free-threaded builds
+        with mock.patch('warnings.warn') as warn:
+            self.transport.push(self.paused_event('R5', 'https://x/thing'))
+            await drain()
+        assert any('route handler failed' in str(c.args[0])
+                   for c in warn.call_args_list if c.args)
+        assert self.sent('Fetch.continueRequest')[0]['params']['requestId'] == 'R5'
 
     async def test_mock_api_exact_prefix_callable_and_passthrough(self):
         await self.page.mock_api({
@@ -1090,3 +1259,7 @@ class HumanBehaviorWireTests(PageTestBase):
         assert len(wheels) == 6
         total = sum(w['params']['deltaY'] for w in wheels)
         assert abs(total - 300) < 1e-6           # steps sum to the requested delta
+
+
+if __name__ == '__main__':
+    unittest.main()

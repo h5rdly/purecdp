@@ -96,6 +96,61 @@ class JSError(PureCDPError):
         return cls(message, details)
 
 
+async def _call_function(
+    session: Session,
+    function: str,
+    args: tuple,
+    *,
+    await_promise: bool = True,
+    return_by_value: bool = True,
+    user_gesture: bool = False,
+) -> typing.Any:
+    '''``function(*args)`` in the page via Runtime.callFunctionOn — how
+    evaluate() passes values without interpolating them into JS source.
+    Anchored on a per-call ``globalThis`` handle: a cached one dies with
+    every navigation, and evaluate is nowhere near a hot path. Element args
+    become live handles (legal: element handles and the anchor are both
+    main-world); everything else must be JSON-serializable.'''
+    call_args = []
+    for index, arg in enumerate(args):
+        if isinstance(arg, Element):
+            call_args.append(runtime_proto.CallArgument(
+                object_id=runtime_proto.RemoteObjectId(arg._object_id)))
+            continue
+        try:
+            json.dumps(arg)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f'evaluate() argument {index} is neither JSON-serializable '
+                f'nor an Element: {arg!r}') from exc
+        call_args.append(runtime_proto.CallArgument(value=arg))
+    anchor, _ = await session.execute(runtime_proto.evaluate(
+        expression='globalThis', return_by_value=False))
+    if anchor.object_id is None:  # can't realistically happen; fail loudly
+        raise JSError('could not resolve globalThis to anchor callFunctionOn')
+    try:
+        result, details = await session.execute(runtime_proto.call_function_on(
+            function_declaration=(
+                f'function(...args) {{ return ({function})(...args); }}'),
+            object_id=anchor.object_id,
+            arguments=call_args,
+            return_by_value=return_by_value,
+            await_promise=await_promise,
+            user_gesture=True if user_gesture else None,
+        ))
+    finally:
+        with suppress(Exception):
+            await session.execute(
+                runtime_proto.release_object(anchor.object_id))
+    if details is not None:
+        error = JSError.from_details(details)
+        if 'is not a function' in str(error):
+            error.add_note('with arguments, evaluate() takes a function '
+                           "declaration like '(a, b) => ...' as its expression")
+        raise error
+    return result.value if return_by_value else result
+
+
 @dataclass
 class ConsoleMessage:
     kind: str  # log, warning, error, ...
@@ -284,29 +339,41 @@ class Page(ElementQueries, LiveFactories):
         self, url: str, *, wait: str = 'load', timeout: float | None = None
     ) -> None:
         '''Navigate and wait: 'load' (Page.loadEventFired), 'idle' (load +
-        network quiet), or 'none' (return as soon as navigation starts).'''
+        network quiet), or 'none' (return as soon as navigation starts).
+
+        'idle' is for apps you control: a third-party-heavy public page
+        (ads, analytics, long-polls) may NEVER go network-quiet — use 'load'
+        there.'''
         if wait not in ('load', 'idle', 'none'):
             raise ValueError(f'wait must be load/idle/none, not {wait!r}')
-        async with asyncio.timeout(timeout or self.default_timeout):
-            waiter = None
-            if wait != 'none':
-                waiter = asyncio.create_task(
-                    self.session.wait_for(page_proto.LoadEventFired))
-                await asyncio.sleep(0)
-            try:
-                result = await self.session.execute(page_proto.navigate(url=url))
-                error_text = result[2]
-                if error_text:
-                    raise NavigateError(
-                        f'navigation to {url!r} failed: {error_text}')
-                if waiter is not None:
-                    await waiter
-                    waiter = None
-            finally:
-                if waiter is not None:
-                    waiter.cancel()
-            if wait == 'idle':
-                await self.wait_for_network_idle()
+        to = timeout or self.default_timeout
+        try:
+            async with asyncio.timeout(to):
+                waiter = None
+                if wait != 'none':
+                    waiter = asyncio.create_task(
+                        self.session.wait_for(page_proto.LoadEventFired))
+                    await asyncio.sleep(0)
+                try:
+                    result = await self.session.execute(page_proto.navigate(url=url))
+                    error_text = result[2]
+                    if error_text:
+                        raise NavigateError(
+                            f'navigation to {url!r} failed: {error_text}')
+                    if waiter is not None:
+                        await waiter
+                        waiter = None
+                finally:
+                    if waiter is not None:
+                        waiter.cancel()
+                if wait == 'idle':
+                    await self.wait_for_network_idle()
+        except TimeoutError:
+            hint = (" — 'idle' may never arrive on third-party-heavy pages; "
+                    "try wait='load'") if wait == 'idle' else ''
+            raise TimeoutError(
+                f'goto({url!r}) timed out after {to}s waiting for '
+                f'{wait!r}{hint}') from None
 
     async def wait_for_network_idle(
         self, *, idle_time: float = 0.5, timeout: float | None = None
@@ -387,15 +454,28 @@ class Page(ElementQueries, LiveFactories):
     async def evaluate(
         self,
         expression: str,
-        *,
+        *args: typing.Any,
         await_promise: bool = True,
         return_by_value: bool = True,
         user_gesture: bool = False,
         timeout: float | None = None,
     ) -> typing.Any:
         '''Evaluate JS and return its value; raises JSError on exceptions
-        (including rejected promises, which are awaited by default).'''
+        (including rejected promises, which are awaited by default).
+
+        With positional ``*args``, ``expression`` must be a FUNCTION
+        DECLARATION (``'(a, b) => a + b'``) and is called with the args via
+        Runtime.callFunctionOn — the injection-safe way to pass values in
+        (never interpolate them into the JS source). Args must be
+        JSON-serializable, or ``Element`` handles (which arrive as live DOM
+        nodes).'''
         async with asyncio.timeout(timeout or self.default_timeout):
+            if args:
+                return await _call_function(
+                    self.session, expression, args,
+                    await_promise=await_promise,
+                    return_by_value=return_by_value,
+                    user_gesture=user_gesture)
             result, details = await self.session.execute(runtime_proto.evaluate(
                 expression=expression,
                 return_by_value=return_by_value,
@@ -661,6 +741,8 @@ class Page(ElementQueries, LiveFactories):
         predicate: typing.Callable[[str], bool] | None = None,
         record_preflights: bool = False,
         default_timeout: float | None = None,
+        bodies: bool = True,
+        redact: typing.Callable[[str], bool] | None = None,
     ) -> NetworkRecorder:
         '''Start recording matching HTTP exchanges (see NetworkRecorder).
         Subscribe before triggering; cleaned up with the page.
@@ -670,11 +752,18 @@ class Page(ElementQueries, LiveFactories):
         nothing to do with the page's DOM default, so declare it once where
         the endpoint is named (an LLM route might need 120, a preview
         sub-second) instead of remembering ``timeout=`` at every call site.
-        Falls back to the page default when not set.'''
+        Falls back to the page default when not set.
+
+        ``bodies=False`` records metadata only; ``redact=`` makes matching
+        exchanges fully private (no bodies, credential headers masked) — the
+        secrets are withheld at capture and never enter the process. Keeps
+        traffic visibility on e.g. a card-entry flow without the PAN ever
+        landing in an artifact.'''
         recorder = NetworkRecorder(self, needle=needle, exclude=exclude,
                                    predicate=predicate,
                                    record_preflights=record_preflights,
-                                   default_timeout=default_timeout)
+                                   default_timeout=default_timeout,
+                                   bodies=bodies, redact=redact)
         stream = self.session.listen(
             network_proto.RequestWillBeSent,
             network_proto.ResponseReceived,

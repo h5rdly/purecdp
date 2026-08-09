@@ -66,15 +66,23 @@ class Frame(ElementQueries, LiveFactories):
     async def evaluate(
         self,
         expression: str,
-        *,
+        *args: typing.Any,
         await_promise: bool = True,
         return_by_value: bool = True,
         user_gesture: bool = False,
         timeout: float | None = None,
     ) -> typing.Any:
-        '''Evaluate JS in the frame's context; raises JSError on exceptions.'''
-        from .page import JSError  # local: page imports this module lazily
+        '''Evaluate JS in the frame's context; raises JSError on exceptions.
+        With positional ``*args`` the expression must be a function
+        declaration, called injection-safely — see :meth:`Page.evaluate`.'''
+        from .page import JSError, _call_function  # local: page imports this module lazily
         async with asyncio.timeout(timeout or self.default_timeout):
+            if args:
+                return await _call_function(
+                    self.session, expression, args,
+                    await_promise=await_promise,
+                    return_by_value=return_by_value,
+                    user_gesture=user_gesture)
             result, details = await self.session.execute(runtime_proto.evaluate(
                 expression=expression,
                 return_by_value=return_by_value,

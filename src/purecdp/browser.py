@@ -177,6 +177,16 @@ class Browser:
     async def close_page(self, session) -> None:
         await close_page(self.connection, session)
 
+    async def close_target(self, target_id: str) -> bool:
+        '''Close any target by id — including one this client never attached
+        to, e.g. an id from ``discovery.list_targets()`` on a ``connect()``-ed
+        browser. Rounds out the lifecycle without hand-rolled ``/json/close``
+        HTTP calls. Returns CDP's success flag.'''
+        from .protocol import target as _target
+
+        return await self.connection.execute(
+            _target.close_target(_target.TargetID(target_id)))
+
     async def __aenter__(self) -> Browser:
         return self
 

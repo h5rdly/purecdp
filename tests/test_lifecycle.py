@@ -96,6 +96,21 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             await drain()
             assert session.closed
 
+    async def test_browser_close_target_by_id(self):
+        # Browser.close_target closes by bare id — no Session object needed,
+        # the connect()-to-a-running-browser flow where the id came from
+        # discovery.list_targets()
+        from purecdp.browser import Browser
+        fake, transport, conn = self.make()
+        async with conn:
+            session = await purecdp.new_session(conn, 'about:blank')
+            browser = Browser(None, conn, '', False)
+            ok = await browser.close_target(session.target_id)
+            await drain()
+            assert ok is True
+            assert 'T-1' not in fake.targets
+            assert session.closed
+
     async def test_close_page_ends_session_keeps_connection(self):
         fake, transport, conn = self.make()
         async with conn:

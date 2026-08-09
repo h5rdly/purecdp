@@ -45,7 +45,37 @@ asyncio.run(main())
 
 `page.evaluate` awaits promises by default and raises `JSError` on an exception
 or rejection. `wait=` is `"load"` (default), `"idle"` (load + network quiet), or
-`"none"` (return as soon as navigation starts).
+`"none"` (return as soon as navigation starts). Prefer `"load"` on public
+pages: `"idle"` is for apps you control — a third-party-heavy page (ads,
+analytics, long-polls) may never go network-quiet, and the timeout will tell
+you so.
+
+### Passing values into `evaluate` — as arguments, never by interpolation
+
+With positional args the expression is a **function declaration**, called with
+your values via `Runtime.callFunctionOn` — they travel as protocol arguments,
+so no quoting, no `%`-escaping nested braces, no injection risk:
+
+```python
+await page.evaluate("(a, b) => a + b", 2, 3)                       # -> 5
+await page.evaluate("(sel) => !!document.querySelector(sel)", selector)
+await page.evaluate("(o) => o.items.length", {"items": [1, 2, 3]}) # dicts/lists fine
+
+el = await page.query("#row")
+await page.evaluate("(el, cls) => el.classList.add(cls)", el, "active")
+```
+
+Args must be JSON-serializable — or `Element` handles, which arrive as live
+DOM nodes (last line; `el.eval("(el, ...) => ...", ...)` is the same thing
+scoped to the element). The old way still works but don't reach for it:
+
+```python
+# the anti-pattern: interpolating values into JS source. One quote in
+# `needle` and this breaks — or worse, executes it.
+await page.evaluate(f"document.title.includes({json.dumps(needle)})")
+# instead:
+await page.evaluate("(n) => document.title.includes(n)", needle)
+```
 
 Every exception purecdp raises — `JSError`, `NavigateError`, `DownloadError`,
 `ExpectationError`, `ActionabilityError`, `CDPCommandError`,
@@ -344,7 +374,10 @@ await self.page.route(lambda u: u.endswith("/track") and "beacon" not in u, hand
 ### Assert on the traffic itself
 
 `page.record()` captures full exchanges (request body, status, response body)
-for URLs matching a filter — "assert on the traffic, not the DOM".
+for URLs matching a filter — "assert on the traffic, not the DOM". (It's
+synchronous — the recorder starts listening immediately — but `await
+page.record()` also works and is a no-op, because on an all-async `Page`
+everyone types it eventually.)
 
 ```python
 rec = self.page.record(needle="/api/track")
@@ -353,6 +386,17 @@ await self.page.click("#buy")
 ex = await turn.value                        # blocks until the next match lands
 assert ex.request_json["event"] == "purchase"
 assert ex.status == 200
+```
+
+An `Exchange` is **flat** — no `ex.request.method` nesting to guess at:
+
+```python
+ex.url, ex.method, ex.status, ex.mime          # the one-line summary
+ex.request_body, ex.body                       # raw: str | None, bytes | None
+ex.request_json, ex.json, ex.text              # parsed conveniences
+ex.request_headers, ex.response_headers        # wire-truth dicts (see below)
+ex.failed, ex.body_error, ex.redacted          # what went wrong / was withheld
+ex.timestamp, ex.duration                      # epoch seconds; total seconds
 ```
 
 `expect(json=True)` resolves to the first new exchange whose body parses as
@@ -391,6 +435,32 @@ but couldn't be retrieved:
 assert not ex.failed                 # the request itself succeeded
 assert ex.status == 204              # a preflight — bodyless, and that's fine
 ```
+
+### Private recording — visibility without the secrets
+
+Recording a card-entry or login flow shouldn't mean the PAN or password lands
+in memory, an artifacts dump, or a HAR. Two levers, both applied **at
+capture** — the secret never enters the process:
+
+```python
+rec = self.page.record(bodies=False)         # metadata-only, recorder-wide:
+                                             # URL/method/status/headers/timing/
+                                             # sizes — no bodies, either side
+
+rec = self.page.record(                      # full privacy for matching URLs:
+    redact=lambda url: "/payment" in url)    # no bodies AND credential headers
+                                             # (Authorization, Cookie, Set-Cookie)
+                                             # masked to "<redacted>"
+```
+
+A withheld exchange has `ex.redacted == True`, `body_error` stays `None` (a
+choice, not a failure), and the byte counts survive — `ex.request_body_size`
+and `ex.body_size` (the response's total wire length). Reading `.json`/`.text`
+on one raises with a message that says *redacted*, `expect(json=True)` counts
+it as skipped, and `rec.har()` exports sizes plus a `"body redacted"` comment
+— never the bytes. Other exchanges on the same recorder are untouched, so you
+keep watching the traffic *around* the sensitive step instead of turning the
+recorder off.
 
 For a streamed (`text/event-stream`) response, `parse_sse` turns the captured
 body into events (any per-frame encoding — base64, JSON — is yours to decode):
@@ -610,26 +680,38 @@ extra cost.
 
 ---
 
-## 7. Connecting to a browser you didn't launch
+## 7. Attaching to a browser you didn't launch
 
-`connect()` attaches over CDP to an already-running browser — Chrome-in-Docker,
-a browserless / cloud session, or a local `chromium --remote-debugging-port=9222`.
-Unlike `launch`, it neither starts nor owns the browser: `aclose()` just detaches
-and leaves it running.
+`connect()` attaches over CDP to an already-running browser. The headline use
+is a **privacy/authorization boundary**: a human logs in — password, MFA,
+consent — in their own browser window, and the agent *attaches afterwards*.
+The credentials never touch the automation; the agent inherits the
+authenticated session and nothing else. Unlike `launch`, `connect()` neither
+starts nor owns the browser: `aclose()` just detaches and leaves it running.
 
 ```python
 import purecdp
 from purecdp.testing import Page
 
-# discover the endpoint via /json/version on host/port …
+# the human ran:  brave --remote-debugging-port=9222   and logged in
 async with await purecdp.connect(host="127.0.0.1", port=9222) as browser:
-    session = await browser.new_session()
-    page = await Page.create(session)
-    await page.goto("https://example.com")
+    session = await browser.new_session()     # NEW tab, but the SAME profile:
+    page = await Page.create(session)         # cookies/session already there
+    await page.goto("https://portal.example/dashboard")   # in, no login flow
 
-# … or pass a browser-level ws:// endpoint straight through:
+# … or pass a browser-level ws:// endpoint straight through
+# (Chrome-in-Docker, a browserless/cloud session):
 browser = await purecdp.connect("ws://127.0.0.1:9222/devtools/browser/abc123")
 ```
+
+`new_session()` beats hunting for "the tab the user logged in on" by URL —
+a fresh tab in the same profile shares its cookies, and no other script is
+fighting you for it. To work with what's already open,
+`purecdp.discovery.list_targets(port=9222)` lists every target as a raw dict
+(`id`, `type`, `url`, `title`, `webSocketDebuggerUrl`); feed an `id` to
+`connection.attach()` — and when you're done with a tab,
+`browser.close_target(id)` closes it (works for targets you never attached
+to; no hand-rolled `/json/close` HTTP calls).
 
 ---
 

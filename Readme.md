@@ -35,8 +35,11 @@ async def main():
 asyncio.run(main())
 ```
 
-`purecdp.launch(pipe=True)` uses `--remote-debugging-pipe` instead of a websocket;
-`purecdp.discovery.get_version(port=9222)` reaches a browser someone else started.
+`purecdp.launch(pipe=True)` uses `--remote-debugging-pipe` instead of a websocket.
+`purecdp.connect(port=9222)` attaches to a browser someone else started — notably
+a browser a *human* just logged into (password, MFA), so an agent can inherit the
+authenticated session while the credentials never touch the automation; a
+`new_session()` tab shares the profile's cookies, so it's signed in from birth.
 `browser.new_context()` gives an isolated cookies/storage context (cheap per-test
 isolation); `connection.set_auto_attach()` auto-attaches popups/workers/OOPIFs,
 resuming paused targets automatically.
@@ -61,7 +64,9 @@ class MyAppTests(CDPTestCase):
 ```
 
 `Page` gives you `goto` (load/idle waits), `evaluate` (promises awaited,
-`JSError` raised), `wait_for_selector`/`wait_for_function`, `click`,
+`JSError` raised; values pass as *arguments* —
+`evaluate("(a, b) => a + b", x, y)` — never interpolated into JS source),
+`wait_for_selector`/`wait_for_function`, `click`,
 `query`/`query_all` (held elements, text-filtered, stale-copy-proof),
 `screenshot`, always-on `page.console` / `page.js_errors` capture, and
 `page.route()` request stubbing/rewriting/aborting. For traffic-level
@@ -71,7 +76,10 @@ assertions there's `page.record()` (full request/response exchanges — the
 download's bytes without touching disk); arm `recorder.expect()` before a
 click and `await .value` for the response it triggers (`json=True` skips
 interleaved non-JSON bodies), and `recorder.save_har()` writes the whole
-capture as a HAR any devtools opens. And when a test fails, its pages
+capture as a HAR any devtools opens. Sensitive flows keep their privacy:
+`record(bodies=False)` captures metadata only, and `record(redact=...)` makes
+matching exchanges fully private (no bodies, credential headers masked) — the
+secret never enters the process. And when a test fails, its pages
 are dumped as diagnostic artifacts — screenshot, HTML, console, recorded
 traffic, traceback — under `purecdp-artifacts/<test id>/` before the browser
 closes; green tests write nothing.

@@ -46,5 +46,11 @@ async def get_version(
 async def list_targets(
     host: str = '127.0.0.1', port: int = 9222, *, timeout: float = 10.0
 ) -> list[dict]:
-    '''Fetch ``/json/list``: one dict per open target (pages, workers...).'''
+    '''Fetch ``/json/list``: one dict per open target (pages, workers...).
+
+    Returned dicts are the browser's own JSON, verbatim (raw at this boundary
+    by design — same ethos as the recorder's wire-truth headers). The keys
+    you'll reach for: ``id`` (feed to ``Connection.attach()`` or
+    ``Browser.close_target()``), ``type`` (``'page'``, ``'iframe'``,
+    ``'service_worker'``...), ``url``, ``title``, ``webSocketDebuggerUrl``.'''
     return await asyncio.to_thread(_fetch, host, port, '/json/list', timeout)

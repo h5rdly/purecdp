@@ -18,7 +18,8 @@ stdio. It drives one browser page and offers these tools an LLM host can call:
 - ``record`` (needle?) — narrow capture going forward (on broad by default)
 - ``wait`` (for, selector?/text?) — poll until visible/hidden/count/text holds
 - ``seed_storage`` (kind, key, value) — plant session/localStorage before nav
-- ``evaluate`` (expression) — evaluate JS, return the JSON result
+- ``evaluate`` (expression, args?) — evaluate JS, return the JSON result; with
+  ``args`` the expression is a function declaration called with them
   (**off by default** — arbitrary page JS; enable with ``--allow-eval``)
 
 The network tools make "assert on the wire, not the DOM" reachable natively:
@@ -300,10 +301,21 @@ TOOLS: list[dict] = [
     {
         'name': 'evaluate',
         'description': 'Evaluate a JavaScript expression in the page and return '
-                       'its JSON value (for reading state the snapshot omits).',
+                       'its JSON value (for reading state the snapshot omits). '
+                       'To pass values, give "args" and make the expression a '
+                       'function declaration like "(a, b) => ..." — never '
+                       'interpolate values into the JS source.',
         'inputSchema': {
             'type': 'object',
-            'properties': {'expression': {'type': 'string'}},
+            'properties': {
+                'expression': {'type': 'string'},
+                'args': {
+                    'type': 'array',
+                    'description': 'JSON values passed as the function\'s '
+                                   'arguments (expression must then be a '
+                                   'function declaration)',
+                },
+            },
             'required': ['expression'],
         },
     },
@@ -500,7 +512,8 @@ class MCPServer:
                 raise ValueError(
                     "the 'evaluate' tool is disabled; start the server with "
                     '--allow-eval to enable arbitrary page JavaScript')
-            return json.dumps(await page.evaluate(args['expression']))
+            return json.dumps(await page.evaluate(
+                args['expression'], *args.get('args', [])))
         raise ValueError(f'unknown tool {name!r}')
 
     async def _add_mock(self, page: Page, args: dict) -> None:

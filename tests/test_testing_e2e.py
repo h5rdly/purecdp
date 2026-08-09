@@ -47,6 +47,25 @@ class PageE2ETests(CDPTestCase):
         assert await self.page.evaluate('6 * 7') == 42
         assert await self.page.evaluate("Promise.resolve('later')") == 'later'
 
+    async def test_evaluate_with_args(self):
+        assert await self.page.evaluate('(a, b) => a + b', 2, 3) == 5
+        # async functions await like promise expressions do
+        assert await self.page.evaluate(
+            'async (x) => (await Promise.resolve(x)) * 2', 21) == 42
+        # the whole point: values round-trip verbatim, never interpolated —
+        # this payload is a syntax error / injection under string-formatting
+        hostile = '"; alert(1); //\\ ${`}`} \''
+        assert await self.page.evaluate('(s) => s', hostile) == hostile
+        assert await self.page.evaluate(
+            '(o) => o.items.length', {'items': [1, 2, 3]}) == 3
+
+    async def test_evaluate_element_arg(self):
+        await self.page.goto('data:text/html,<p id=one>alpha</p><p>beta</p>')
+        el = await self.page.query('#one')
+        got = await self.page.evaluate('(el, suffix) => el.textContent + suffix',
+                                       el, '!')
+        assert got == 'alpha!'
+
     async def test_evaluate_raises_jserror(self):
         try:
             await self.page.evaluate("(() => { throw new Error('kaboom') })()")
@@ -348,6 +367,78 @@ class DriveParityE2ETests(CDPTestCase):
             assert '<p>hdrs</p>' in entries[0]['response']['content']['text']
         finally:
             httpd.shutdown()
+
+    async def test_redacted_recording_never_captures_the_secret(self):
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html')
+                self.send_header('Set-Cookie', 'sid=supersecret; Path=/')
+                self.end_headers()
+                self.wfile.write(b'<p>pay</p>')
+
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length', 0))
+                self.rfile.read(length)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"charged": true}')
+
+            def log_message(self, *args):
+                pass
+
+        httpd = ThreadingHTTPServer(('127.0.0.1', 0), H)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            recorder = self.page.record(
+                needle='127.0.0.1', redact=lambda url: '/charge' in url)
+            await self.page.goto(f'http://127.0.0.1:{httpd.server_port}/')
+            page_load = await recorder.wait_for_next(0)
+            assert not page_load.redacted            # only /charge matches
+            assert b'<p>pay</p>' == page_load.body
+
+            await self.page.evaluate(
+                "(pan) => fetch('/charge', {method: 'POST', "
+                "headers: {'Content-Type': 'application/json'}, "
+                'body: JSON.stringify({pan})}).then(r => r.text())',
+                '4111111111111111')
+            # find by URL, not index — a favicon fetch may land in between
+            await eventually(lambda: any(
+                '/charge' in e.url for e in recorder.exchanges))
+            charge = next(e for e in recorder.exchanges if '/charge' in e.url)
+            assert charge.redacted
+            assert charge.request_body is None and charge.body is None
+            assert charge.status == 200              # metadata still there
+            assert charge.request_body_size and charge.request_body_size > 20
+            assert charge.body_size and charge.body_size > 0  # total wire bytes
+            # the session cookie rode the request — masked, not captured
+            await eventually(lambda: any(
+                k.lower() == 'cookie' for k in charge.request_headers))
+            cookie = charge.request_headers[next(
+                k for k in charge.request_headers if k.lower() == 'cookie')]
+            assert cookie == '<redacted>'
+            # nothing secret in the HAR either: the PAN is nowhere, and the
+            # charge entry has masked headers, no postData, no body text
+            import json as json_mod
+            har = recorder.har()
+            assert '4111111111111111' not in json_mod.dumps(har)
+            entry = next(e for e in har['log']['entries']
+                         if '/charge' in e['request']['url'])
+            assert 'postData' not in entry['request']
+            assert 'text' not in entry['response']['content']
+            assert entry['response']['content']['comment'] == 'body redacted'
+            assert all(h['value'] == '<redacted>'
+                       for h in entry['request']['headers']
+                       if h['name'].lower() == 'cookie')
+        finally:
+            httpd.shutdown()
+
+    async def test_close_target_by_id(self):
+        session = await self.browser.new_session(context=self.context)
+        target_id = session.target_id
+        assert await self.browser.close_target(target_id) is True
+        await eventually(lambda: session.closed)
 
     async def test_query_containing_accepts_regex(self):
         await self.page.goto(
