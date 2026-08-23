@@ -528,6 +528,10 @@ class DriveParityE2ETests(CDPTestCase):
         page = await self.browser.new_page(
             'data:text/html,<title>attach-me</title>', context=self.context)
         try:
+            # new_page() doesn't wait for the navigation — on a slow runner
+            # getTargets can still see about:blank and the title be empty.
+            # A parsed title means the document (and its URL) committed.
+            await page.wait_for_function('document.title === "attach-me"')
             again = await self.browser.attach(url_contains='attach-me')
             assert again.session.target_id == page.session.target_id
             assert await again.title() == 'attach-me'
