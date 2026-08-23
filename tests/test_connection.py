@@ -17,10 +17,13 @@ except ImportError:
     from support import FakeTransport, drain  # direct run
 
 from purecdp import (  # noqa: E402
+    CDPClosedError,
+    CDPCommandTimeout,
     CDPConnectionClosed,
     CDPError,
     CDPSessionClosed,
     Connection,
+    PureCDPError,
 )
 from purecdp._shared import UnknownEvent  # noqa: E402
 from purecdp.protocol import page, target  # noqa: E402
@@ -111,6 +114,48 @@ class ExecuteTests(unittest.IsolatedAsyncioTestCase):
             pass
         else:
             raise AssertionError('expected CDPConnectionClosed')
+
+    async def test_execute_timeout_names_the_method(self):
+        async with Connection(FakeTransport()) as conn:   # never responds
+            try:
+                await conn.execute(page.enable(), timeout=0.05)
+            except CDPCommandTimeout as exc:
+                assert 'Page.enable' in str(exc)
+                assert isinstance(exc, TimeoutError)   # generic handlers work
+                assert isinstance(exc, PureCDPError)   # family catch works
+            else:
+                raise AssertionError('expected CDPCommandTimeout')
+
+    async def test_default_command_timeout_bounds_every_command(self):
+        async with Connection(FakeTransport()) as conn:
+            conn.default_command_timeout = 0.05
+            try:
+                await conn.execute(page.enable())      # no per-call timeout
+            except CDPCommandTimeout:
+                pass
+            else:
+                raise AssertionError('expected CDPCommandTimeout')
+
+    async def test_response_within_timeout_returns_normally(self):
+        def responder(msg):
+            return [{'id': msg['id'], 'result': {}}]
+
+        async with Connection(FakeTransport(responder)) as conn:
+            assert await conn.execute(page.enable(), timeout=2) is None
+
+    async def test_late_response_after_timeout_is_discarded(self):
+        # the straggler must resolve through the engine and be dropped —
+        # not abort the read loop as an unknown command id
+        transport = FakeTransport()
+        async with Connection(transport) as conn:
+            try:
+                await conn.execute(page.enable(), timeout=0.05)
+            except CDPCommandTimeout:
+                pass
+            transport.push({'id': 1, 'result': {}})    # arrives too late
+            await drain()
+            assert conn._closed_reason is None         # reader survived
+            assert not conn._reader_task.done()
 
     async def test_transport_ending_fails_pending_command(self):
         transport = FakeTransport()
@@ -251,6 +296,12 @@ class SessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             assert not conn.closed
             session2 = await conn.attach('T1')
             assert session2 is not session
+
+    def test_closed_errors_share_a_giveup_base(self):
+        # a watcher loop separates give-up from retry with one name
+        assert issubclass(CDPSessionClosed, CDPClosedError)
+        assert issubclass(CDPConnectionClosed, CDPClosedError)
+        assert issubclass(CDPClosedError, PureCDPError)
 
 
 if __name__ == '__main__':

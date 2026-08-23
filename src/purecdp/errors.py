@@ -38,17 +38,54 @@ class CDPProtocolError(PureCDPError):
     event). Indicates a broken peer or transport; the connection aborts.'''
 
 
-class CDPConnectionClosed(PureCDPError):
+class CDPClosedError(PureCDPError):
+    '''The session or connection is gone for good — retrying cannot help.
+
+    Common base of :class:`CDPSessionClosed` and :class:`CDPConnectionClosed`,
+    so a watcher loop can separate give-up from retry with one name::
+
+        try:
+            ...poll...
+        except CDPClosedError:
+            break                  # tab/browser is gone
+        except PureCDPError:
+            continue               # transient — back off and retry
+    '''
+
+
+class CDPConnectionClosed(CDPClosedError):
     '''The connection is closed; pending and future operations fail with this.'''
 
 
-class CDPSessionClosed(PureCDPError):
+class CDPSessionClosed(CDPClosedError):
     '''The session detached (target closed/crashed) or its connection closed.'''
+
+
+class CDPCommandTimeout(TimeoutError, PureCDPError):
+    '''A CDP command did not return within the requested time.
+
+    Raised only when a bound was asked for — ``session.execute(cmd,
+    timeout=...)`` per call, or ``connection.default_command_timeout`` for
+    every command on the connection (None, the default, keeps commands
+    unbounded: some are legitimately open-ended, e.g. ``Runtime.evaluate``
+    awaiting a promise). The message names the CDP method that hung. A late
+    response arriving after the timeout is discarded, not misdelivered.
+    Both a ``TimeoutError`` (generic handlers keep working) and a
+    ``PureCDPError`` (the family catch is universal).
+    '''
 
 
 class CDPTransportError(PureCDPError):
     '''Transport-level failure: websocket handshake rejected, oversized or
     malformed frame, write on a closed transport, discovery endpoint error.'''
+
+
+class TargetNotFound(PureCDPError):
+    '''``browser.attach()`` could not pick a page target: nothing matched
+    (the message lists the page targets that DO exist), or ``url_contains``
+    matched several (the message lists their ids — pass ``target_id=`` to
+    pick one; guessing would mean driving the wrong tab of a browser a human
+    may be using).'''
 
 
 class BrowserLaunchError(PureCDPError):

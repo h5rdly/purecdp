@@ -11,6 +11,11 @@ str-or-bytes input, matching what the transports and engine expect.
 Only the hot paths (per-message dumps/loads) route through here. Code that
 builds JavaScript string literals keeps stdlib ``json`` on purpose: it wants
 ``str`` out and ASCII-escaped output for safe embedding.
+
+Named ``_fastjson``, not ``_json``: stdlib ``json/scanner.py`` does a
+top-level ``from _json import make_scanner``, and with the package directory
+on sys.path (cwd inside site-packages/purecdp) a file called ``_json.py``
+shadows CPython's C accelerator and breaks ``import json`` everywhere.
 '''
 
 from __future__ import annotations

@@ -14,8 +14,9 @@ import typing
 from contextlib import suppress
 from dataclasses import dataclass, field
 
-from .. import _json
+from .. import _fastjson
 from .. import _b64
+from ..errors import PureCDPError
 from ..protocol import network as network_proto
 
 if typing.TYPE_CHECKING:
@@ -78,16 +79,24 @@ class Exchange:
                              f'{self.method} {self.url}')
 
     @property
+    def response_body(self) -> bytes | None:
+        '''Alias for :attr:`body` — the symmetric name next to
+        ``request_body``. The type asymmetry is wire truth: CDP hands over the
+        request's postData as text but response bodies as (possibly
+        base64-decoded) bytes.'''
+        return self.body
+
+    @property
     def request_json(self) -> typing.Any:
         '''Request body parsed as JSON ({} when absent).'''
         self._guard_redacted('request')
-        return _json.loads(self.request_body) if self.request_body else {}
+        return _fastjson.loads(self.request_body) if self.request_body else {}
 
     @property
     def json(self) -> typing.Any:
         '''Response body parsed as JSON (None when absent).'''
         self._guard_redacted('response')
-        return _json.loads(self.body) if self.body else None
+        return _fastjson.loads(self.body) if self.body else None
 
     @property
     def text(self) -> str:
@@ -205,10 +214,21 @@ def _parses_as_json(exchange: Exchange) -> bool:
     if exchange.body is None:
         return False
     try:
-        _json.loads(exchange.body)
+        _fastjson.loads(exchange.body)
     except Exception:
         return False
     return True
+
+
+class ExpectTimeout(TimeoutError, PureCDPError):
+    '''No matching exchange within the timeout — and the message reports what
+    the recorder DID see, because a bare timeout while reverse-engineering
+    someone else's page means re-running with print statements. It names the
+    exchanges completed since arming but skipped by ``json=True``, the
+    requests still in flight (sent, no response — a hung endpoint looks
+    exactly like this), and how many requests never matched the recorder's
+    URL filter. Still a ``TimeoutError`` (existing handlers keep working) and
+    a ``PureCDPError`` (the family catch is universal).'''
 
 
 class _ExchangeExpectation:
@@ -394,18 +414,55 @@ class NetworkRecorder:
         as JSON, skipping those that don't (they stay in ``exchanges``).
         :meth:`expect` wraps this with the position captured for you. Timeout
         resolution: the ``timeout`` argument, else the recorder's
-        ``default_timeout``, else the page default.'''
+        ``default_timeout``, else the page default. On expiry raises
+        :class:`ExpectTimeout`, whose message says what the recorder DID see.'''
         index = previous_count
-        async with asyncio.timeout(timeout or self.default_timeout
-                                   or self._page.default_timeout):
-            while True:
-                while index < len(self.exchanges):
-                    exchange = self.exchanges[index]
-                    index += 1
-                    if not json or _parses_as_json(exchange):
-                        return exchange
-                self._appended.clear()
-                await self._appended.wait()
+        wait = (timeout or self.default_timeout or self._page.default_timeout)
+        try:
+            async with asyncio.timeout(wait):
+                while True:
+                    while index < len(self.exchanges):
+                        exchange = self.exchanges[index]
+                        index += 1
+                        if not json or _parses_as_json(exchange):
+                            return exchange
+                    self._appended.clear()
+                    await self._appended.wait()
+        except TimeoutError:
+            raise ExpectTimeout(
+                self._timeout_message(previous_count, json, wait)) from None
+
+    def _timeout_message(self, mark: int, json_only: bool, wait: float) -> str:
+        '''What the recorder saw while a wait came up empty — the near-miss
+        report that turns "timed out" into a diagnosis.'''
+        def urls(items: list) -> str:
+            shown = ', '.join(e.url[:80] for e in items[:4])
+            extra = len(items) - 4
+            return shown + (f' (+{extra} more)' if extra > 0 else '')
+
+        if self._predicate is not None:
+            wanted = ' matching the predicate'
+        elif self._needle:
+            wanted = f' matching {self._needle!r}'
+        else:
+            wanted = ''
+        what = 'no JSON-bodied exchange' if json_only else 'no exchange'
+        parts = [f'{what}{wanted} completed within {wait:g}s']
+        seen = self.exchanges[mark:]
+        if seen:
+            parts.append(f'{len(seen)} completed since arming but skipped '
+                         f'as non-JSON: {urls(seen)}')
+        in_flight = list(self._pending.values())
+        if in_flight:
+            parts.append(f'{len(in_flight)} still in flight (request sent, '
+                         f'no response): {urls(in_flight)}')
+        if self._unmatched:
+            parts.append(f"{len(self._unmatched)} requests never matched the "
+                         f"recorder's filter")
+        if not (seen or in_flight or self._unmatched):
+            parts.append('no traffic seen at all — armed after the trigger, '
+                         'or the filter matches nothing')
+        return '; '.join(parts)
 
     # -- pump (driven by page.record()) --------------------------------------
 

@@ -21,7 +21,9 @@ except ImportError:
 
 import purecdp  # noqa: E402
 from purecdp import Connection  # noqa: E402
-from purecdp.testing import JSError, NavigateError, Page  # noqa: E402
+from purecdp import PureCDPError, TargetNotFound  # noqa: E402
+from purecdp.testing import (  # noqa: E402
+    ExpectTimeout, JSError, NavigateError, Page)
 
 
 EXCEPTION_DETAILS = {
@@ -862,6 +864,66 @@ class InitScriptAndRecorderTests(PageTestBase):
         else:
             raise AssertionError('expected TimeoutError from the explicit timeout')
 
+    async def test_response_body_is_the_symmetric_alias(self):
+        recorder = self.page.record(needle='/query')
+        self._push_exchange('R1', 'https://x/query', '{"answer": 42}',
+                            method='POST', post='{"ask": 1}')
+        exchange = await recorder.wait_for_next(0, timeout=2)
+        assert exchange.response_body == exchange.body == b'{"answer": 42}'
+        assert isinstance(exchange.request_body, str)  # str/bytes = wire truth
+
+    async def test_expect_timeout_reports_skipped_non_json(self):
+        recorder = self.page.record(needle='/query')
+        self._push_exchange('R1', 'https://x/query', '<html>proxy err</html>')
+        try:
+            await recorder.expect(json=True, timeout=0.05).value
+        except ExpectTimeout as exc:
+            message = str(exc)
+            assert "no JSON-bodied exchange matching '/query'" in message
+            assert 'skipped as non-JSON' in message
+            assert 'https://x/query' in message
+            assert isinstance(exc, TimeoutError)   # existing handlers work
+            assert isinstance(exc, PureCDPError)   # family catch works
+        else:
+            raise AssertionError('expected ExpectTimeout')
+
+    async def test_expect_timeout_reports_in_flight_and_unmatched(self):
+        recorder = self.page.record(needle='/query')
+        sid = self.page.session.session_id
+
+        def req(request_id, url):
+            self.transport.push({
+                'method': 'Network.requestWillBeSent', 'sessionId': sid,
+                'params': {'requestId': request_id, 'loaderId': 'L1',
+                           'documentURL': 'https://x/', 'timestamp': 1.0,
+                           'wallTime': 1.0, 'initiator': {'type': 'other'},
+                           'redirectHasExtraInfo': False,
+                           'request': {'url': url, 'method': 'GET',
+                                       'headers': {},
+                                       'initialPriority': 'High',
+                                       'referrerPolicy': 'no-referrer'}}})
+
+        req('R1', 'https://x/query')   # matches, response never comes
+        req('R2', 'https://x/other')   # never matches the filter
+        try:
+            await recorder.wait_for_next(0, timeout=0.05)
+        except ExpectTimeout as exc:
+            message = str(exc)
+            assert '1 still in flight' in message
+            assert 'https://x/query' in message
+            assert "1 requests never matched the recorder's filter" in message
+        else:
+            raise AssertionError('expected ExpectTimeout')
+
+    async def test_expect_timeout_when_nothing_seen_says_so(self):
+        recorder = self.page.record(needle='/nothing')
+        try:
+            await recorder.wait_for_next(0, timeout=0.05)
+        except ExpectTimeout as exc:
+            assert 'no traffic seen at all' in str(exc)
+        else:
+            raise AssertionError('expected ExpectTimeout')
+
     async def test_await_record_returns_the_recorder(self):
         # everything else on Page is awaited; the first call to record()
         # always gets awaited too — tolerate it instead of TypeError-ing
@@ -1473,6 +1535,82 @@ class HumanBehaviorWireTests(PageTestBase):
         assert len(wheels) == 6
         total = sum(w['params']['deltaY'] for w in wheels)
         assert abs(total - 300) < 1e-6           # steps sum to the requested delta
+
+
+class AliveTests(PageTestBase):
+    async def test_alive_flips_when_the_target_detaches(self):
+        assert self.page.alive
+        self.transport.push({'method': 'Target.detachedFromTarget',
+                             'params': {'sessionId': self.page.session.session_id,
+                                        'targetId': self.page.session.target_id}})
+        await drain()
+        assert not self.page.alive
+
+    async def test_alive_flips_when_the_connection_dies(self):
+        assert self.page.alive
+        await self.conn.aclose()          # a connection abort closes every session
+        assert not self.page.alive
+
+
+class AttachTests(PageTestBase):
+    '''browser.attach() — an existing tab as a ready Page.'''
+
+    def _browser(self):
+        return purecdp.Browser(None, self.conn, '', False)
+
+    async def test_attach_by_url_substring(self):
+        self.fake.targets['T-9'] = {'url': 'https://kais.example/map',
+                                    'ctx': None}
+        page = await self._browser().attach(url_contains='kais')
+        assert page.session.target_id == 'T-9'
+        assert page.alive
+        await page.stop()
+
+    async def test_no_match_lists_open_page_targets(self):
+        try:
+            await self._browser().attach(url_contains='kais')
+        except TargetNotFound as exc:
+            message = str(exc)
+            assert "'kais'" in message
+            assert 'about:blank' in message     # the setUp tab is listed
+            assert isinstance(exc, PureCDPError)
+        else:
+            raise AssertionError('expected TargetNotFound')
+
+    async def test_ambiguity_raises_with_the_candidates(self):
+        self.fake.targets['T-8'] = {'url': 'https://kais.example/a',
+                                    'ctx': None}
+        self.fake.targets['T-9'] = {'url': 'https://kais.example/b',
+                                    'ctx': None}
+        try:
+            await self._browser().attach(url_contains='kais')
+        except TargetNotFound as exc:
+            assert 'target_id=' in str(exc)     # the message says the way out
+            assert 'T-8' in str(exc) and 'T-9' in str(exc)
+        else:
+            raise AssertionError('expected TargetNotFound')
+        page = await self._browser().attach(target_id='T-9')
+        assert page.session.target_id == 'T-9'
+        await page.stop()
+
+    async def test_only_page_targets_are_considered(self):
+        self.fake.targets['W-1'] = {'url': 'https://kais.example/sw.js',
+                                    'ctx': None, 'type': 'service_worker'}
+        try:
+            await self._browser().attach(url_contains='kais')
+        except TargetNotFound:
+            pass
+        else:
+            raise AssertionError('expected TargetNotFound')
+
+    async def test_exactly_one_selector_required(self):
+        for kwargs in ({}, {'url_contains': 'x', 'target_id': 'T-1'}):
+            try:
+                await self._browser().attach(**kwargs)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'expected ValueError for {kwargs}')
 
 
 if __name__ == '__main__':

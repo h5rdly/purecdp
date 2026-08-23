@@ -6,6 +6,9 @@ Three things, layered:
 
 1. **`purecdp.protocol`** — low-level typed bindings, generated from the official
    [devtools-protocol](https://github.com/ChromeDevTools/devtools-protocol) JSON specs.
+   Names are bare — `TargetInfo.type`, `Frame.id`, `dispatch_mouse_event(type=...)` —
+   not the `type_`/`id_` trailing-underscore convention some CDP generators use
+   (they aren't Python keywords, so nothing needs mangling).
 2. **`purecdp` core** — sans-I/O protocol engine + asyncio transports (websocket / pipe) + browser launcher.
 3. **`purecdp.testing`** — opinionated helpers for driving a browser in tests, incl. a pytest plugin.
 
@@ -41,7 +44,10 @@ asyncio.run(main())
 or a `ws://` endpoint) attaches to a browser someone else started — notably a
 browser a *human* just logged into (password, MFA), so an agent can inherit the
 authenticated session while the credentials never touch the automation; a new
-tab shares the profile's cookies, so it's signed in from birth.
+tab shares the profile's cookies, so it's signed in from birth — and
+`browser.attach(url_contains="kais")` grabs an already-*open* tab as a ready
+`Page` (no match, or several, raises `TargetNotFound` naming the tabs that
+do exist).
 `browser.new_context()` gives an isolated cookies/storage context (cheap per-test
 isolation); `connection.set_auto_attach()` auto-attaches popups/workers/OOPIFs,
 resuming paused targets automatically.
@@ -85,7 +91,11 @@ matching exchanges fully private (no bodies, credential headers masked) — the
 secret never enters the process. And when a test fails, its pages
 are dumped as diagnostic artifacts — screenshot, HTML, console, recorded
 traffic, traceback — under `purecdp-artifacts/<test id>/` before the browser
-closes; green tests write nothing.
+closes; green tests write nothing. Long-running watchers get an honest
+give-up signal: `page.alive` (False once the tab or browser is gone; no
+round-trip) and the `CDPClosedError` base (`CDPSessionClosed` +
+`CDPConnectionClosed`), so `while page.alive:` with
+`except CDPClosedError: break` can never spin on a dead tab.
 
 For SPA-proof tests there are lazy locators: `page.live(selector)` and
 `get_by_test_id` / `get_by_text` / `get_by_role` / `get_by_label` hold the
@@ -145,6 +155,38 @@ await page.human_scroll(1200)      # eased wheel steps, not one jump
 Since purecdp drives a *real* browser, its TLS/HTTP2 (JA3/JA4) fingerprint is
 already authentically Chrome's — no spoofing needed, unlike browserless HTTP
 scrapers.
+
+## Field notes
+
+Lessons from real scraping/automation runs, cheapest first:
+
+- **Check for SSR state before driving a browser.** Many SPAs ship their whole
+  data model inside the HTML — `<script id="serverApp-state"
+  type="application/json">` (Angular Universal), `__NEXT_DATA__` (Next.js),
+  `__NUXT__` (Nuxt). One plain HTTP GET plus `json.loads` beats a browser
+  session in speed and reliability; purecdp is for pages that genuinely
+  render client-side.
+- **Heavy SPAs never fire `load` quickly.** `goto` waits for `'load'` with a
+  10 s default; for Google-Maps-class pages pass
+  `await page.goto(url, wait='domcontentloaded')` (or raise `timeout=`) and
+  poll for the element you need.
+- **The reliable `evaluate` idiom is strings both ways:** `JSON.stringify(...)`
+  on the JS side, `json.loads(...)` on the Python side. It sidesteps any
+  question of how richer values marshal.
+- **Headed mode can leave the profile locked.** After a headed run a browser
+  process could keep holding `user_data_dir` — a wrapper script re-execs, so
+  signalling the spawned child may miss the real browser. `aclose()` therefore
+  closes gracefully first: `Browser.close` over CDP reaches the real browser
+  whatever its PID, and it exits cleanly, releasing the lock (signals are only
+  the fallback). If a profile *is* still held, `launch()` diagnoses it instead
+  of failing obscurely: a `SingletonLock` pointing at a live process raises
+  `BrowserLaunchError: profile … in use by PID N`, a stale `DevToolsActivePort`
+  is cleared (it used to surface as a baffling `ConnectionRefusedError` to a
+  dead port), and any launch failure quotes the browser's own stderr.
+- **Search-engine bot walls are IP-reputation, not fingerprints.** From a
+  flagged IP, `stealth=True` does not move the needle on google.com/search —
+  yet Google *Maps* place pages load fine in the same session, and
+  independent engines captcha on volume. Pick targets, not evasions.
 
 ## Driving with an LLM (agent surface)
 

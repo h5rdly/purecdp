@@ -14,7 +14,7 @@ import typing
 import warnings
 from dataclasses import dataclass
 
-from . import _json, protocol
+from . import _fastjson, protocol
 from ._shared import T_JSON_DICT, UnknownEvent, parse_event
 from .errors import CDPCommandError, CDPProtocolError, ProtocolDriftWarning
 
@@ -27,6 +27,7 @@ CommandGenerator = typing.Generator[T_JSON_DICT, T_JSON_DICT, typing.Any]
 class _Pending:
     gen: CommandGenerator
     session_id: str | None
+    method: str = ''
 
 
 @dataclass(frozen=True)
@@ -136,8 +137,16 @@ class Engine:
         request['id'] = cmd_id
         if session_id is not None:
             request['sessionId'] = session_id
-        self._pending[cmd_id] = _Pending(gen=cmd, session_id=session_id)
-        return cmd_id, _json.dumps(request)
+        self._pending[cmd_id] = _Pending(
+            gen=cmd, session_id=session_id, method=request.get('method', '')
+        )
+        return cmd_id, _fastjson.dumps(request)
+
+    def pending_method(self, cmd_id: int) -> str:
+        '''CDP method name of a still-pending command ('' once resolved or
+        unknown) — lets a caller name what it was waiting on after a timeout.'''
+        pending = self._pending.get(cmd_id)
+        return pending.method if pending is not None else ''
 
     def receive(self, raw: str | bytes) -> Happening:
         '''Process one incoming wire message (CDP sends one JSON object per
@@ -149,7 +158,7 @@ class Engine:
         dispatch for everything else.
         '''
         try:
-            msg = _json.loads(raw)
+            msg = _fastjson.loads(raw)
         except (ValueError, TypeError) as exc:
             raise CDPProtocolError(f'unparseable message: {exc}') from exc
         if not isinstance(msg, dict):

@@ -26,18 +26,21 @@ from .browser import (
 from .connection import Connection, EventStream, Session, Transport
 from .errors import (
     BrowserLaunchError,
+    CDPClosedError,
     CDPConnectionClosed,
     CDPCommandError,
+    CDPCommandTimeout,
     CDPError,
     PureCDPError,
     CDPProtocolError,
     CDPSessionClosed,
     CDPTransportError,
     ProtocolDriftWarning,
+    TargetNotFound,
 )
 from .transport import PipeTransport, WebSocketTransport
 
-__version__ = '0.7.0'
+__version__ = '0.8.0'
 
 __all__ = [
     'Connection',
@@ -57,12 +60,15 @@ __all__ = [
     'STEALTH_ARGS',
     'run',
     'CDPCommandError',
+    'CDPCommandTimeout',
     'CDPError',
     'PureCDPError',
     'CDPProtocolError',
+    'CDPClosedError',
     'CDPConnectionClosed',
     'CDPSessionClosed',
     'CDPTransportError',
+    'TargetNotFound',
     'BrowserLaunchError',
     'ProtocolDriftWarning',
 ]

@@ -29,7 +29,7 @@ from .engine import (
     Engine,
     EventReceived,
 )
-from .errors import CDPConnectionClosed, CDPSessionClosed
+from .errors import CDPCommandTimeout, CDPConnectionClosed, CDPSessionClosed
 
 #: Target.* events the Connection acts on regardless of listeners — these are
 #: always parsed so session bookkeeping (attach/detach/crash/info) stays live.
@@ -167,12 +167,19 @@ class Session:
     def closed(self) -> bool:
         return self._closed_reason is not None
 
-    async def execute(self, cmd: CommandGenerator) -> typing.Any:
+    async def execute(
+        self, cmd: CommandGenerator, *, timeout: float | None = None
+    ) -> typing.Any:
         '''Run one generated command on this session and return its typed
-        result. Raises CDPCommandError if the browser reports an error.'''
+        result. Raises CDPCommandError if the browser reports an error.
+        ``timeout`` bounds the round-trip (:class:`CDPCommandTimeout` on
+        expiry); None falls back to ``connection.default_command_timeout``,
+        itself None by default — unbounded, since some commands are
+        legitimately open-ended.'''
         if self.closed and self.session_id is not None:
             raise CDPSessionClosed(self._closed_reason)
-        return await self.connection._execute(cmd, self.session_id)
+        return await self.connection._execute(cmd, self.session_id,
+                                              timeout=timeout)
 
     async def detach(self) -> None:
         '''Detach from the target, leaving it running (vs. closing it).'''
@@ -275,6 +282,11 @@ class Connection:
         #: When a target attaches paused (waitForDebuggerOnStart), send
         #: Runtime.runIfWaitingForDebugger automatically.
         self.resume_waiting_targets = True
+        #: Bound EVERY command on this connection (seconds); a per-call
+        #: ``execute(timeout=)`` overrides it. None = unbounded (the default:
+        #: some commands are legitimately open-ended). Set it once to turn a
+        #: hung browser from a killed process into a CDPCommandTimeout retry.
+        self.default_command_timeout: float | None = None
         #: async hook(session) run on each target that attaches paused, before
         #: it is resumed — see add_target_init_hook.
         self._target_init_hooks: list[typing.Callable] = []
@@ -352,8 +364,10 @@ class Connection:
 
     # -- browser-level convenience (delegates to the root session) -----------
 
-    async def execute(self, cmd: CommandGenerator) -> typing.Any:
-        return await self.root.execute(cmd)
+    async def execute(
+        self, cmd: CommandGenerator, *, timeout: float | None = None
+    ) -> typing.Any:
+        return await self.root.execute(cmd, timeout=timeout)
 
     def listen(self, *event_types: type, buffer_size: int = 256) -> EventStream:
         return self.root.listen(*event_types, buffer_size=buffer_size)
@@ -378,16 +392,36 @@ class Connection:
     # -- internals -----------------------------------------------------------
 
     async def _execute(
-        self, cmd: CommandGenerator, session_id: str | None
+        self,
+        cmd: CommandGenerator,
+        session_id: str | None,
+        timeout: float | None = None,
     ) -> typing.Any:
         if self._closed_reason is not None:
             raise CDPConnectionClosed(self._closed_reason)
+        if timeout is None:
+            timeout = self.default_command_timeout
         cmd_id, wire = self._engine.start_command(cmd, session_id)
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._futures[cmd_id] = future
         try:
-            await self._transport.send(wire)
-            return await future
+            if timeout is None:
+                await self._transport.send(wire)
+                return await future
+            try:
+                async with asyncio.timeout(timeout):
+                    await self._transport.send(wire)
+                    return await future
+            except TimeoutError:
+                # The engine keeps the command pending on purpose: a response
+                # arriving after the timeout must resolve through receive()
+                # (and be dropped for lack of a future) — popping it here
+                # would make that late response abort the read loop as an
+                # unknown command id.
+                method = self._engine.pending_method(cmd_id) or 'command'
+                raise CDPCommandTimeout(
+                    f'{method} did not return within {timeout:g}s'
+                ) from None
         finally:
             self._futures.pop(cmd_id, None)
 

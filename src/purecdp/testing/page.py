@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 
 from ..browser import Browser, close_page, launch
 from ..connection import EventStream, Session
-from ..errors import CDPConnectionClosed, CDPSessionClosed, PureCDPError
+from ..errors import CDPClosedError, PureCDPError
 from .. import _b64
 from ..protocol import browser as browser_proto
 from ..protocol import emulation as emulation_proto
@@ -253,6 +253,17 @@ class Page(ElementQueries, LiveFactories):
         #: InterceptedRequest.respond_preflight). Disable for tests that are
         #: about preflight behavior itself.
         self.auto_preflight = True
+
+    @property
+    def alive(self) -> bool:
+        '''True while this page can still be driven: its session is attached
+        and the connection is up. Purely local state — no round-trip. Turns
+        False when the tab closes, the target crashes, or the browser goes
+        away (a connection abort closes every session). The watcher-loop
+        front door: ``while page.alive: ...`` cannot spin on a dead tab —
+        pair with ``except CDPClosedError: break`` for the give-up decision.
+        '''
+        return not self.session.closed
 
     @property
     def cursor(self):
@@ -1128,7 +1139,7 @@ class Page(ElementQueries, LiveFactories):
                             await route.handler(request)
                     if not request.handled:
                         await request.continue_()
-                except (CDPConnectionClosed, CDPSessionClosed):
+                except CDPClosedError:
                     return  # teardown mid-handle: not the handler's fault
                 except Exception as exc:  # a broken handler must not wedge the page
                     warnings.warn(

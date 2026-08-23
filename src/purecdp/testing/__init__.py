@@ -21,7 +21,7 @@ from .page import (
     Page,
     launched_page,
 )
-from .recorder import Exchange, NetworkRecorder, to_har
+from .recorder import Exchange, ExpectTimeout, NetworkRecorder, to_har
 from .snapshot import Snapshot, build_snapshot
 from .sse import ServerSentEvent, parse_sse
 from .stealth import (
@@ -59,6 +59,7 @@ __all__ = [
     'InterceptedRequest',
     'NetworkRecorder',
     'Exchange',
+    'ExpectTimeout',
     'to_har',
     'Snapshot',
     'build_snapshot',

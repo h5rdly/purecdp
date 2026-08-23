@@ -515,6 +515,31 @@ class DriveParityE2ETests(CDPTestCase):
         assert await self.browser.close_target(target_id) is True
         await eventually(lambda: session.closed)
 
+    async def test_alive_flips_when_the_tab_closes(self):
+        page = await self.browser.new_page(context=self.context)
+        assert page.alive
+        assert await self.browser.close_target(page.session.target_id) is True
+        await eventually(lambda: not page.alive)
+        await page.stop()
+
+    async def test_attach_to_an_existing_tab(self):
+        from purecdp import TargetNotFound
+
+        page = await self.browser.new_page(
+            'data:text/html,<title>attach-me</title>', context=self.context)
+        try:
+            again = await self.browser.attach(url_contains='attach-me')
+            assert again.session.target_id == page.session.target_id
+            assert await again.title() == 'attach-me'
+            try:
+                await self.browser.attach(url_contains='no-such-tab')
+            except TargetNotFound as exc:
+                assert 'attach-me' in str(exc)   # existing tabs are listed
+            else:
+                raise AssertionError('expected TargetNotFound')
+        finally:
+            await self.browser.close_target(page.session.target_id)
+
     async def test_query_timeout_says_what_was_there(self):
         from purecdp.testing import QueryTimeout
         await self.page.goto(

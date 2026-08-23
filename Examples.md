@@ -86,6 +86,21 @@ Every exception purecdp raises — `JSError`, `NavigateError`, `DownloadError`,
 also inherits `AssertionError`, so a failed `.should(...)` still registers as a
 test *failure*.)
 
+For long-running loops there is one more distinction that matters: *is this
+worth retrying?* `CDPSessionClosed` and `CDPConnectionClosed` share the
+`CDPClosedError` base — they mean the tab or browser is gone for good — and
+`page.alive` is the same fact as a property (purely local, no round-trip):
+
+```python
+while page.alive:                      # can't spin on a dead tab
+    try:
+        await check_something(page)
+    except CDPClosedError:
+        break                          # tab/browser gone — give up
+    except PureCDPError:
+        await asyncio.sleep(5)         # transient — back off and retry
+```
+
 ### Waiting, clicking, reading
 
 ```python
@@ -196,6 +211,42 @@ asyncio.run(main())
 (a debug pipe instead of a websocket), `stealth=True` (see below),
 `ignore_https_errors=True` (accept self-signed / local-HTTPS certs), a
 persistent `user_data_dir=`, and `extra_args=[...]` for anything else.
+
+A reused `user_data_dir` gets two guards before the spawn: if a live browser
+still holds the profile (its `SingletonLock` names a running PID — common
+after a headed run), `launch()` raises `BrowserLaunchError: profile … in use
+by PID N` up front instead of letting the new browser rendezvous-and-exit
+into a confusing downstream error; and the previous run's stale
+`DevToolsActivePort` is deleted so the endpoint wait can't connect to a dead
+port. When a launch does fail, the exception quotes the tail of the
+browser's own stderr — the "profile appears to be in use" / missing-library
+/ sandbox complaints land in the message instead of `/dev/null`.
+
+Teardown is graceful-first: `aclose()` sends `Browser.close` over CDP —
+which reaches the *real* browser process even when a launcher wrapper
+re-exec'd away from the child we spawned — and only falls back to signals
+if the browser doesn't reply and exit on its own. A browser that exits
+cleanly releases its profile lock and records a normal exit (no "restore
+pages?" bubble on the next headed run). `connect()`-ed browsers are never
+closed, only detached from.
+
+Know that plain `headless=True` advertises a `HeadlessChrome/…` user agent,
+and some servers quietly refuse it — map tile servers are notorious: the page
+works, the basemap renders blank, and it looks like a rendering bug. Fixes,
+in order of preference: `launch(stealth=True)` (modern headless, no
+`Headless` token), `page.strip_headless_ua()` (version-preserving override),
+or `headless=False`.
+
+Commands are unbounded by default — some are legitimately open-ended (a
+`runtime.evaluate` awaiting a promise resolves when the promise does). To
+bound one, or all of them, and turn a hung browser into a retriable
+`CDPCommandTimeout` (a `TimeoutError` and a `PureCDPError`, naming the CDP
+method that hung) instead of a killed process:
+
+```python
+await session.execute(page.capture_screenshot(), timeout=30)   # this one call
+browser.connection.default_command_timeout = 60                # every command
+```
 
 ### Event streams
 
@@ -444,6 +495,7 @@ An `Exchange` is **flat** — no `ex.request.method` nesting to guess at:
 ```python
 ex.url, ex.method, ex.status, ex.mime          # the one-line summary
 ex.request_body, ex.body                       # raw: str | None, bytes | None
+ex.response_body                               # alias for ex.body (symmetry)
 ex.request_json, ex.json, ex.text              # parsed conveniences
 ex.request_headers, ex.response_headers        # wire-truth dicts (see below)
 ex.failed, ex.body_error, ex.redacted          # what went wrong / was withheld
@@ -466,6 +518,19 @@ endpoint is named instead of remembering `timeout=` at every `expect()`:
 ```python
 llm = self.page.record(needle="/api/chat", default_timeout=120)   # slow route
 prices = self.page.record(needle="/api/prices")                   # page default is fine
+```
+
+When a wait comes up empty it raises `ExpectTimeout` (a `TimeoutError` and a
+`PureCDPError`), and the message reports what the recorder DID see instead of
+a bare "timed out": exchanges completed since arming but skipped by
+`json=True`, requests still in flight (sent, no response — a hung endpoint
+looks exactly like this), and how many requests never matched the filter —
+exactly what you need when reverse-engineering someone else's page:
+
+```
+ExpectTimeout: no JSON-bodied exchange matching '/GetObjectInfo' completed
+within 10s; 2 still in flight (request sent, no response): https://x/api/slow;
+4 requests never matched the recorder's filter
 ```
 
 Exchanges carry the **wire** headers (`ex.request_headers` / `ex.response_headers`
@@ -761,12 +826,25 @@ browser = await purecdp.connect("ws://127.0.0.1:9222/devtools/browser/abc123")
 
 `new_session()` beats hunting for "the tab the user logged in on" by URL —
 a fresh tab in the same profile shares its cookies, and no other script is
-fighting you for it. To work with what's already open,
-`purecdp.discovery.list_targets(port=9222)` lists every target as a raw dict
-(`id`, `type`, `url`, `title`, `webSocketDebuggerUrl`); feed an `id` to
-`connection.attach()` — and when you're done with a tab,
-`browser.close_target(id)` closes it (works for targets you never attached
-to; no hand-rolled `/json/close` HTTP calls).
+fighting you for it. But when the *state you need lives in the open tab
+itself* (an SPA mid-flow, an unsaved form), attach to it directly:
+
+```python
+page = await browser.attach(url_contains="kais")     # the tab, armed as a Page
+page = await browser.attach(target_id="A1B2...")     # or by exact id
+```
+
+No match raises `TargetNotFound` listing the page targets that *do* exist;
+several matches raise it too, with the candidate ids — pass `target_id=` to
+pick one, because guessing would mean driving the wrong tab of a browser a
+human may be using. Arming enables CDP domains on the tab; for a
+low-observability attach pass `capture=False, track_network=False`.
+
+For a raw listing, `purecdp.discovery.list_targets(port=9222)` returns every
+target as a dict (`id`, `type`, `url`, `title`, `webSocketDebuggerUrl`); feed
+an `id` to `connection.attach()` for a bare `Session` — and when you're done
+with a tab, `browser.close_target(id)` closes it (works for targets you never
+attached to; no hand-rolled `/json/close` HTTP calls).
 
 ---
 

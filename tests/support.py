@@ -128,11 +128,16 @@ class FakeBrowser:
         #: only SPECIFIC expressions (e.g. the near-miss diagnostic) while
         #: unrelated polling keeps getting the undefined default.
         self.evaluate_hook = None
+        #: Count of Browser.close commands received (graceful shutdown).
+        self.browser_close_requests = 0
+        #: Optional callable() run on each Browser.close — e.g. to make the
+        #: fake "browser process" of a Browser under test exit.
+        self.on_browser_close = None
 
     def _target_info(self, tid: str) -> dict:
         t = self.targets[tid]
-        info = {'targetId': tid, 'type': 'page', 'title': '', 'url': t['url'],
-                'attached': True, 'canAccessOpener': False}
+        info = {'targetId': tid, 'type': t.get('type', 'page'), 'title': '',
+                'url': t['url'], 'attached': True, 'canAccessOpener': False}
         if t['ctx']:
             info['browserContextId'] = t['ctx']
         return info
@@ -186,6 +191,9 @@ class FakeBrowser:
                 _, event = self._attach(tid, self.wait_on_start)
                 replies.append(event)
             return replies
+        if method == 'Target.getTargets':
+            return [ok({'targetInfos': [self._target_info(tid)
+                                        for tid in self.targets]})]
         if method == 'Target.attachToTarget':
             new_sid, event = self._attach(params['targetId'], False)
             return [event, ok({'sessionId': new_sid})]  # event first, like Chrome
@@ -282,6 +290,11 @@ class FakeBrowser:
             body = self.response_bodies.get(
                 request_id, {'body': '', 'base64Encoded': False})
             return [ok(body)]
+        if method == 'Browser.close':
+            self.browser_close_requests += 1
+            if self.on_browser_close is not None:
+                self.on_browser_close()
+            return [ok()]
         if method == 'Accessibility.getFullAXTree':
             return [ok({'nodes': self.ax_nodes})]
         if method == 'DOM.resolveNode':

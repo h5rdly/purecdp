@@ -156,6 +156,51 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
                     expression='7 * 6', return_by_value=True))
                 assert answer.value == 42
 
+    @retry_flaky()
+    async def test_locked_profile_diagnosed_then_reusable(self):
+        '''A second launch into a live profile must say "in use by PID N" —
+        not die with ConnectionRefused on a stale DevToolsActivePort — and
+        after the first browser closes, the same profile must launch again.'''
+        import tempfile
+
+        async with asyncio.timeout(120):
+            with tempfile.TemporaryDirectory() as profile:
+                async with await purecdp.launch(
+                        user_data_dir=profile, extra_args=EXTRA_ARGS) as first:
+                    assert first.process is not None
+                    try:
+                        await purecdp.launch(user_data_dir=profile,
+                                             extra_args=EXTRA_ARGS)
+                    except purecdp.BrowserLaunchError as exc:
+                        if sys.platform != 'win32':  # no SingletonLock there
+                            assert (f'in use by PID {first.process.pid}'
+                                    in str(exc))
+                    else:
+                        raise AssertionError(
+                            'second launch into a locked profile succeeded')
+                # the dir still holds last run's DevToolsActivePort remnants;
+                # relaunching proves the stale-port clearing works
+                async with await purecdp.launch(
+                        user_data_dir=profile, extra_args=EXTRA_ARGS) as again:
+                    session = await again.new_session()
+                    assert session.target_id is not None
+
+    @retry_flaky()
+    async def test_aclose_is_graceful_and_releases_the_profile(self):
+        '''aclose() must end with the browser exiting by itself on
+        Browser.close — exit code 0, SingletonLock gone — not by SIGTERM.'''
+        import tempfile
+        from purecdp.browser import _profile_lock_holder
+
+        async with asyncio.timeout(60):
+            with tempfile.TemporaryDirectory() as profile:
+                browser = await purecdp.launch(user_data_dir=profile,
+                                               extra_args=EXTRA_ARGS)
+                await browser.new_session()
+                await browser.aclose()
+                assert browser.process.returncode == 0
+                assert _profile_lock_holder(profile) is None
+
 
 if __name__ == '__main__':
     unittest.main()
