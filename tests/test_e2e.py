@@ -208,21 +208,25 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
 
         async with asyncio.timeout(60):
             async with await purecdp.launch(extra_args=EXTRA_ARGS) as browser:
-                # clear whatever initial tabs the browser opened, so exactly
-                # one realized page target remains. closeTarget acknowledges
-                # BEFORE the target is gone from getTargets (a slow runner
-                # still listed the closed about:blank) — wait it out.
+                # Make ours the only page target. Create it FIRST: the CI
+                # runners' Chrome opens a fresh about:blank whenever a
+                # createTarget happens with no window alive, so closing
+                # everything and then creating leaves two tabs. And
+                # closeTarget acknowledges before the tab leaves getTargets,
+                # so wait until the listing agrees.
+                session = await browser.new_session(
+                    'data:text/html,<title>only-me</title>')
+
                 async def page_targets():
                     infos = await browser.connection.execute(
                         _target.get_targets())
                     return [str(i.target_id) for i in infos if i.type == 'page']
 
                 for target_id in await page_targets():
-                    await browser.close_target(target_id)
-                while await page_targets():
+                    if target_id != session.target_id:
+                        await browser.close_target(target_id)
+                while await page_targets() != [session.target_id]:
                     await asyncio.sleep(0.05)
-                session = await browser.new_session(
-                    'data:text/html,<title>only-me</title>')
                 page = await browser.attach()
                 assert page.session.target_id == session.target_id
                 await page.stop()
