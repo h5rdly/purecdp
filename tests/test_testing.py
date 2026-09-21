@@ -350,15 +350,69 @@ class CaptureTests(PageTestBase):
 
 
 class InterceptTests(PageTestBase):
-    def paused_event(self, request_id, url):
+    def paused_event(self, request_id, url, *, method='GET', headers=None,
+                     post_data=None, post_data_entries=None):
+        request = {'url': url, 'method': method, 'headers': headers or {},
+                   'initialPriority': 'High', 'referrerPolicy': 'no-referrer'}
+        if post_data is not None:
+            request['postData'] = post_data
+            request['hasPostData'] = True
+        if post_data_entries is not None:
+            request['postDataEntries'] = [
+                {'bytes': base64.b64encode(chunk).decode()}
+                for chunk in post_data_entries]
+            request['hasPostData'] = True
         return {
             'method': 'Fetch.requestPaused',
             'sessionId': self.page.session.session_id,
             'params': {'requestId': request_id, 'frameId': 'F-1',
-                       'resourceType': 'Fetch',
-                       'request': {'url': url, 'method': 'GET', 'headers': {},
-                                   'initialPriority': 'High',
-                                   'referrerPolicy': 'no-referrer'}}}
+                       'resourceType': 'Fetch', 'request': request}}
+
+    async def captured(self, event):
+        '''Route everything, push ``event``, return the InterceptedRequest
+        the handler saw (fulfilled with 204 so the pump is happy).'''
+        seen = []
+
+        async def handler(request):
+            seen.append(request)
+            await request.fulfill(status=204)
+
+        await self.page.route('*', handler)
+        self.transport.push(event)
+        await drain()
+        assert len(seen) == 1
+        return seen[0]
+
+    async def test_post_data_from_post_data_field(self):
+        request = await self.captured(self.paused_event(
+            'R1', 'https://x/api', method='POST', post_data='{"a": 1}',
+            headers={'Content-Type': 'application/json'}))
+        assert request.post_data == '{"a": 1}'
+        assert request.post_data_bytes == b'{"a": 1}'
+        assert request.json == {'a': 1}
+
+    async def test_post_data_from_entries_when_field_absent(self):
+        '''Large or binary bodies arrive only as base64 postDataEntries.'''
+        request = await self.captured(self.paused_event(
+            'R1', 'https://x/upload', method='PUT',
+            post_data_entries=[b'\x00\x01', b'{"k": "v"}']))
+        assert request.post_data_bytes == b'\x00\x01{"k": "v"}'
+        assert request.post_data == '\x00\x01{"k": "v"}'
+
+    async def test_bodyless_request_has_no_post_data(self):
+        request = await self.captured(self.paused_event('R1', 'https://x/'))
+        assert request.post_data is None
+        assert request.post_data_bytes is None
+        assert request.json is None
+
+    async def test_header_is_case_insensitive_and_public(self):
+        request = await self.captured(self.paused_event(
+            'R1', 'https://x/', headers={'Content-Type': 'text/plain',
+                                          'X-Token': 'abc'}))
+        assert request.header('content-TYPE') == 'text/plain'
+        assert request.header('x-token') == 'abc'
+        assert request.header('missing') is None
+        assert request._header('X-Token') == 'abc'  # old private spelling
 
     async def test_fulfill_matched_continue_unmatched(self):
         async def handler(request):
@@ -400,6 +454,146 @@ class InterceptTests(PageTestBase):
         await drain()
         assert self.sent('Fetch.fulfillRequest')[0]['params']['requestId'] == 'R1'
         assert self.sent('Fetch.continueRequest')[0]['params']['requestId'] == 'R2'
+
+
+class RelayTests(PageTestBase):
+    '''page.relay: the fake stands in for the browser, the TARGET is a real
+    local HTTP server — what matters is what urllib sent it and what the
+    page got back as Fetch.fulfillRequest.'''
+
+    def setUp(self):
+        super().setUp()
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+        seen = self.seen = []
+
+        class H(BaseHTTPRequestHandler):
+            def _serve(self):
+                length = int(self.headers.get('Content-Length', 0))
+                seen.append({'method': self.command, 'path': self.path,
+                             'headers': dict(self.headers.items()),
+                             'body': self.rfile.read(length)})
+                if self.path.startswith('/api/missing'):
+                    self.send_response(404)
+                    self.send_header('Content-Type', 'text/plain')
+                    self.end_headers()
+                    self.wfile.write(b'nope')
+                    return
+                self.send_response(201)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Set-Cookie', 'a=1; Path=/')
+                self.send_header('Set-Cookie', 'b=2; Path=/')
+                self.send_header('Access-Control-Allow-Origin',
+                                 'http://someone-else')
+                self.end_headers()
+                self.wfile.write(b'{"relayed": true}')
+
+            do_GET = do_POST = do_PUT = _serve
+
+            def log_message(self, *args):
+                pass
+
+        self.httpd = ThreadingHTTPServer(('127.0.0.1', 0), H)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.target = f'http://127.0.0.1:{self.httpd.server_port}'
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        super().tearDown()
+
+    def paused(self, request_id, url, **kw):
+        return InterceptTests.paused_event(self, request_id, url, **kw)
+
+    async def fulfilled(self, request_id):
+        '''The fulfillRequest for ``request_id`` — the relay answers from a
+        worker thread, so poll rather than drain a fixed number of cycles.'''
+        async with asyncio.timeout(5.0):
+            while True:
+                for m in self.sent('Fetch.fulfillRequest'):
+                    if m['params']['requestId'] == request_id:
+                        return m['params']
+                await asyncio.sleep(0.01)
+
+    @staticmethod
+    def header_values(params, name):
+        return [h['value'] for h in params.get('responseHeaders') or []
+                if h['name'].lower() == name.lower()]
+
+    async def test_post_is_forwarded_and_the_answer_comes_back(self):
+        await self.page.relay('/api/', self.target)
+        self.transport.push(self.paused(
+            'R1', 'http://app.local/api/turns?x=1&y=2', method='POST',
+            post_data='{"q": "hi"}',
+            headers={'Content-Type': 'application/json', 'X-Custom': 'yes',
+                     'Host': 'app.local', 'Content-Length': '11',
+                     'Connection': 'keep-alive',
+                     'Origin': 'http://app.local',
+                     'Cookie': 'sid=s3cret'}))
+        params = await self.fulfilled('R1')
+
+        # what the target saw
+        hit = self.seen[0]
+        assert hit['method'] == 'POST'
+        assert hit['path'] == '/api/turns?x=1&y=2'
+        assert hit['body'] == b'{"q": "hi"}'
+        assert hit['headers']['X-Custom'] == 'yes'
+        assert hit['headers']['Content-Type'] == 'application/json'
+        assert hit['headers']['Cookie'] == 'sid=s3cret'       # transparent
+        assert hit['headers']['Origin'] == 'http://app.local'
+        assert hit['headers']['Host'].startswith('127.0.0.1')  # not app.local
+        assert hit['headers']['Accept-Encoding'] == 'identity'
+        assert hit['headers']['Connection'] != 'keep-alive'   # hop-by-hop dropped
+
+        # what the page got
+        assert params['responseCode'] == 201
+        assert base64.b64decode(params['body']) == b'{"relayed": true}'
+        assert self.header_values(params, 'Content-Type') == ['application/json']
+        assert self.header_values(params, 'Set-Cookie') == ['a=1; Path=/', 'b=2; Path=/']
+        assert not self.header_values(params, 'Content-Length')
+        # the target's CORS grant is replaced by an echo of the page's Origin
+        assert self.header_values(params, 'Access-Control-Allow-Origin') == ['http://app.local']
+
+    async def test_error_status_passes_through(self):
+        await self.page.relay('/api/', self.target)
+        self.transport.push(self.paused('R1', 'http://app.local/api/missing'))
+        params = await self.fulfilled('R1')
+        assert params['responseCode'] == 404
+        assert base64.b64decode(params['body']) == b'nope'
+
+    async def test_outside_prefix_is_continued_untouched(self):
+        await self.page.relay('/api/', self.target)
+        self.transport.push(self.paused('R1', 'http://app.local/assets/x.js'))
+        await drain()
+        assert self.sent('Fetch.continueRequest')[0]['params']['requestId'] == 'R1'
+        assert not self.seen
+
+    async def test_unreachable_target_answers_502_naming_it(self):
+        await self.page.relay('/api/', 'http://127.0.0.1:1')
+        self.transport.push(self.paused('R1', 'http://app.local/api/x'))
+        params = await self.fulfilled('R1')
+        assert params['responseCode'] == 502
+        assert b'http://127.0.0.1:1/api/x' in base64.b64decode(params['body'])
+
+    async def test_extra_headers_are_added(self):
+        await self.page.relay('/api/', self.target,
+                              headers={'Authorization': 'Bearer t0k'})
+        self.transport.push(self.paused('R1', 'http://app.local/api/x'))
+        await self.fulfilled('R1')
+        assert self.seen[0]['headers']['Authorization'] == 'Bearer t0k'
+
+    async def test_mock_and_relay_compose_in_either_order(self):
+        '''A catch-all mock_api registered FIRST leaves its unmatched paths
+        to the relay registered after it (routes fall through).'''
+        await self.page.mock_api({'/api/stubbed': {'stub': True}})
+        await self.page.relay('/api/', self.target)
+        self.transport.push(self.paused('R1', 'http://app.local/api/stubbed'))
+        self.transport.push(self.paused('R2', 'http://app.local/api/real'))
+        stubbed = await self.fulfilled('R1')
+        real = await self.fulfilled('R2')
+        assert base64.b64decode(stubbed['body']) == b'{"stub": true}'
+        assert base64.b64decode(real['body']) == b'{"relayed": true}'
+        assert [h['path'] for h in self.seen] == ['/api/real']
 
 
 class HarExportTests(unittest.TestCase):
@@ -601,6 +795,56 @@ class ElementTests(PageTestBase):
                                                          'mouseReleased']
         assert events[0]['params']['x'] == 10.5
         assert events[0]['params']['button'] == 'left'
+
+
+class DetachedNodeTests(PageTestBase):
+    '''type/set_value/click on a node the app has replaced must raise, not
+    act on nothing. The fake cans the action script's verdict.'''
+
+    def element(self, *verdicts):
+        from purecdp.testing import Element
+        self.fake.call_results = [
+            {'result': {'type': 'string', 'value': v}} for v in verdicts]
+        return Element(self.page, 'OBJ-1')
+
+    async def expect_failure(self, coro, reason):
+        from purecdp.testing import ActionabilityError
+        try:
+            await coro
+        except ActionabilityError as exc:
+            assert exc.reason == reason
+            return str(exc)
+        raise AssertionError(f'expected ActionabilityError({reason!r})')
+
+    async def test_type_on_detached_node_raises_and_sends_no_keys(self):
+        message = await self.expect_failure(
+            self.element('detached').type('ab'), 'detached')
+        assert 'page.live(selector)' in message and 're-query' in message
+        assert not self.sent('Input.dispatchKeyEvent')
+
+    async def test_type_on_unfocusable_node_raises(self):
+        message = await self.expect_failure(
+            self.element('unfocused').type('ab'), 'unfocused')
+        assert 'did not take focus' in message
+        assert not self.sent('Input.dispatchKeyEvent')
+
+    async def test_type_proceeds_when_focus_landed(self):
+        await self.element('ok').type('ab')
+        types = [e['params']['type'] for e in self.sent('Input.dispatchKeyEvent')]
+        assert types == ['keyDown', 'keyUp', 'keyDown', 'keyUp']
+
+    async def test_odd_verdict_does_not_block(self):
+        '''Only the explicit failure tokens fail: a page returning nothing
+        (the fake's default) still types.'''
+        self.fake.call_results = []
+        from purecdp.testing import Element
+        await Element(self.page, 'OBJ-1').type('a')
+        assert len(self.sent('Input.dispatchKeyEvent')) == 2
+
+    async def test_set_value_and_click_on_detached_node_raise(self):
+        await self.expect_failure(
+            self.element('detached').set_value('x'), 'detached')
+        await self.expect_failure(self.element('detached').click(), 'detached')
 
 
 class KeyboardTests(PageTestBase):
@@ -923,6 +1167,88 @@ class InitScriptAndRecorderTests(PageTestBase):
             assert 'no traffic seen at all' in str(exc)
         else:
             raise AssertionError('expected ExpectTimeout')
+
+
+class RecorderWaitTests(PageTestBase):
+    '''expect(where=) and wait_for(count=): the reviewer's "at least two
+    POSTs that are not 202" — a page retrying a turn while a profile is
+    pending.'''
+
+    @staticmethod
+    def settled_post(e):
+        return e.method == 'POST' and e.status != 202
+
+    async def test_expect_where_skips_the_pending_retry(self):
+        recorder = self.page.record(needle='/turn')
+        turn = recorder.expect(where=self.settled_post, timeout=2)
+        self._push_exchange('R1', 'https://x/turn', '{"pending": 1}',
+                            method='POST', status=202)
+        self._push_exchange('R2', 'https://x/turn', '{"ok": 1}',
+                            method='POST', status=200)
+        done = await turn.value
+        assert done.status == 200 and done.json == {'ok': 1}
+        assert [e.status for e in turn.skipped] == [202]
+
+    async def test_wait_for_count_waits_for_the_second_match(self):
+        recorder = self.page.record(needle='/turn')
+        self._push_exchange('R1', 'https://x/turn', '{}', method='POST', status=200)
+        self._push_exchange('R2', 'https://x/turn', '{}', method='GET', status=200)
+        waiter = asyncio.create_task(recorder.wait_for(
+            count=2, where=self.settled_post, timeout=2))
+        await drain()
+        assert not waiter.done()                       # one of two so far
+        self._push_exchange('R3', 'https://x/turn', '{}', method='POST', status=202)
+        self._push_exchange('R4', 'https://x/turn', '{}', method='POST', status=201)
+        turns = await waiter
+        assert [e.status for e in turns] == [200, 201]  # GET and 202 skipped
+        assert len(recorder.exchanges) == 4             # nothing dropped
+
+    async def test_wait_for_already_satisfied_returns_at_once(self):
+        recorder = self.page.record(needle='/turn')
+        self._push_exchange('R1', 'https://x/turn', '{}', method='POST')
+        self._push_exchange('R2', 'https://x/turn', '{}', method='POST')
+        await drain()
+        turns = await recorder.wait_for(count=2, where=self.settled_post,
+                                        timeout=0.05)
+        assert len(turns) == 2
+
+    async def test_wait_for_since_windows_to_what_comes_next(self):
+        recorder = self.page.record(needle='/turn')
+        self._push_exchange('R1', 'https://x/turn', '{}', method='POST')
+        await drain()
+        mark = len(recorder.exchanges)
+        try:
+            await recorder.wait_for(where=self.settled_post, since=mark,
+                                    timeout=0.05)
+        except ExpectTimeout as exc:
+            assert str(exc).startswith('no exchange passing where=')
+        else:
+            raise AssertionError('expected ExpectTimeout')
+
+    async def test_wait_for_timeout_says_how_many_of_how_many(self):
+        recorder = self.page.record(needle='/turn')
+        self._push_exchange('R1', 'https://x/turn', '{}', method='POST', status=200)
+        self._push_exchange('R2', 'https://x/turn?retry', '{}', method='POST', status=202)
+        try:
+            await recorder.wait_for(count=2, where=self.settled_post,
+                                    timeout=0.05)
+        except ExpectTimeout as exc:
+            message = str(exc)
+            assert message.startswith(
+                "1 of 2 exchanges passing where= matching '/turn' completed")
+            assert '1 completed since arming but skipped by where=' in message
+            assert 'https://x/turn?retry' in message
+            assert 'https://x/turn,' not in message   # the match is not "skipped"
+        else:
+            raise AssertionError('expected ExpectTimeout')
+
+    async def test_wait_for_next_takes_where_too(self):
+        recorder = self.page.record(needle='/turn')
+        self._push_exchange('R1', 'https://x/turn', 'nope', method='GET')
+        self._push_exchange('R2', 'https://x/turn', '{}', method='POST')
+        exchange = await recorder.wait_for_next(
+            0, where=lambda e: e.method == 'POST', timeout=2)
+        assert exchange.method == 'POST'
 
     async def test_await_record_returns_the_recorder(self):
         # everything else on Page is awaited; the first call to record()
@@ -1603,14 +1929,56 @@ class AttachTests(PageTestBase):
         else:
             raise AssertionError('expected TargetNotFound')
 
-    async def test_exactly_one_selector_required(self):
-        for kwargs in ({}, {'url_contains': 'x', 'target_id': 'T-1'}):
-            try:
-                await self._browser().attach(**kwargs)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError(f'expected ValueError for {kwargs}')
+    async def test_both_selectors_rejected(self):
+        try:
+            await self._browser().attach(url_contains='x', target_id='T-1')
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('expected ValueError')
+
+    async def test_no_arg_picks_the_realized_tab(self):
+        # zombies (empty URL — created but never adopted) and browser-UI
+        # targets don't count; the setUp about:blank tab is the one realized
+        self.fake.targets['T-8'] = {'url': '', 'ctx': None}
+        self.fake.targets['T-9'] = {'url': 'chrome://newtab/', 'ctx': None}
+        page = await self._browser().attach()
+        assert page.session.target_id == self.page.session.target_id
+        await page.stop()
+
+    async def test_no_arg_with_no_realized_tab_lists_what_exists(self):
+        del self.fake.targets[self.page.session.target_id]
+        self.fake.targets['T-8'] = {'url': '', 'ctx': None}
+        self.fake.targets['T-9'] = {'url': 'vivaldi://startpage/', 'ctx': None}
+        try:
+            await self._browser().attach()
+        except TargetNotFound as exc:
+            assert 'unrealized' in str(exc)         # the zombie is visible
+            assert 'vivaldi://startpage' in str(exc)
+        else:
+            raise AssertionError('expected TargetNotFound')
+
+    async def test_no_arg_ambiguity_says_the_way_out(self):
+        self.fake.targets['T-9'] = {'url': 'https://kais.example/b',
+                                    'ctx': None}
+        try:
+            await self._browser().attach()
+        except TargetNotFound as exc:
+            assert 'url_contains=' in str(exc) and 'target_id=' in str(exc)
+            assert 'T-9' in str(exc)
+        else:
+            raise AssertionError('expected TargetNotFound')
+
+    async def test_empty_url_contains_stays_match_everything(self):
+        # '' is substring-matching (matches every URL, zombies included) —
+        # deliberately NOT an alias for the no-arg realized-tab pick
+        self.fake.targets['T-8'] = {'url': '', 'ctx': None}
+        try:
+            await self._browser().attach(url_contains='')
+        except TargetNotFound as exc:
+            assert '2 page targets' in str(exc)
+        else:
+            raise AssertionError('expected TargetNotFound')
 
 
 if __name__ == '__main__':

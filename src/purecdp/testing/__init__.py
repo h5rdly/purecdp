@@ -6,7 +6,7 @@
   import purecdp.testing.pytest_plugin only happens when pytest loads it)
 '''
 
-from .artifacts import dump_artifacts
+from .artifacts import Checks, dump_artifacts
 from .element import ActionabilityError, Element, QueryTimeout
 from .frame import Frame, FrameNotFound
 from .live import ExpectationError, Live
@@ -67,4 +67,5 @@ __all__ = [
     'parse_sse',
     'CDPTestCase',
     'dump_artifacts',
+    'Checks',
 ]

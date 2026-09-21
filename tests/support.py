@@ -128,6 +128,11 @@ class FakeBrowser:
         #: only SPECIFIC expressions (e.g. the near-miss diagnostic) while
         #: unrelated polling keeps getting the undefined default.
         self.evaluate_hook = None
+        #: When True, created targets never realize (Vivaldi-style): the
+        #: browser hands out a target id but the tab's URL stays empty forever.
+        self.unrealized_targets = False
+        #: Product string served by Browser.getVersion.
+        self.product = 'FakeBrowser/1.0'
         #: Count of Browser.close commands received (graceful shutdown).
         self.browser_close_requests = 0
         #: Optional callable() run on each Browser.close — e.g. to make the
@@ -184,7 +189,8 @@ class FakeBrowser:
         if method == 'Target.createTarget':
             self._n += 1
             tid = f'T-{self._n}'
-            self.targets[tid] = {'url': params['url'],
+            url = '' if self.unrealized_targets else params['url']
+            self.targets[tid] = {'url': url,
                                  'ctx': params.get('browserContextId')}
             replies = [ok({'targetId': tid})]
             if self.auto_attach:
@@ -194,6 +200,12 @@ class FakeBrowser:
         if method == 'Target.getTargets':
             return [ok({'targetInfos': [self._target_info(tid)
                                         for tid in self.targets]})]
+        if method == 'Target.getTargetInfo':
+            return [ok({'targetInfo': self._target_info(params['targetId'])})]
+        if method == 'Browser.getVersion':
+            return [ok({'protocolVersion': '1.3', 'product': self.product,
+                        'revision': '0', 'userAgent': 'FakeUA',
+                        'jsVersion': '0'})]
         if method == 'Target.attachToTarget':
             new_sid, event = self._attach(params['targetId'], False)
             return [event, ok({'sessionId': new_sid})]  # event first, like Chrome

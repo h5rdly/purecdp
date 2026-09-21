@@ -34,7 +34,8 @@ from . import _agent
 from .element import Element, ElementQueries
 from .live import LiveFactories
 from .snapshot import Snapshot
-from .intercept import Handler, InterceptedRequest, Route, match_route
+from .intercept import (Handler, InterceptedRequest, Route, forward,
+                        matching_routes)
 from .recorder import NetworkRecorder
 
 #: Injects a <script>/<style> by url or inline content, resolving when ready.
@@ -796,6 +797,40 @@ class Page(ElementQueries, LiveFactories):
 
         await self.route(pattern, handler)
 
+    async def relay(
+        self,
+        prefix: str,
+        target_base: str,
+        *,
+        headers: dict[str, str] | None = None,
+        timeout: float = 10.0,
+    ) -> None:
+        '''Forward requests whose URL *path* starts with ``prefix`` to
+        ``target_base`` (``scheme://host[:port]``) and answer the page with
+        what the target returned — the dev proxy the frontend expects,
+        without running one. The sibling of ``mock_api``: stub or forward::
+
+            await page.relay('/api/', 'http://127.0.0.1:8000')
+
+        ``headers`` are added to every forwarded request (an Authorization
+        for the real backend); ``timeout`` bounds each upstream call.
+        Transparent otherwise — method, query, body, ``Cookie``/``Origin``
+        go through unchanged, ``Set-Cookie`` and 4xx/5xx come back as-is;
+        an unreachable target answers 502 with the reason in the body.
+        Routes are tried in registration order until one handles the
+        request, so a ``mock_api`` for one path and a relay for the rest
+        compose either way round. Limits: whole-body (no streaming, so no
+        SSE through a relay); redirects are followed upstream; meant for
+        dev/test origins, not a general proxy.'''
+        def under_prefix(url: str) -> bool:
+            return urlparse(url).path.startswith(prefix)
+
+        async def handler(request: InterceptedRequest) -> None:
+            await forward(request, target_base, headers=headers,
+                          timeout=timeout)
+
+        await self.route(under_prefix, handler)
+
     def record(
         self,
         *,
@@ -1110,9 +1145,10 @@ class Page(ElementQueries, LiveFactories):
                     handler: Handler) -> None:
         '''Intercept requests whose URL matches ``pattern`` — an fnmatch glob
         (note: '*' crosses '/') or a ``callable(url) -> bool`` predicate, the
-        same form ``record()`` takes. First matching route wins; its async
-        handler gets an InterceptedRequest and should fulfill/continue_/abort
-        it. Unmatched or unhandled requests are continued untouched.'''
+        same form ``record()`` takes. Matching routes run in registration
+        order until one handles the request (fulfill/continue_/abort) — a
+        handler that returns without handling passes it on. Unmatched or
+        unhandled requests are continued untouched.'''
         self._routes.append(Route(pattern, handler))
         if not self._intercepting:
             self._intercepting = True
@@ -1130,13 +1166,14 @@ class Page(ElementQueries, LiveFactories):
         with suppress(Exception):  # session teardown ends the pump
             async for event in stream:
                 request = InterceptedRequest(self.session, event)
-                route = match_route(self._routes, request.url)
+                routes = matching_routes(self._routes, request.url)
                 try:
-                    if route is not None:
-                        if self.auto_preflight and request.is_cors_preflight:
-                            await request.respond_preflight()
-                        else:
-                            await route.handler(request)
+                    if routes and self.auto_preflight and request.is_cors_preflight:
+                        await request.respond_preflight()
+                    for route in routes:  # first handler that HANDLES wins
+                        if request.handled:
+                            break
+                        await route.handler(request)
                     if not request.handled:
                         await request.continue_()
                 except CDPClosedError:

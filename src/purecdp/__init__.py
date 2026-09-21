@@ -37,10 +37,11 @@ from .errors import (
     CDPTransportError,
     ProtocolDriftWarning,
     TargetNotFound,
+    TargetNotRealized,
 )
 from .transport import PipeTransport, WebSocketTransport
 
-__version__ = '0.8.0'
+__version__ = '0.9.0'
 
 __all__ = [
     'Connection',
@@ -69,6 +70,7 @@ __all__ = [
     'CDPSessionClosed',
     'CDPTransportError',
     'TargetNotFound',
+    'TargetNotRealized',
     'BrowserLaunchError',
     'ProtocolDriftWarning',
 ]

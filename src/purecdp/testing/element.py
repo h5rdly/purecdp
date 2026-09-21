@@ -31,22 +31,41 @@ if typing.TYPE_CHECKING:
 #: put the click target on a wrapper whose own .click() does nothing, with a
 #: visually-hidden <input> inside it (or inside its label).
 _RESOLVE_AND_CLICK = (
-    '(el) => { const i = el.matches('
+    "(el) => { if (!el.isConnected) return 'detached';"
+    ' const i = el.matches('
     "'input,button,a,select,textarea,[role=button],[role=radio],[role=checkbox]')"
     " ? el : el.querySelector('input') || el.closest('label')?.querySelector('input');"
-    ' (i || el).click(); }'
+    " (i || el).click(); return 'ok'; }"
 )
 
 #: React patches value setters; go through the native prototype setter, then
 #: fire bubbling input+change so controlled components commit either way.
 _SET_VALUE = (
-    '(el, value) => {'
+    "(el, value) => { if (!el.isConnected) return 'detached';"
     ' const proto = el instanceof HTMLTextAreaElement'
     '   ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;'
     " Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, value);"
     " el.dispatchEvent(new Event('input', { bubbles: true }));"
-    " el.dispatchEvent(new Event('change', { bubbles: true })); }"
+    " el.dispatchEvent(new Event('change', { bubbles: true }));"
+    " return 'ok'; }"
 )
+
+#: Focus for typing, reporting whether focus actually landed: keys sent to a
+#: node that is no longer in the document, or that refused focus, vanish
+#: without a trace — the classic "the app ignored my typing".
+_FOCUS_FOR_TYPING = (
+    "(el) => { if (!el.isConnected) return 'detached';"
+    ' el.focus();'
+    " return document.activeElement === el ? 'ok' : 'unfocused'; }"
+)
+
+_ACTION_FAILURES = {
+    'detached': ('element is no longer in the document (the app re-rendered '
+                 'or replaced it) — re-query it, or use page.live(selector), '
+                 'which re-resolves on every action'),
+    'unfocused': ('element did not take focus (hidden, disabled, or not '
+                  'focusable) — typed keys would go nowhere'),
+}
 
 #: In-browser actionability poll: 
 #: loop until the element is connected, has a visible box, is enabled, has stopped
@@ -220,11 +239,23 @@ class Element:
     async def text(self) -> str:
         return (await self.eval('(el) => el.textContent')) or ''
 
+    @staticmethod
+    def _raise_if_failed(result: typing.Any, action: str) -> None:
+        '''Turn an explicit failure token from an action script into an
+        :class:`ActionabilityError`. Only the known tokens fail — anything
+        else (a real page's 'ok', an odd/None result) lets the action
+        stand, so a quirk can't spuriously block it.'''
+        if result in _ACTION_FAILURES:
+            raise ActionabilityError(
+                f'{action}: {_ACTION_FAILURES[result]}', result)
+
     async def click(self) -> None:
         '''Synthetic click, resolving wrappers to their real control (see
         _RESOLVE_AND_CLICK). Use mouse_click() when the app needs a trusted
-        event.'''
-        await self.eval(_RESOLVE_AND_CLICK)
+        event. Raises :class:`ActionabilityError` (reason ``detached``) if
+        this node is no longer in the document — a click into the void is
+        never what you meant.'''
+        self._raise_if_failed(await self.eval(_RESOLVE_AND_CLICK), 'click')
 
     async def wait_actionable(
         self,
@@ -288,15 +319,23 @@ class Element:
     async def set_value(
         self, value: str, *, stable: bool = False, timeout: float | None = None
     ) -> None:
-        '''React-safe value write on this exact node (native setter + input
-        and change events). Prefer this over selector-based writes whenever
-        several copies of a widget can be in the DOM.
+        '''Instant value write on this exact node: native setter + bubbling
+        ``input`` and ``change`` events, so controlled inputs (React & co.)
+        commit it — and so does ``type``, with real keystrokes (verified
+        against React 18); pick by what the app listens to, not by
+        framework. Prefer this over selector-based writes whenever several
+        copies of a widget can be in the DOM.
+
+        Raises :class:`ActionabilityError` (reason ``detached``) if the node
+        is no longer in the document: a value written into a node nobody
+        renders used to "succeed" silently — the app re-rendered after you
+        queried, so re-query or use ``page.live(selector)``.
 
         ``stable=True`` first waits for the field to be visible, enabled, and
         settled (no pointer hit-test needed for a value write).'''
         if stable:
             await self.wait_actionable(hit=False, timeout=timeout)
-        await self.eval(_SET_VALUE, value)
+        self._raise_if_failed(await self.eval(_SET_VALUE, value), 'set_value')
 
     async def focus(self) -> None:
         await self.eval('(el) => el.focus()')
@@ -315,14 +354,21 @@ class Element:
         instead: ONE ``input`` event, ZERO key events — fast bulk entry, but
         key listeners silently never fire while ``.value`` looks perfect
         (maddening to debug; that is why it is not the default). See also
-        ``set_value`` (React-safe instant setter, no real events at all) and
-        ``page.human_type`` (real keys + human cadence).
+        ``set_value`` (instant setter + synthetic input/change, no key
+        events) and ``page.human_type`` (real keys + human cadence). Both
+        ``type`` and ``set_value`` reach controlled (React) inputs.
+
+        Keys go to whatever has focus, so this first checks focus landed on
+        THIS node and raises :class:`ActionabilityError` otherwise — reason
+        ``detached`` (the app re-rendered and this handle is stale: re-query,
+        or use ``page.live(selector)``) or ``unfocused`` (hidden, disabled,
+        not focusable). Before 0.9.0 both cases typed into the void.
 
         ``stable=True`` first waits for the field to be visible, enabled, and
         settled before focusing.'''
         if stable:
             await self.wait_actionable(hit=False, timeout=timeout)
-        await self.focus()
+        self._raise_if_failed(await self.eval(_FOCUS_FOR_TYPING), 'type')
         if insert:
             await self._page.session.execute(input_proto.insert_text(text))
             return

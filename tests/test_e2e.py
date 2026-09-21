@@ -201,6 +201,25 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
                 assert browser.process.returncode == 0
                 assert _profile_lock_holder(profile) is None
 
+    @retry_flaky()
+    async def test_no_arg_attach_finds_the_realized_tab(self):
+        '''attach() with no selector = "the realized page tab".'''
+        from purecdp.protocol import target as _target
+
+        async with asyncio.timeout(60):
+            async with await purecdp.launch(extra_args=EXTRA_ARGS) as browser:
+                # clear whatever initial tabs the browser opened, so exactly
+                # one realized page target remains
+                infos = await browser.connection.execute(_target.get_targets())
+                for info in infos:
+                    if info.type == 'page':
+                        await browser.close_target(str(info.target_id))
+                session = await browser.new_session(
+                    'data:text/html,<title>only-me</title>')
+                page = await browser.attach()
+                assert page.session.target_id == session.target_id
+                await page.stop()
+
 
 if __name__ == '__main__':
     unittest.main()

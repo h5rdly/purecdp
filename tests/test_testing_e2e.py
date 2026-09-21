@@ -1584,6 +1584,150 @@ class ArtifactsE2ETests(unittest.TestCase):
             httpd.server_close()
 
 
+#: A controlled input built the way React builds one — an instance-level
+#: value-setter patch (the "value tracker") plus an input listener that
+#: commits to state and echoes it — with no React download in the suite.
+#: ``remount()`` replaces the node, exactly what a component remount does.
+_CONTROLLED_INPUT = '''<title>ctl</title>
+<input name=analysis_name><span id=echo></span>
+<input name=hidden style="display:none">
+<script>
+let state = '';
+const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+function mount() {
+  const el = document.querySelector('[name=analysis_name]');
+  let tracked = desc.get.call(el);
+  Object.defineProperty(el, 'value', {
+    configurable: true,
+    get() { return desc.get.call(this); },
+    set(v) { tracked = String(v); desc.set.call(this, v); },
+  });
+  el.addEventListener('input', () => {
+    const dom = desc.get.call(el);
+    if (dom === tracked) return;            // React's dedupe
+    state = tracked = dom;
+    document.getElementById('echo').textContent = state;
+  });
+}
+mount();
+window.remount = () => {
+  const old = document.querySelector('[name=analysis_name]');
+  const fresh = old.cloneNode(false);
+  old.replaceWith(fresh);
+  mount();
+  fresh.value = state;
+};
+</script>'''
+
+
+class DetachedNodeE2ETests(CDPTestCase):
+    '''The reviewer's "React ignored my typing", reproduced and closed:
+    type() DOES drive a controlled input; what fails is a handle held across
+    a remount — and that now raises instead of typing into the void.'''
+    EXTRA_ARGS = EXTRA
+
+    async def echo(self):
+        return await self.page.evaluate(
+            "document.getElementById('echo').textContent")
+
+    async def test_type_and_set_value_drive_a_controlled_input(self):
+        await self.page.set_content(_CONTROLLED_INPUT)
+        el = await self.page.query('[name=analysis_name]')
+        await el.type('abc')                  # real keystrokes → input events
+        assert await self.echo() == 'abc'
+        await el.set_value('xyz')             # native setter + synthetic input
+        assert await self.echo() == 'xyz'
+
+    async def test_stale_handle_after_remount_raises_not_silence(self):
+        from purecdp.testing import ActionabilityError
+        await self.page.set_content(_CONTROLLED_INPUT)
+        el = await self.page.query('[name=analysis_name]')
+        await el.type('abc')
+        await self.page.evaluate('window.remount()')
+        for action in (el.type('zzz'), el.set_value('zzz'), el.click()):
+            try:
+                await action
+            except ActionabilityError as exc:
+                assert exc.reason == 'detached'
+            else:
+                raise AssertionError('stale handle acted silently')
+        assert await self.echo() == 'abc'     # nothing leaked through
+        # the locator re-resolves and drives the replacement (caret lands
+        # at the start of a freshly focused input — Chrome's choice)
+        await self.page.live('[name=analysis_name]').type('!')
+        echoed = await self.echo()
+        assert '!' in echoed and echoed.replace('!', '') == 'abc'
+
+    async def test_unfocusable_input_raises_unfocused(self):
+        from purecdp.testing import ActionabilityError
+        await self.page.set_content(_CONTROLLED_INPUT)
+        hidden = await self.page.query('[name=hidden]')
+        try:
+            await hidden.type('x')
+        except ActionabilityError as exc:
+            assert exc.reason == 'unfocused'
+        else:
+            raise AssertionError('typing into a hidden input succeeded')
+
+
+class RelayE2ETests(CDPTestCase):
+    '''page.relay through a real browser: the page fetches an origin nobody
+    listens on (proves interception is pre-network) and the relay answers
+    from a real local backend — same-origin and cross-origin (preflight).'''
+    EXTRA_ARGS = EXTRA
+
+    def setUp(self):
+        super().setUp()
+        class Backend(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(length)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(
+                    b'{"echo": ' + body + b', "path": "' + self.path.encode() + b'"}')
+
+            def log_message(self, *args):
+                pass
+
+        class Frontend(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html')
+                self.end_headers()
+                self.wfile.write(b'<title>front</title><p>app</p>')
+
+            def log_message(self, *args):
+                pass
+
+        self.backend = ThreadingHTTPServer(('127.0.0.1', 0), Backend)
+        self.frontend = ThreadingHTTPServer(('127.0.0.1', 0), Frontend)
+        for httpd in (self.backend, self.frontend):
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        for httpd in (self.backend, self.frontend):
+            httpd.shutdown()
+            httpd.server_close()
+        super().tearDown()
+
+    async def test_same_and_cross_origin_fetches_are_relayed(self):
+        await self.page.relay('/api/',
+                              f'http://127.0.0.1:{self.backend.server_port}')
+        await self.page.goto(f'http://127.0.0.1:{self.frontend.server_port}/')
+        post = ('(url) => fetch(url, {method: "POST", '
+                'headers: {"Content-Type": "application/json"}, '
+                'body: JSON.stringify({q: "hi"})}).then(r => r.json())')
+        # same-origin: the frontend's own /api/ path
+        same = await self.page.evaluate(post, '/api/turns?n=1')
+        assert same == {'echo': {'q': 'hi'}, 'path': '/api/turns?n=1'}
+        # cross-origin to a port nobody listens on: preflight answered by
+        # the pump, POST relayed — never touches the network
+        cross = await self.page.evaluate(post, 'http://127.0.0.1:1/api/x')
+        assert cross == {'echo': {'q': 'hi'}, 'path': '/api/x'}
+
+
 @unittest.skipUnless(purecdp.find_browser(), 'no Chromium-based browser found')
 class MCPAgentLoopE2ETests(unittest.IsolatedAsyncioTestCase):
     '''M15 native driving: the act -> requests -> request(select) loop an agent

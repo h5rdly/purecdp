@@ -319,6 +319,29 @@ async def test_title(cdp_page):
     assert await cdp_page.title() == "hi"
 ```
 
+### Waiting: the page decides, not `sleep`
+
+If you have written `for _ in range(40): ... await asyncio.sleep(0.25)`, one of
+these is what you meant — and each one raises with a *diagnosis* (what WAS
+there, what the recorder DID see) instead of timing out silently:
+
+| you are waiting for | the call |
+|---|---|
+| an element to appear | `await page.wait_for("#ok")` · `await page.live("#ok").should(visible=True)` |
+| it to go away | `await page.wait_for(".spinner", count=0)` · `.should(count=0)` |
+| a button to become enabled | `await page.live("button[type=submit]").should(enabled=True)` |
+| text / a value to settle | `.should(text="Saved")` · `.should(value=re.compile(r"\d+"))` |
+| any JS condition | `await page.wait_for_function("window.app?.ready === true")` |
+| a response | `turn = rec.expect(where=...)` before the trigger, `await turn.value` after |
+| N responses | `await rec.wait_for(count=2, where=lambda e: e.status != 202)` |
+| a navigation | `async with page.expect_navigation(): await page.click("a")` |
+| the network to go quiet | `await page.goto(url, wait="idle")` · `await page.wait_for_network_idle()` |
+| a download | `dl = page.expect_download(); await page.click("#export"); await dl.value` |
+
+Actions wait for themselves: `live(...).click()` / `.fill()` / `.type()` auto-wait
+for actionability, and `page.query()` waits for presence. The only `sleep`
+left in a good drive is none.
+
 ### Typing: which call fires which events
 
 The classic silent failure: a framework autocompletes on `keydown`, you write
@@ -327,7 +350,7 @@ fires, because nothing ever pressed a key. Know what each call emits:
 
 | call | key events | input events | speed | use when |
 |---|---|---|---|---|
-| `set_value` | none | synthetic `input`+`change` | instant | controlled (React) inputs, bulk state |
+| `set_value` | none | synthetic `input`+`change` | instant | instant bulk write (React-safe — so is `type`) |
 | `el.type(text, insert=True)` | none | one real `input` | 1 round trip | big text, key events unwanted |
 | `el.type(text)` | per char | per char | fast | **default** — anything listening to keys |
 | `page.human_type` | per char | per char | human cadence | stealth / behavioral realism |
@@ -335,6 +358,14 @@ fires, because nothing ever pressed a key. Know what each call emits:
 
 `type()` sends real per-key events by default (0.7.0 — the surprising
 behavior became the opt-in, not the default).
+
+Both `type` and `set_value` reach controlled inputs — verified against React
+18, where three keystrokes are three `onChange` calls. If either ever "did
+nothing", the handle was **stale**: the app re-rendered after you queried, the
+node you hold is detached, and keys sent to it vanished. Since 0.9.0 that is
+an `ActionabilityError` (reason `detached`, or `unfocused` for a hidden /
+disabled field) instead of silence — re-query, or use a `live()` locator,
+which re-resolves on every action.
 
 ### Failures leave artifacts behind
 
@@ -378,6 +409,24 @@ Traffic your test records itself with `page.record()` is dumped regardless of
 
 `dump_artifacts(pages, dest, exc=...)` is also importable directly for ad-hoc
 scripts (call it in your `except` block while the browser is still up).
+
+A standalone *drive* script — not a test case, just a sequence of checks
+against a real deployment — gets the same failure capture from `Checks`, the
+one piece of a test framework a script lacks:
+
+```python
+from purecdp.testing import Checks
+
+async with Checks(page, dest="purecdp-artifacts/qb-drive") as checks:
+    await checks.check("form renders", await page.live("form").count() == 1)
+    await checks.check("turn posted", turn.status == 200, detail=turn.text[:200])
+sys.exit(checks.finish())          # prints "N passed, M failed", returns 0/1
+```
+
+Each check prints `PASS`/`FAIL` as it happens; a failed check dumps the pages'
+artifacts under `<dest>/<check-slug>/` *right then*, and an exception escaping
+the block lands under `<dest>/crash/` before it re-raises. Nothing else — no
+timing, colours, or reports.
 
 ### Locators (`live`) + auto-retrying assertions — the robust way for SPAs
 
@@ -473,6 +522,28 @@ await self.page.route("*/api/orders", handler)
 await self.page.route(lambda u: u.endswith("/track") and "beacon" not in u, handler)
 ```
 
+The request object is complete — `request.url`, `.method`, `.headers`,
+`.header("content-type")`, `.post_data` / `.post_data_bytes`, `.json` — so a
+handler can branch on what was posted without reaching into the event.
+
+**Or forward instead of stub.** A frontend served from a dev server expects
+`/api/...` on its own origin to reach the real backend; `relay` is that dev
+proxy without running one — the sibling of `mock_api`, stub or forward:
+
+```python
+await self.page.relay("/api/", "http://127.0.0.1:8000")     # path prefix → origin
+await self.page.mock_api({"/api/flags": {"beta": True}})   # stub one path, relay the rest
+```
+
+Matching routes run in registration order until one *handles* the request,
+so a mock for one path and a relay for the rest compose either way round.
+The relay is transparent (method, query, body, `Cookie`/`Origin` go through;
+`Set-Cookie` and 4xx/5xx come back as-is; an unreachable target answers 502
+naming it), runs stdlib `urllib` on a worker thread, and takes
+`headers={"Authorization": ...}` for the real backend. Limits: whole-body
+only — no streaming, so no SSE through a relay — and dev/test origins, not a
+general proxy.
+
 ### Assert on the traffic itself
 
 `page.record()` captures full exchanges (request body, status, response body)
@@ -503,10 +574,22 @@ ex.timestamp, ex.duration                      # epoch seconds; total seconds
 ```
 
 `expect(json=True)` resolves to the first new exchange whose body parses as
-JSON, skipping interleaved non-JSON responses (a dev proxy's HTML error page)
-— after `.value` resolves, `turn.skipped` lists exactly what was passed over
+JSON, skipping interleaved non-JSON responses (a dev proxy's HTML error page);
+`expect(where=...)` is the general form — any `callable(exchange) -> bool`.
+After `.value` resolves, `turn.skipped` lists exactly what was passed over
 (log it if you care), the skipped ones stay in `rec.exchanges`, and `turn.new`
-lists everything captured since arming. The lower-level
+lists everything captured since arming. When one exchange isn't the story —
+a page that retries the same turn while a profile is pending, and you need
+"at least two POSTs that are not 202" — `wait_for(count=)` returns the list:
+
+```python
+settled = lambda e: e.method == "POST" and e.status != 202
+turn = rec.expect(where=settled)                 # the first settled answer …
+turns = await rec.wait_for(count=2, where=settled, timeout=30)   # … or two of them
+```
+
+`since=0` (the default) counts the whole capture — already-satisfied returns at
+once; `since=len(rec.exchanges)` windows to what comes next. The lower-level
 `rec.wait_for_next(previous_len)` is still there when you want to walk
 exchanges by index (burst-safe: exchanges landing together come back one per
 call, oldest first).
@@ -532,6 +615,11 @@ ExpectTimeout: no JSON-bodied exchange matching '/GetObjectInfo' completed
 within 10s; 2 still in flight (request sent, no response): https://x/api/slow;
 4 requests never matched the recorder's filter
 ```
+
+With a count it says how far it got — `1 of 2 exchanges passing where=
+matching '/turn' completed within 30s; 1 completed since arming but skipped
+by where=: https://x/turn` — so "the page never retried" and "the retry was
+another 202" are different messages.
 
 Exchanges carry the **wire** headers (`ex.request_headers` / `ex.response_headers`
 — the `*ExtraInfo` events merged in, so `Cookie`, `Origin`, `Sec-*` and
@@ -832,6 +920,7 @@ itself* (an SPA mid-flow, an unsaved form), attach to it directly:
 ```python
 page = await browser.attach(url_contains="kais")     # the tab, armed as a Page
 page = await browser.attach(target_id="A1B2...")     # or by exact id
+page = await browser.attach()                        # "the realized page tab"
 ```
 
 No match raises `TargetNotFound` listing the page targets that *do* exist;
@@ -839,6 +928,16 @@ several matches raise it too, with the candidate ids — pass `target_id=` to
 pick one, because guessing would mean driving the wrong tab of a browser a
 human may be using. Arming enables CDP domains on the tab; for a
 low-observability attach pass `capture=False, track_network=False`.
+
+No-arg `attach()` means "just give me the usable tab": only targets whose URL
+begins `http`/`https`/`about`/`file`/`data` count, which skips empty-URL
+zombie targets (created over CDP but never adopted — driving one hangs) and
+browser-UI surfaces like `chrome://newtab`. That matters on Chromium forks
+with their own tab UI — **Vivaldi** accepts `Target.createTarget` but the tab
+never comes to exist, so `new_session()`/`new_page()` raise
+`TargetNotRealized` there instead of hanging, and attaching to an existing
+tab is the way to drive it. Reusing one attached tab for a whole run is also
+the leak-free pattern on any browser.
 
 For a raw listing, `purecdp.discovery.list_targets(port=9222)` returns every
 target as a dict (`id`, `type`, `url`, `title`, `webSocketDebuggerUrl`); feed

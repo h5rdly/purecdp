@@ -18,7 +18,7 @@ _SRC = str(pathlib.Path(__file__).resolve().parents[1] / 'src')
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from purecdp.testing import CDPTestCase, Exchange, dump_artifacts  # noqa: E402
+from purecdp.testing import Checks, CDPTestCase, Exchange, dump_artifacts  # noqa: E402
 from purecdp.testing.artifacts import (  # noqa: E402
     _clip, _sanitize, artifacts_dir,
 )
@@ -154,6 +154,100 @@ class DumpArtifactsTests(unittest.TestCase):
                                        exc='formatted traceback text'))
             assert sorted(os.listdir(dest)) == ['info.txt']   # stale wiped
             assert 'formatted traceback text' in _read(dest, 'info.txt')
+
+
+class ChecksTests(unittest.TestCase):
+    '''Checks: the drive-script tally whose failures dump artifacts.'''
+
+    def run_checks(self, body, *pages, dest):
+        import io
+        out = io.StringIO()
+        checks = Checks(*pages, dest=dest, stream=out)
+
+        async def go():
+            async with checks:
+                await body(checks)
+        asyncio.run(go())
+        return checks, out.getvalue()
+
+    def test_tally_exit_code_and_live_lines(self):
+        async def body(checks):
+            assert await checks.check('renders', True) is True
+            assert await checks.check('posts', False, detail='got 500') is False
+            await checks.check('ok again', True)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            checks, out = self.run_checks(body, FakePage(), dest=tmp)
+            code = checks.finish()
+        assert code == 1
+        assert checks.passed == ['renders', 'ok again']
+        assert checks.failed == [('posts', 'got 500')]
+        lines = out.splitlines()
+        assert lines[0] == 'PASS renders'
+        assert lines[1] == 'FAIL posts — got 500'
+        assert lines[2].strip().startswith('artifacts: ')
+        assert lines[3] == 'PASS ok again'
+
+    def test_all_passed_is_zero_and_writes_nothing(self):
+        async def body(checks):
+            await checks.check('a', True)
+            await checks.check('b', True)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, 'drive')
+            checks, out = self.run_checks(body, FakePage(), dest=dest)
+            assert checks.finish() == 0
+            assert not os.path.exists(dest)
+
+    def test_failed_check_dumps_under_its_slug_and_dedupes(self):
+        async def body(checks):
+            await checks.check('Login shows form', False)
+            await checks.check('Login shows form', False)   # same name again
+
+        with tempfile.TemporaryDirectory() as tmp:
+            checks, _ = self.run_checks(
+                body, FakePage(console=[ConsoleMessage('log', 'hi')]), dest=tmp)
+            assert sorted(os.listdir(tmp)) == ['login-shows-form', 'login-shows-form-2']
+            manifest = pathlib.Path(tmp, 'login-shows-form', 'info.txt').read_text()
+            assert 'check failed: Login shows form' in manifest
+            assert os.path.exists(os.path.join(tmp, 'login-shows-form', 'screenshot.png'))
+            assert os.path.exists(os.path.join(tmp, 'login-shows-form', 'console.log'))
+
+    def test_crash_dumps_and_rethrows(self):
+        async def body(checks):
+            await checks.check('before', True)
+            raise RuntimeError('drive blew up')
+
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                self.run_checks(body, FakePage(), dest=tmp)
+            except RuntimeError as exc:
+                assert str(exc) == 'drive blew up'
+            else:
+                raise AssertionError('crash was swallowed')
+            manifest = pathlib.Path(tmp, 'crash', 'info.txt').read_text()
+            assert 'RuntimeError: drive blew up' in manifest
+
+    def test_without_pages_tallies_but_dumps_nothing(self):
+        async def body(checks):
+            await checks.check('x', False, detail='no page to dump')
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, 'drive')
+            checks, out = self.run_checks(body, dest=dest)
+            assert checks.finish() == 1
+            assert not os.path.exists(dest)
+            assert 'artifacts:' not in out
+
+    def test_finish_lists_the_failures(self):
+        import io
+        checks = Checks(dest='unused', stream=io.StringIO())
+        asyncio.run(checks.check('one', False, detail='d1'))
+        asyncio.run(checks.check('two', True))
+        out = io.StringIO()
+        checks._stream = out
+        assert checks.finish() == 1
+        assert out.getvalue().splitlines() == ['1 passed, 1 failed', '  FAIL one — d1']
 
 
 class _BrowserlessCase(CDPTestCase):

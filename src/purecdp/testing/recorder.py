@@ -210,6 +210,15 @@ def _body_expected(exchange: Exchange) -> bool:
     return status not in (204, 304) and not (300 <= status < 400)
 
 
+#: ``where=`` filter: any callable over a completed Exchange.
+Filter = typing.Callable[[Exchange], bool]
+
+
+def _passes(exchange: Exchange, json: bool, where: Filter | None) -> bool:
+    return ((not json or _parses_as_json(exchange))
+            and (where is None or bool(where(exchange))))
+
+
 def _parses_as_json(exchange: Exchange) -> bool:
     if exchange.body is None:
         return False
@@ -238,10 +247,11 @@ class _ExchangeExpectation:
     works held as a plain object or as an ``async with`` around the trigger.'''
 
     def __init__(self, recorder: NetworkRecorder, mark: int, *,
-                 json: bool, timeout: float | None):
+                 json: bool, where: Filter | None, timeout: float | None):
         self._recorder = recorder
         self._mark = mark
         self._json = json
+        self._where = where
         self._timeout = timeout
         self._resolved: Exchange | None = None
 
@@ -258,10 +268,11 @@ class _ExchangeExpectation:
 
     @property
     def skipped(self) -> list[Exchange]:
-        '''The exchanges a ``json=True`` filter passed over before the one
-        ``.value`` resolved to — what a proxy error page looks like when you
-        want to log it. Empty until ``.value`` has resolved (and always empty
-        without ``json=True``, which skips nothing).'''
+        '''The exchanges the ``json=True`` / ``where=`` filter passed over
+        before the one ``.value`` resolved to — what a proxy error page or a
+        202-retry looks like when you want to log it. Empty until ``.value``
+        has resolved (and always empty without a filter, which skips
+        nothing).'''
         out: list[Exchange] = []
         if self._resolved is not None:
             for exchange in self.new:
@@ -277,7 +288,8 @@ class _ExchangeExpectation:
     async def _resolve(self) -> Exchange:
         if self._resolved is None:
             self._resolved = await self._recorder.wait_for_next(
-                self._mark, json=self._json, timeout=self._timeout)
+                self._mark, json=self._json, where=self._where,
+                timeout=self._timeout)
         return self._resolved
 
 
@@ -384,8 +396,8 @@ class NetworkRecorder:
             json_mod.dump(har, fh, indent=2)
         return len(har['log']['entries'])
 
-    def expect(self, *, json: bool = False, timeout: float | None = None
-               ) -> _ExchangeExpectation:
+    def expect(self, *, json: bool = False, where: Filter | None = None,
+               timeout: float | None = None) -> _ExchangeExpectation:
         '''Arm a wait for the next exchange BEFORE triggering it::
 
             turn = recorder.expect(json=True)
@@ -396,27 +408,57 @@ class NetworkRecorder:
         current position, so the length-bookkeeping ``wait_for_next`` needs is
         done for you and nothing that lands in between is missed. ``json=True``
         resolves to the first new exchange whose body parses as JSON, skipping
-        those that don't (a dev proxy's interleaved HTML error page) — after
-        ``.value`` resolves, ``.skipped`` lists exactly what was passed over,
-        and everything stays in ``.new`` / ``exchanges``. Timeout: the
+        those that don't (a dev proxy's interleaved HTML error page);
+        ``where=`` is the general form — any ``callable(exchange) -> bool``,
+        e.g. ``where=lambda e: e.method == 'POST' and e.status != 202`` to
+        wait past the accepted-but-pending retries. After ``.value``
+        resolves, ``.skipped`` lists exactly what was passed over, and
+        everything stays in ``.new`` / ``exchanges``. Timeout: the
         ``timeout`` argument, else the recorder's ``default_timeout``, else
         the page default.'''
         return _ExchangeExpectation(self, len(self.exchanges),
-                                    json=json, timeout=timeout)
+                                    json=json, where=where, timeout=timeout)
 
     async def wait_for_next(
         self, previous_count: int, *,
-        json: bool = False, timeout: float | None = None,
+        json: bool = False, where: Filter | None = None,
+        timeout: float | None = None,
     ) -> Exchange:
         '''The first exchange past ``previous_count``, waiting for it if
         needed. Burst-safe: exchanges landing together are returned one per
         call, oldest first. ``json=True`` returns the first whose body parses
-        as JSON, skipping those that don't (they stay in ``exchanges``).
-        :meth:`expect` wraps this with the position captured for you. Timeout
-        resolution: the ``timeout`` argument, else the recorder's
-        ``default_timeout``, else the page default. On expiry raises
-        :class:`ExpectTimeout`, whose message says what the recorder DID see.'''
-        index = previous_count
+        as JSON, ``where=`` the first passing the callable — the others stay
+        in ``exchanges``. :meth:`expect` wraps this with the position captured
+        for you. Timeout resolution: the ``timeout`` argument, else the
+        recorder's ``default_timeout``, else the page default. On expiry
+        raises :class:`ExpectTimeout`, whose message says what the recorder
+        DID see.'''
+        matched = await self._collect(previous_count, 1, json, where, timeout)
+        return matched[0]
+
+    async def wait_for(
+        self, *, count: int = 1, where: Filter | None = None,
+        json: bool = False, since: int = 0, timeout: float | None = None,
+    ) -> list[Exchange]:
+        '''Wait until ``count`` recorded exchanges (from index ``since``)
+        pass the filter, and return them oldest first. "At least two POSTs
+        that are not 202" — a page that retries a turn while something is
+        pending — is::
+
+            turns = await recorder.wait_for(
+                count=2, where=lambda e: e.method == 'POST' and e.status != 202)
+
+        ``since=0`` counts the whole capture (already-satisfied returns at
+        once); ``since=len(recorder.exchanges)`` windows to what comes next.
+        On expiry raises :class:`ExpectTimeout` saying how many of ``count``
+        were seen and what was skipped.'''
+        return await self._collect(since, count, json, where, timeout)
+
+    async def _collect(self, mark: int, count: int, json: bool,
+                       where: Filter | None, timeout: float | None
+                       ) -> list[Exchange]:
+        index = mark
+        matched: list[Exchange] = []
         wait = (timeout or self.default_timeout or self._page.default_timeout)
         try:
             async with asyncio.timeout(wait):
@@ -424,15 +466,20 @@ class NetworkRecorder:
                     while index < len(self.exchanges):
                         exchange = self.exchanges[index]
                         index += 1
-                        if not json or _parses_as_json(exchange):
-                            return exchange
+                        if _passes(exchange, json, where):
+                            matched.append(exchange)
+                            if len(matched) >= count:
+                                return matched
                     self._appended.clear()
                     await self._appended.wait()
         except TimeoutError:
-            raise ExpectTimeout(
-                self._timeout_message(previous_count, json, wait)) from None
+            raise ExpectTimeout(self._timeout_message(
+                mark, wait, json=json, where=where,
+                matched=len(matched), count=count)) from None
 
-    def _timeout_message(self, mark: int, json_only: bool, wait: float) -> str:
+    def _timeout_message(self, mark: int, wait: float, *, json: bool = False,
+                         where: Filter | None = None, matched: int = 0,
+                         count: int = 1) -> str:
         '''What the recorder saw while a wait came up empty — the near-miss
         report that turns "timed out" into a diagnosis.'''
         def urls(items: list) -> str:
@@ -446,12 +493,19 @@ class NetworkRecorder:
             wanted = f' matching {self._needle!r}'
         else:
             wanted = ''
-        what = 'no JSON-bodied exchange' if json_only else 'no exchange'
-        parts = [f'{what}{wanted} completed within {wait:g}s']
-        seen = self.exchanges[mark:]
+        noun = 'JSON-bodied exchange' if json else 'exchange'
+        filt = ' passing where=' if where is not None else ''
+        head = (f'{matched} of {count} {noun}s{filt}' if count > 1
+                else f'no {noun}{filt}')
+        parts = [f'{head}{wanted} completed within {wait:g}s']
+        seen = [e for e in self.exchanges[mark:]
+                if not _passes(e, json, where)]
         if seen:
+            reason = ('as non-JSON' if json and where is None
+                      else 'by where=' if not json
+                      else 'as non-JSON or by where=')
             parts.append(f'{len(seen)} completed since arming but skipped '
-                         f'as non-JSON: {urls(seen)}')
+                         f'{reason}: {urls(seen)}')
         in_flight = list(self._pending.values())
         if in_flight:
             parts.append(f'{len(in_flight)} still in flight (request sent, '
@@ -459,7 +513,7 @@ class NetworkRecorder:
         if self._unmatched:
             parts.append(f"{len(self._unmatched)} requests never matched the "
                          f"recorder's filter")
-        if not (seen or in_flight or self._unmatched):
+        if not (seen or matched or in_flight or self._unmatched):
             parts.append('no traffic seen at all — armed after the trigger, '
                          'or the filter matches nothing')
         return '; '.join(parts)

@@ -88,6 +88,14 @@ class TargetNotFound(PureCDPError):
     may be using).'''
 
 
+class TargetNotRealized(PureCDPError):
+    '''``Target.createTarget`` returned an id, but the tab never became real:
+    its URL stayed empty and no renderer appeared, so any navigation on it
+    would hang forever. Some Chromium forks with their own tab UI (Vivaldi
+    confirmed) accept the command without adopting the tab. The fix is to
+    drive an EXISTING tab instead: ``browser.attach()``.'''
+
+
 class BrowserLaunchError(PureCDPError):
     '''The browser binary could not be found, failed to start, or never
     published its debugging endpoint.'''

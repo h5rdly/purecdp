@@ -186,3 +186,86 @@ async def dump_artifacts(
     with open(os.path.join(dest, 'info.txt'), 'w', encoding='utf-8') as f:
         f.write('\n'.join(manifest) + '\n')
     return dest
+
+
+class Checks:
+    '''PASS/FAIL bookkeeping for a standalone drive script — the one piece
+    of a test framework a script lacks: a failed check dumps artifacts for
+    the pages RIGHT THEN (screenshot, HTML, console, recorded network)
+    under ``<dest>/<check-slug>/``, and an exception escaping the
+    ``async with`` block dumps them under ``<dest>/crash/`` before
+    re-raising. ``finish()`` prints the tally and returns the exit code
+    (never calls ``sys.exit`` — the caller owns the process)::
+
+        async with Checks(page, dest='purecdp-artifacts/qb-drive') as checks:
+            await checks.check('form renders',
+                               await page.live('form').count() == 1)
+            await checks.check('turn posted', turn.status == 200,
+                               detail=turn.text[:200])
+        sys.exit(checks.finish())
+
+    Each check prints ``PASS name`` / ``FAIL name — detail`` as it happens
+    (drives are watched live). ``dest`` defaults to ``drive/`` under
+    :func:`artifacts_dir` (so ``$PURECDP_ARTIFACTS_DIR`` is honoured).
+    Nothing else — no timing, colours, or reports.'''
+
+    def __init__(self, *pages: Page, dest: str | None = None,
+                 stream: typing.TextIO | None = None) -> None:
+        self._pages = list(pages)
+        self.dest = dest or os.path.join(artifacts_dir(), 'drive')
+        self._stream = stream
+        self.passed: list[str] = []
+        self.failed: list[tuple[str, str]] = []
+        self._slugs: set[str] = set()
+
+    def _say(self, line: str) -> None:
+        import sys
+        print(line, file=self._stream or sys.stdout, flush=True)
+
+    def _slug(self, name: str) -> str:
+        base = _sanitize(name.strip().lower().replace(' ', '-'))
+        slug, n = base, 1
+        while slug in self._slugs:
+            n += 1
+            slug = f'{base}-{n}'
+        self._slugs.add(slug)
+        return slug
+
+    async def _dump(self, subdir: str, exc: BaseException | str) -> str | None:
+        if not self._pages:
+            return None
+        return await dump_artifacts(self._pages,
+                                    os.path.join(self.dest, subdir),
+                                    test_id=subdir, exc=exc)
+
+    async def check(self, name: str, ok: bool, *, detail: str = '') -> bool:
+        '''Record one check; a failure dumps artifacts under its slug.'''
+        if ok:
+            self.passed.append(name)
+            self._say(f'PASS {name}')
+            return True
+        self.failed.append((name, detail))
+        self._say(f'FAIL {name}' + (f' — {detail}' if detail else ''))
+        where = await self._dump(self._slug(name), f'check failed: {name}'
+                                 + (f'\n{detail}' if detail else ''))
+        if where:
+            self._say(f'     artifacts: {where}')
+        return False
+
+    def finish(self) -> int:
+        '''Print the tally and the failed names; 0 if all passed, else 1.'''
+        self._say(f'{len(self.passed)} passed, {len(self.failed)} failed')
+        for name, detail in self.failed:
+            self._say(f'  FAIL {name}' + (f' — {detail}' if detail else ''))
+        return 0 if not self.failed else 1
+
+    async def __aenter__(self) -> Checks:
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        if exc is not None:
+            self._say(f'CRASH {type(exc).__name__}: {exc}')
+            where = await self._dump('crash', exc)
+            if where:
+                self._say(f'     artifacts: {where}')
+        return False  # never swallows

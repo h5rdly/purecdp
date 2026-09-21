@@ -260,6 +260,47 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             assert str(session.target_info.url) == 'about:blank'
             await session.execute(page.enable())  # session is usable
 
+    async def test_unrealized_target_raises_instead_of_hanging(self):
+        # Vivaldi-style: createTarget hands out an id but the tab never comes
+        # to exist (URL stays empty, no renderer) — new_session must raise,
+        # not return a session whose every command hangs forever
+        fake, transport, conn = self.make()
+        fake.unrealized_targets = True
+        fake.product = 'Vivaldi/7.7.3851.50'
+        async with conn:
+            try:
+                await purecdp.new_session(conn, 'https://example.org/',
+                                          realize_timeout=0.2)
+            except purecdp.TargetNotRealized as exc:
+                assert 'Vivaldi/7.7.3851.50' in str(exc)  # names the culprit
+                assert 'browser.attach()' in str(exc)     # says the way out
+            else:
+                raise AssertionError('expected TargetNotRealized')
+            await drain()
+            # the zombie was closed, not left to trap the next attach()
+            assert not fake.targets
+
+    async def test_realize_check_can_be_skipped(self):
+        fake, transport, conn = self.make()
+        fake.unrealized_targets = True
+        async with conn:
+            session = await purecdp.new_session(conn, 'about:blank',
+                                                realize_timeout=None)
+            assert session.target_id == 'T-1'
+
+    async def test_browser_realize_timeout_forwards(self):
+        fake, transport, conn = self.make()
+        fake.unrealized_targets = True
+        async with conn:
+            browser = purecdp.Browser(None, conn, '', False)
+            browser.realize_timeout = 0.1
+            try:
+                await browser.new_session()
+            except purecdp.TargetNotRealized:
+                pass
+            else:
+                raise AssertionError('expected TargetNotRealized')
+
     async def test_attach_is_idempotent_per_target(self):
         # a second CDP attach would create a second session that duplicates
         # every event (the auto-attach + explicit-attach combo); attach()

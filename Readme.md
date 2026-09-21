@@ -46,8 +46,8 @@ browser a *human* just logged into (password, MFA), so an agent can inherit the
 authenticated session while the credentials never touch the automation; a new
 tab shares the profile's cookies, so it's signed in from birth — and
 `browser.attach(url_contains="kais")` grabs an already-*open* tab as a ready
-`Page` (no match, or several, raises `TargetNotFound` naming the tabs that
-do exist).
+`Page` (no-arg `attach()` = the realized page tab; no match, or several,
+raises `TargetNotFound` naming the tabs that do exist).
 `browser.new_context()` gives an isolated cookies/storage context (cheap per-test
 isolation); `connection.set_auto_attach()` auto-attaches popups/workers/OOPIFs,
 resuming paused targets automatically.
@@ -77,21 +77,29 @@ class MyAppTests(CDPTestCase):
 `wait_for(selector, **conditions)` (present / `visible=False` gone-or-hidden /
 `count=0` absent — the `should()` vocabulary), `wait_for_function`, `click`,
 `query`/`query_all` (held elements, text-filtered, stale-copy-proof),
-`screenshot`, always-on `page.console` / `page.js_errors` capture, and
-`page.route()` request stubbing/rewriting/aborting. For traffic-level
+`screenshot`, always-on `page.console` / `page.js_errors` capture,
+`page.route()` request stubbing/rewriting/aborting (the intercepted request
+exposes `.post_data` / `.json` / `.header()`), `page.mock_api()` for
+path-keyed stubs and `page.relay(prefix, origin)` to forward a path prefix to
+a real backend — stub or forward, composable either way. An action on a
+handle the app has since replaced raises `ActionabilityError` (`detached`)
+rather than typing into the void. For traffic-level
 assertions there's `page.record()` (full request/response exchanges — the
 *wire* headers, `Cookie` / `Origin` / `Set-Cookie` included, plus bodies, and
 `parse_sse()` for streamed ones) and `page.expect_download()` (capture a
 download's bytes without touching disk); arm `recorder.expect()` before a
 click and `await .value` for the response it triggers (`json=True` skips
-interleaved non-JSON bodies), and `recorder.save_har()` writes the whole
+interleaved non-JSON bodies, `where=` takes any predicate), `recorder.wait_for(count=2,
+where=...)` waits for several, and `recorder.save_har()` writes the whole
 capture as a HAR any devtools opens. Sensitive flows keep their privacy:
 `record(bodies=False)` captures metadata only, and `record(redact=...)` makes
 matching exchanges fully private (no bodies, credential headers masked) — the
 secret never enters the process. And when a test fails, its pages
 are dumped as diagnostic artifacts — screenshot, HTML, console, recorded
 traffic, traceback — under `purecdp-artifacts/<test id>/` before the browser
-closes; green tests write nothing. Long-running watchers get an honest
+closes; green tests write nothing (standalone drive scripts get the same
+from `Checks`: a failed `check()` dumps artifacts right then). Long-running
+watchers get an honest
 give-up signal: `page.alive` (False once the tab or browser is gone; no
 round-trip) and the `CDPClosedError` base (`CDPSessionClosed` +
 `CDPConnectionClosed`), so `while page.alive:` with
@@ -183,6 +191,15 @@ Lessons from real scraping/automation runs, cheapest first:
   `BrowserLaunchError: profile … in use by PID N`, a stale `DevToolsActivePort`
   is cleared (it used to surface as a baffling `ConnectionRefusedError` to a
   dead port), and any launch failure quotes the browser's own stderr.
+- **Some Chromium forks never realize CDP-created tabs.** Vivaldi (confirmed)
+  accepts `Target.createTarget`, returns an id, even lets you attach — but
+  the tab never comes to exist: its URL stays empty, there is no renderer,
+  and any navigation on it hangs forever. `new_session()`/`new_page()` detect
+  this and raise `TargetNotRealized` naming the browser instead of hanging.
+  The fix is to drive an *existing* tab: no-arg `browser.attach()` picks the
+  realized page tab, skipping empty-URL zombies and `chrome://`-style UI
+  targets. Likely applies to other forks with their own tab UI (Opera, Arc) —
+  "attach works, create doesn't."
 - **Search-engine bot walls are IP-reputation, not fingerprints.** From a
   flagged IP, `stealth=True` does not move the needle on google.com/search —
   yet Google *Maps* place pages load fine in the same session, and

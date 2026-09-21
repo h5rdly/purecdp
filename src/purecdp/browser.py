@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 
 from .connection import Connection
 from .discovery import get_version
-from .errors import BrowserLaunchError, TargetNotFound
+from .errors import BrowserLaunchError, TargetNotFound, TargetNotRealized
 from .transport.pipe import spawn_pipe_process
 from .transport.websocket import WebSocketTransport
 
@@ -124,14 +124,59 @@ async def new_context(connection: Connection) -> BrowserContext:
     return BrowserContext(connection, str(context_id))
 
 
+#: URL schemes marking a page target as a real, drivable tab — as opposed to
+#: empty-URL zombies (created but never adopted) and browser-UI surfaces
+#: (chrome://newtab, vivaldi://…, devtools://…), which no-arg attach() skips.
+_REALIZED_PAGE_SCHEMES = ('http://', 'https://', 'about:', 'file://', 'data:')
+
+
+async def _wait_target_realized(connection: Connection, target_id: str,
+                                timeout: float) -> None:
+    '''Raise TargetNotRealized unless the created target gets real (non-empty
+    URL, i.e. a renderer) within ``timeout``. Chrome/Brave realize instantly,
+    so the first poll succeeds; the deadline only ever bites on browsers that
+    silently drop CDP-created tabs — where the alternative is that the
+    caller's first navigation hangs forever.'''
+    from .protocol import target as _target
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    tid = _target.TargetID(target_id)
+    while True:
+        info = await connection.execute(_target.get_target_info(tid))
+        if info.url:
+            return
+        if loop.time() >= deadline:
+            break
+        await asyncio.sleep(0.05)
+    product = ''
+    with suppress(Exception):
+        from .protocol import browser as _browser
+        version = await connection.execute(_browser.get_version())
+        product = f' ({version[1]})'
+    raise TargetNotRealized(
+        f'target {target_id} was created but never realized within '
+        f'{timeout:.1f}s — its URL stayed empty, so it has no renderer and '
+        f'any navigation on it would hang. This browser{product} likely '
+        f'does not adopt CDP-created tabs into its UI (Vivaldi is a known '
+        f'case) — drive an existing tab instead: browser.attach()')
+
+
 async def new_session(
     connection: Connection,
     url: str = 'about:blank',
     *,
     browser_context_id: str | None = None,
+    realize_timeout: float | None = 3.0,
 ):
     '''Create a page target (optionally inside a context) and attach to it.
-    Returns the page's Session.'''
+    Returns the page's Session.
+
+    Verifies the target actually materializes (some Chromium forks accept
+    ``Target.createTarget`` and return an id for a tab that never comes to
+    exist); a target still unrealized after ``realize_timeout`` seconds
+    raises :class:`TargetNotRealized` instead of leaving a session whose
+    every command hangs. Pass ``realize_timeout=None`` to skip the check.'''
     from .protocol import browser as _browser
     from .protocol import target as _target
 
@@ -139,7 +184,19 @@ async def new_session(
                if browser_context_id else None)
     target_id = await connection.execute(
         _target.create_target(url=url, browser_context_id=context))
-    return await connection.attach(str(target_id))
+    session = await connection.attach(str(target_id))
+    if realize_timeout is not None:
+        try:
+            await _wait_target_realized(connection, str(target_id),
+                                        realize_timeout)
+        except TargetNotRealized:
+            # best effort: don't leave the zombie behind — a later
+            # unfiltered attach/cleanup would grab it and hang too
+            with suppress(Exception):
+                await connection.execute(_target.close_target(
+                    _target.TargetID(str(target_id))))
+            raise
+    return session
 
 
 async def close_page(connection: Connection, session) -> None:
@@ -176,6 +233,12 @@ class Browser:
         self._owns_profile = owns_profile
         self._stderr_tail = stderr_tail
 
+    #: How long a created target gets to realize (non-empty URL = renderer
+    #: present) before new_session()/new_page() raise TargetNotRealized
+    #: instead of handing back a tab whose every command would hang.
+    #: None skips the check.
+    realize_timeout: float | None = 3.0
+
     async def new_context(self) -> BrowserContext:
         return await new_context(self.connection)
 
@@ -183,10 +246,15 @@ class Browser:
                           context: BrowserContext | None = None):
         '''Create a page target (optionally in a context) and attach — returns
         the raw :class:`Session`; wrap it in ``testing.Page.create`` for the
-        high-level driver (or use :meth:`new_page`, which does both).'''
+        high-level driver (or use :meth:`new_page`, which does both).
+
+        Raises :class:`TargetNotRealized` when the browser accepted the
+        create but the tab never became real (see :attr:`realize_timeout`;
+        Vivaldi does this) — ``attach()`` is the way to drive such browsers.'''
         return await new_session(
             self.connection, url,
-            browser_context_id=context.context_id if context else None)
+            browser_context_id=context.context_id if context else None,
+            realize_timeout=self.realize_timeout)
 
     async def new_page(self, url: str = 'about:blank', *,
                        context: BrowserContext | None = None, **page_kw):
@@ -210,38 +278,55 @@ class Browser:
         attach, and arm. The missing half of :func:`connect`: connect() gets
         you the browser a human logged into, attach() gets you their tab.
 
+        With no selector at all, ``attach()`` means "the realized page tab":
+        only targets whose URL begins http/https/about/file/data count —
+        skipping empty-URL zombies (created but never adopted; driving one
+        hangs) and browser-UI targets (``chrome://…``, ``vivaldi://…``).
+        The common case on tab-quirky browsers like Vivaldi, where
+        creating tabs doesn't work but attaching does.
+
         Raises :class:`TargetNotFound` when nothing matches (the message
-        lists the page targets that DO exist) or when ``url_contains``
-        matches several tabs (the message lists their ids — pass
-        ``target_id=`` to pick one; guessing would mean driving the wrong
-        tab). ``page_kw`` forwards to :meth:`testing.Page.create`; arming
-        enables CDP domains on the tab, so for a low-observability attach
-        pass ``capture=False, track_network=False``.'''
+        lists the page targets that DO exist) or when several tabs match
+        (the message lists their ids — pass ``target_id=`` to pick one;
+        guessing would mean driving the wrong tab). ``page_kw`` forwards to
+        :meth:`testing.Page.create`; arming enables CDP domains on the tab,
+        so for a low-observability attach pass ``capture=False,
+        track_network=False``.'''
         from .protocol import target as _target
         from .testing.page import Page  # lazy: testing sits above this module
 
-        if (url_contains is None) == (target_id is None):
-            raise ValueError('pass exactly one of url_contains= / target_id=')
+        if url_contains is not None and target_id is not None:
+            raise ValueError('pass at most one of url_contains= / target_id=')
         infos = await self.connection.execute(_target.get_targets())
         pages = [i for i in infos if i.type == 'page']
 
         def listing(items):
-            return ', '.join(f'{i.target_id} {i.url[:80]}' for i in items[:8])
+            return ', '.join(
+                f'{i.target_id} {i.url[:80] or "<unrealized: empty URL>"}'
+                for i in items[:8])
 
         if target_id is not None:
             matches = [i for i in pages if str(i.target_id) == target_id]
-        else:
+            wanted = f'target id {target_id!r}'
+        elif url_contains is not None:
             matches = [i for i in pages if url_contains in i.url]
+            wanted = f'URL containing {url_contains!r}'
+        else:
+            matches = [i for i in pages
+                       if i.url.startswith(_REALIZED_PAGE_SCHEMES)]
+            wanted = 'a realized URL (http/https/about/file/data)'
         if not matches:
-            wanted = (f'target id {target_id!r}' if target_id is not None
-                      else f'URL containing {url_contains!r}')
             raise TargetNotFound(
                 f'no page target with {wanted}; open page targets: '
                 f'{listing(pages) or "none"}')
         if len(matches) > 1:
+            described = (f'match {url_contains!r}' if url_contains is not None
+                         else 'are realized')
+            hint = ('target_id=' if url_contains is not None
+                    else 'url_contains= or target_id=')
             raise TargetNotFound(
-                f'{len(matches)} page targets match {url_contains!r} — pass '
-                f'target_id= to pick one: {listing(matches)}')
+                f'{len(matches)} page targets {described} — pass {hint} to '
+                f'pick one: {listing(matches)}')
         session = await self.connection.attach(str(matches[0].target_id))
         return await Page.create(session, **page_kw)
 
