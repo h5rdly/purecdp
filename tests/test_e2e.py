@@ -209,11 +209,18 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(60):
             async with await purecdp.launch(extra_args=EXTRA_ARGS) as browser:
                 # clear whatever initial tabs the browser opened, so exactly
-                # one realized page target remains
-                infos = await browser.connection.execute(_target.get_targets())
-                for info in infos:
-                    if info.type == 'page':
-                        await browser.close_target(str(info.target_id))
+                # one realized page target remains. closeTarget acknowledges
+                # BEFORE the target is gone from getTargets (a slow runner
+                # still listed the closed about:blank) — wait it out.
+                async def page_targets():
+                    infos = await browser.connection.execute(
+                        _target.get_targets())
+                    return [str(i.target_id) for i in infos if i.type == 'page']
+
+                for target_id in await page_targets():
+                    await browser.close_target(target_id)
+                while await page_targets():
+                    await asyncio.sleep(0.05)
                 session = await browser.new_session(
                     'data:text/html,<title>only-me</title>')
                 page = await browser.attach()
