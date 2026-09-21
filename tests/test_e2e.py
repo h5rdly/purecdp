@@ -208,24 +208,29 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
 
         async with asyncio.timeout(60):
             async with await purecdp.launch(extra_args=EXTRA_ARGS) as browser:
-                # Make ours the only page target. Create it FIRST: the CI
-                # runners' Chrome opens a fresh about:blank whenever a
-                # createTarget happens with no window alive, so closing
-                # everything and then creating leaves two tabs. And
-                # closeTarget acknowledges before the tab leaves getTargets,
-                # so wait until the listing agrees.
+                # Make ours the only REALIZED page target without touching
+                # the tab count: the hosted runners' Chrome re-spawns an
+                # about:blank whenever tabs get closed (three different
+                # timings seen on CI), so instead every other tab is sent to
+                # a chrome:// URL — exactly what the no-arg filter skips.
+                from purecdp.browser import _REALIZED_PAGE_SCHEMES
+                from purecdp.protocol import page as _page
+
                 session = await browser.new_session(
                     'data:text/html,<title>only-me</title>')
 
-                async def page_targets():
+                async def realized():
                     infos = await browser.connection.execute(
                         _target.get_targets())
-                    return [str(i.target_id) for i in infos if i.type == 'page']
+                    return [str(i.target_id) for i in infos
+                            if i.type == 'page'
+                            and i.url.startswith(_REALIZED_PAGE_SCHEMES)]
 
-                for target_id in await page_targets():
+                for target_id in await realized():
                     if target_id != session.target_id:
-                        await browser.close_target(target_id)
-                while await page_targets() != [session.target_id]:
+                        other = await browser.connection.attach(target_id)
+                        await other.execute(_page.navigate(url='chrome://version/'))
+                while await realized() != [session.target_id]:
                     await asyncio.sleep(0.05)
                 page = await browser.attach()
                 assert page.session.target_id == session.target_id
