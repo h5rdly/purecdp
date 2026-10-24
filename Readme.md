@@ -295,6 +295,29 @@ is the raw escape hatch, `await page.bidi.call("module.command", {...})`). No
 pipe transport. Chromium stays on CDP: Chrome's own BiDi endpoint is a mapper
 over CDP, so nothing is gained by switching it.
 
+### Drive your own Firefox
+
+Firefox only opens its remote agent when it is *started* with
+`--remote-debugging-port` (`0` = pick a free port; there is no way to turn it on
+afterwards), so give your daily Firefox that flag in its launcher. From then on:
+
+```python
+import purecdp
+
+profile = purecdp.find_firefox_profile()            # from profiles.ini
+browser = await purecdp.connect(user_data_dir=profile)   # reads WebDriverBiDiServer.json
+page = await browser.attach(url_contains="app.example")  # a tab you already have open
+token = await page.evaluate("localStorage.getItem('token')")
+await browser.aclose()                               # ends purecdp's session; Firefox stays up
+```
+
+`connect()` also takes the `ws://host:port/session` endpoint directly, or
+`browser="firefox"` with `host`/`port`. Firefox allows a single BiDi session at
+a time: a second client is refused with a message saying who to close, and
+purecdp releases its own session on `aclose()`. `launch(user_data_dir=profile)`
+is the other route (Firefox must be closed first): purecdp no longer writes its
+quiet-startup prefs into a profile it did not create.
+
 ## Layout
 
 ```

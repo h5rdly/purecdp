@@ -952,6 +952,32 @@ attached to; no hand-rolled `/json/close` HTTP calls).
 
 ---
 
+
+### Your own Firefox, with your logged-in tabs
+
+Firefox's remote agent exists only when Firefox was *started* with
+`--remote-debugging-port` (put it in your launcher; `0` picks a free port).
+Then purecdp attaches over WebDriver BiDi and the tabs you have open are
+reachable — the way to read a token your work session already holds:
+
+```python
+import purecdp
+
+profile = purecdp.find_firefox_profile()                 # profiles.ini -> the default profile dir
+browser = await purecdp.connect(user_data_dir=profile)   # reads <profile>/WebDriverBiDiServer.json
+page = await browser.attach(url_contains="app.example")  # an existing tab; attach() alone = the one realized tab
+token = await page.evaluate("localStorage.getItem('access_token')")
+cookies = await page.cookies(["https://app.example/"])
+await browser.aclose()      # ends purecdp's BiDi session — Firefox and the tab stay exactly as they were
+```
+
+Firefox allows **one** BiDi session at a time: while purecdp holds it, another
+client (or a second `connect()`) is refused with an error that says so; purecdp
+releases it on `aclose()`. A Firefox started without the flag cannot be reached
+by anything — the alternative is `launch(browser="firefox",
+user_data_dir=profile)` after closing Firefox, which starts a fresh instance on
+the same profile (cookies and storage included; purecdp leaves the profile's
+prefs alone).
 ## 8. Grab bag
 
 Handy one-liners drawn from the `Page` surface.

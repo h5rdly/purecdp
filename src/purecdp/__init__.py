@@ -22,6 +22,7 @@ from .browser import (
     browser_kind,
     find_browser,
     find_firefox,
+    find_firefox_profile,
     launch,
     new_context,
     new_session,
@@ -45,7 +46,7 @@ from .errors import (
 )
 from .transport import PipeTransport, WebSocketTransport
 
-__version__ = '0.10.0'
+__version__ = '0.10.1'
 
 __all__ = [
     'Connection',
@@ -60,6 +61,7 @@ __all__ = [
     'connect',
     'find_browser',
     'find_firefox',
+    'find_firefox_profile',
     'browser_kind',
     'FirefoxBrowser',
     'NotSupported',

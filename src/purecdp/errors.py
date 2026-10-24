@@ -98,7 +98,9 @@ class TargetNotRealized(PureCDPError):
 
 class BrowserLaunchError(PureCDPError):
     '''The browser binary could not be found, failed to start, or never
-    published its debugging endpoint.'''
+    published its debugging endpoint — or, for :func:`purecdp.connect`, the
+    running browser could not be reached (no endpoint file, or Firefox's single
+    BiDi session is held by another client).'''
 
 
 class NotSupported(PureCDPError):

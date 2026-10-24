@@ -739,23 +739,58 @@ async def launch(
 async def connect(
     endpoint: str | None = None,
     *,
+    browser: str | None = None,
+    user_data_dir: str | None = None,
     host: str = '127.0.0.1',
     port: int = 9222,
     timeout: float = 30.0,
 ) -> Browser:
-    '''Attach to an already-running browser over CDP and return a Browser.
+    '''Attach to an already-running browser and return a Browser.
 
     Unlike :func:`launch`, this neither starts nor owns the browser: ``aclose()``
     just closes the connection, leaving the browser (and its profile) running.
     This is how you drive a browser someone else started — a Chrome-in-Docker /
-    browserless / Skyvern cloud session, or a local ``chromium
-    --remote-debugging-port=9222``.
+    browserless / Skyvern cloud session, a local ``chromium
+    --remote-debugging-port=9222``, or your own Firefox started with
+    ``--remote-debugging-port 0``.
 
-    Accepted ``endpoint`` forms: a browser-level ``ws://…/devtools/browser/…``
-    URL (used directly), or the ``http://host:port`` everyone tries first —
-    resolved to the websocket endpoint via ``/json/version``, exactly like
-    passing ``host``/``port``.
+    **Chromium (CDP).** ``endpoint`` is a browser-level ``ws://…/devtools/browser/…``
+    URL (used directly) or the ``http://host:port`` everyone tries first —
+    resolved via ``/json/version``, exactly like passing ``host``/``port``;
+    ``user_data_dir`` alone reads the profile's ``DevToolsActivePort``.
+
+    **Firefox (WebDriver BiDi).** Selected by ``browser="firefox"``, by a
+    ``ws://host:port/session`` endpoint, or by a ``user_data_dir`` holding
+    ``WebDriverBiDiServer.json`` — the file Firefox writes when (and only when)
+    it was started with ``--remote-debugging-port`` (``0`` = ephemeral, no
+    value = 9222; there is no way to enable it afterwards). Returns a
+    :class:`FirefoxBrowser` with ``process=None``: ``attach(url_contains=…)``
+    reaches the tabs you have open, ``aclose()`` ends purecdp's BiDi session
+    and leaves Firefox running. Firefox allows ONE BiDi session at a time: if
+    another client holds it the error says so (close that client, or restart
+    Firefox); purecdp releases its own on ``aclose()``.
     '''
+    if browser not in (None, 'chromium', 'firefox'):
+        raise ValueError(f"browser must be 'chromium' or 'firefox', not {browser!r}")
+    bidi_file = (os.path.join(user_data_dir, _BIDI_SERVER_FILE) if user_data_dir else None)
+    looks_bidi = (browser == 'firefox'
+                  or (endpoint is not None and endpoint.startswith(('ws://', 'wss://'))
+                      and urlsplit(endpoint).path.rstrip('/').endswith('/session'))
+                  or (browser is None and bidi_file is not None and os.path.exists(bidi_file)))
+    if looks_bidi:
+        return await _connect_firefox(endpoint, user_data_dir=user_data_dir,
+                                      host=host, port=port, timeout=timeout)
+    if endpoint is None and user_data_dir:
+        port_file = os.path.join(user_data_dir, 'DevToolsActivePort')
+        try:
+            with open(port_file, encoding='utf-8') as f:
+                lines = f.read().splitlines()
+        except OSError:
+            raise BrowserLaunchError(
+                f'no DevToolsActivePort in {user_data_dir} — is a Chromium running '
+                'on that profile with --remote-debugging-port?') from None
+        if len(lines) >= 2 and lines[0].strip().isdigit():
+            endpoint = f'ws://127.0.0.1:{lines[0].strip()}{lines[1].strip()}'
     if endpoint is not None and endpoint.startswith(('http://', 'https://')):
         parsed = urlsplit(endpoint)
         host = parsed.hostname or host
@@ -806,6 +841,15 @@ async def _wait_for_endpoint(
 
 
 # -- Firefox over WebDriver BiDi (M20) ----------------------------------------
+
+def _firefox_prefs(owns_profile: bool, prefs: dict | None) -> dict:
+    '''The ``user.js`` block for a launch: the quiet-startup defaults ONLY for a
+    profile purecdp created — a caller's own profile (their daily browser) gets
+    nothing but their explicit ``prefs``.'''
+    base = dict(FIREFOX_PREFS) if owns_profile else {}
+    base.update(prefs or {})
+    return base
+
 
 _USER_JS_BEGIN = '// purecdp:begin (rewritten on every launch; edit outside this block)'
 _USER_JS_END = '// purecdp:end'
@@ -939,8 +983,11 @@ class FirefoxBrowser(Browser):
     ``new_context()`` is a BiDi user context, ``aclose()`` is graceful-first.
     There is no CDP ``connection`` (None) and no ``new_session()`` — CDP
     sessions do not exist on Firefox; the raw escape hatch is
-    ``browser.bidi.call(method, params)``. Experimental (M20): Page features
-    without a BiDi mapping yet raise :class:`~purecdp.errors.NotSupported`.
+    ``browser.bidi.call(method, params)``. A browser reached via
+    :func:`connect` has ``process=None``: ``aclose()`` then ends purecdp's
+    BiDi session and leaves Firefox (and its profile) alone. Experimental
+    (M20): Page features without a BiDi mapping raise
+    :class:`~purecdp.errors.NotSupported` (today: media emulation).
     '''
 
     kind = 'firefox'
@@ -1033,6 +1080,12 @@ class FirefoxBrowser(Browser):
             return False
 
     async def _close_connection(self) -> None:
+        if self.process is None and not self.bidi.closed:
+            # connected, not launched: release Firefox's single BiDi session
+            # so the next connect() can have it; the browser stays up
+            with suppress(Exception):
+                await self.bidi.call('session.end', {},
+                                     timeout=self.graceful_close_timeout)
         await self.bidi.aclose()
 
 
@@ -1054,7 +1107,9 @@ async def _launch_firefox(
     profile = user_data_dir or tempfile.mkdtemp(prefix='purecdp-firefox-')
     if not owns_profile:
         _prepare_reused_firefox_profile(profile)
-    _write_user_js(profile, {**FIREFOX_PREFS, **(prefs or {})})
+    effective = _firefox_prefs(owns_profile, prefs)
+    if effective:
+        _write_user_js(profile, effective)
     argv = [path, '--no-remote', '-profile', profile,
             '--remote-debugging-port', '0']
     if window_size is not None:
@@ -1105,3 +1160,112 @@ async def _launch_firefox(
         raise
     return FirefoxBrowser(process, connection, profile, owns_profile,
                           stderr_tail=stderr_tail)
+
+
+def _read_bidi_endpoint(profile: str) -> str | None:
+    '''``ws://host:port/session`` from ``<profile>/WebDriverBiDiServer.json``,
+    or None when the file is absent / not yet complete.'''
+    try:
+        with open(os.path.join(profile, _BIDI_SERVER_FILE), encoding='utf-8') as f:
+            info = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(info, dict) or not info.get('ws_port'):
+        return None
+    return f'ws://{info.get("ws_host") or "127.0.0.1"}:{int(info["ws_port"])}/session'
+
+
+#: What a connected (not launched) Firefox session asks for: the same prompt
+#: contract as launch(); nothing else — the browser is somebody's.
+_CONNECT_CAPABILITIES: dict = {'unhandledPromptBehavior': {'default': 'ignore'}}
+
+
+async def _bidi_connect(url: str, capabilities: dict):
+    '''Indirection so tests can stand in a fake connection.'''
+    from . import bidi as _bidi
+    return await _bidi.connect(url, capabilities=capabilities)
+
+
+async def _connect_firefox(endpoint: str | None, *, user_data_dir: str | None,
+                           host: str, port: int, timeout: float) -> FirefoxBrowser:
+    from .bidi.connection import BidiCommandError
+
+    if endpoint is None and user_data_dir:
+        endpoint = _read_bidi_endpoint(user_data_dir)
+        if endpoint is None:
+            raise BrowserLaunchError(
+                f'no {_BIDI_SERVER_FILE} in {user_data_dir} — Firefox only writes '
+                'it when started with --remote-debugging-port (there is no way to '
+                'turn the remote agent on afterwards)')
+    if endpoint is None:
+        endpoint = f'ws://{host}:{port}/session'
+    if not endpoint.startswith(('ws://', 'wss://')):
+        raise ValueError(f'unsupported Firefox endpoint {endpoint!r} — pass a '
+                         'ws://host:port/session URL, user_data_dir=, or host=/port=')
+    try:
+        connection = await _bidi_connect(endpoint, dict(_CONNECT_CAPABILITIES))
+    except BidiCommandError as exc:
+        if exc.code == 'session not created':
+            raise BrowserLaunchError(
+                "Firefox's BiDi session is held by another client "
+                f'({exc.code}: {exc.message}) — Firefox allows one at a time: '
+                'close that client (purecdp releases its own on aclose()), or '
+                'restart Firefox') from exc
+        raise
+    return FirefoxBrowser(None, connection, user_data_dir or '', owns_profile=False)
+
+
+_PROFILES_INI_DIRS = (
+    '~/.mozilla/firefox',
+    '~/snap/firefox/common/.mozilla/firefox',
+    '~/.var/app/org.mozilla.firefox/.mozilla/firefox',
+    '~/Library/Application Support/Firefox',
+    '%APPDATA%/Mozilla/Firefox',
+)
+
+
+def find_firefox_profile(root: str | None = None) -> str | None:
+    '''The default Firefox profile directory, from ``profiles.ini`` — the
+    ``[Install…] Default=`` entry, else the ``[Profile…]`` marked ``Default=1``,
+    else the only profile. Searched in the usual places (Linux, snap, flatpak,
+    macOS, Windows); ``$FIREFOX_PROFILE`` overrides; ``root`` names a
+    directory holding ``profiles.ini`` directly (tests). None when nothing is
+    found. Never called implicitly — pass the result to ``connect(user_data_dir=…)``
+    or ``launch(user_data_dir=…)`` yourself.'''
+    import configparser
+
+    env = os.environ.get('FIREFOX_PROFILE')
+    if env and root is None:
+        return env
+    roots = ([root] if root else
+             [os.path.expandvars(os.path.expanduser(d)) for d in _PROFILES_INI_DIRS])
+    for base in roots:
+        ini = os.path.join(base, 'profiles.ini')
+        if not os.path.isfile(ini):
+            continue
+        cp = configparser.RawConfigParser()
+        cp.optionxform = str  # keep key case
+        with suppress(OSError, configparser.Error):
+            cp.read(ini, encoding='utf-8')
+        profiles = [s for s in cp.sections() if s.startswith('Profile')]
+
+        def resolve(section: str) -> str | None:
+            path = cp.get(section, 'Path', fallback=None)
+            if not path:
+                return None
+            relative = cp.get(section, 'IsRelative', fallback='1') == '1'
+            return os.path.normpath(os.path.join(base, path) if relative else path)
+
+        for section in cp.sections():
+            if section.startswith('Install'):
+                default = cp.get(section, 'Default', fallback=None)
+                if default:
+                    return os.path.normpath(os.path.join(base, default))
+        for section in profiles:
+            if cp.get(section, 'Default', fallback='0') == '1':
+                found = resolve(section)
+                if found:
+                    return found
+        if len(profiles) == 1:
+            return resolve(profiles[0])
+    return None

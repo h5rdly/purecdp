@@ -987,6 +987,130 @@ class FirefoxBrowserTests(unittest.IsolatedAsyncioTestCase):
         assert self.browser.connection is None
 
 
+class ConnectFirefoxTests(unittest.IsolatedAsyncioTestCase):
+    '''purecdp.connect() over BiDi (M21): endpoint / profile file / host+port
+    selection, the capabilities asked for, aclose() = session.end, and the
+    one-session error — all against the fake peer via _bidi_connect.'''
+
+    def setUp(self):
+        from unittest import mock
+        self.fake = FakeBidi()
+        self.transports = []
+        self.urls = []
+
+        async def fake_connect(url, capabilities):
+            self.urls.append((url, capabilities))
+            transport = FakeTransport(self.fake)
+            self.transports.append(transport)
+            conn = BidiConnection(transport)
+            await conn.open()
+            try:
+                await conn.new_session(capabilities)
+            except BaseException:
+                await conn.aclose()
+                raise
+            return conn
+        patcher = mock.patch('purecdp.browser._bidi_connect', fake_connect)
+        patcher.start(); self.addCleanup(patcher.stop)
+
+    def sent(self, method):
+        return [m for t in self.transports for m in t.sent if m['method'] == method]
+
+    async def test_connect_by_session_endpoint(self):
+        from purecdp.browser import FirefoxBrowser
+        browser = await purecdp.connect('ws://127.0.0.1:36087/session')
+        assert isinstance(browser, FirefoxBrowser) and browser.process is None
+        assert browser.kind == 'firefox' and browser.connection is None
+        assert self.urls[0][0] == 'ws://127.0.0.1:36087/session'
+        assert self.urls[0][1] == {'unhandledPromptBehavior': {'default': 'ignore'}}
+        assert self.sent('session.new')[-1]['params'] == {
+            'capabilities': {'alwaysMatch': {'unhandledPromptBehavior': {'default': 'ignore'}}}}
+        page = await browser.attach()           # the one realized tab
+        assert page.backend == 'bidi'
+        await page.stop()
+        await browser.aclose()
+        assert self.sent('session.end') and not self.sent('browser.close')
+        assert self.transports[0].closed
+
+    async def test_connect_by_profile_file_and_by_host_port(self):
+        with tempfile.TemporaryDirectory() as profile:
+            with open(os.path.join(profile, 'WebDriverBiDiServer.json'), 'w', encoding='utf-8') as f:
+                json.dump({'ws_host': '127.0.0.1', 'ws_port': 40001}, f)
+            browser = await purecdp.connect(user_data_dir=profile)      # file => BiDi, no browser= needed
+            assert self.urls[-1][0] == 'ws://127.0.0.1:40001/session'
+            assert browser.user_data_dir == profile
+            await browser.aclose()
+        browser = await purecdp.connect(browser='firefox', host='10.0.0.5', port=9222)
+        assert self.urls[-1][0] == 'ws://10.0.0.5:9222/session'
+        await browser.aclose()
+        with tempfile.TemporaryDirectory() as empty:
+            try:
+                await purecdp.connect(browser='firefox', user_data_dir=empty)
+            except purecdp.BrowserLaunchError as exc:
+                assert 'WebDriverBiDiServer.json' in str(exc) and '--remote-debugging-port' in str(exc)
+            else:
+                raise AssertionError('missing endpoint file must raise')
+
+    async def test_held_session_is_explained(self):
+        self.fake.queue('session.new', ('error', 'session not created', 'Maximum number of active sessions'))
+        try:
+            await purecdp.connect('ws://127.0.0.1:1/session')
+        except purecdp.BrowserLaunchError as exc:
+            assert 'held by another client' in str(exc)
+            assert 'Maximum number of active sessions' in str(exc)
+            assert 'restart Firefox' in str(exc)
+        else:
+            raise AssertionError('expected BrowserLaunchError')
+        assert self.transports[-1].closed    # the failed attempt cleaned up
+
+    async def test_bad_browser_and_endpoint_values(self):
+        for kwargs in ({'browser': 'safari'},):
+            try:
+                await purecdp.connect(**kwargs)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(kwargs)
+        try:
+            await purecdp.connect('http://127.0.0.1:1/', browser='firefox')
+        except ValueError as exc:
+            assert 'ws://host:port/session' in str(exc)
+        else:
+            raise AssertionError('http endpoint for firefox must raise')
+
+
+class FirefoxProfileTests(unittest.TestCase):
+    def ini(self, root, text):
+        pathlib.Path(root, 'profiles.ini').write_text(text, encoding='utf-8')
+
+    def test_install_default_wins(self):
+        from purecdp import find_firefox_profile
+        with tempfile.TemporaryDirectory() as root:
+            self.ini(root, '[Install4F96D1932A9F858E]\nDefault=abcd.default-release\nLocked=1\n\n'
+                           '[Profile1]\nName=old\nIsRelative=1\nPath=zzzz.default\nDefault=1\n\n'
+                           '[Profile0]\nName=default-release\nIsRelative=1\nPath=abcd.default-release\n')
+            assert find_firefox_profile(root) == os.path.normpath(os.path.join(root, 'abcd.default-release'))
+
+    def test_default_flag_then_single_profile_then_absolute(self):
+        from purecdp import find_firefox_profile
+        with tempfile.TemporaryDirectory() as root:
+            self.ini(root, '[Profile0]\nName=a\nIsRelative=1\nPath=a.one\n\n'
+                           '[Profile1]\nName=b\nIsRelative=1\nPath=b.two\nDefault=1\n')
+            assert find_firefox_profile(root).endswith('b.two')
+            self.ini(root, '[Profile0]\nName=only\nIsRelative=0\nPath=/opt/ff/only.prof\n')
+            assert find_firefox_profile(root) == os.path.normpath('/opt/ff/only.prof')
+            self.ini(root, '[General]\nStartWithLastProfile=1\n')
+            assert find_firefox_profile(root) is None
+        with tempfile.TemporaryDirectory() as root:
+            assert find_firefox_profile(root) is None          # no ini at all
+
+    def test_env_override(self):
+        from unittest import mock
+        from purecdp import find_firefox_profile
+        with mock.patch.dict(os.environ, {'FIREFOX_PROFILE': '/home/me/.mozilla/firefox/x.prof'}):
+            assert find_firefox_profile() == '/home/me/.mozilla/firefox/x.prof'
+
+
 class FirefoxLaunchHelperTests(unittest.IsolatedAsyncioTestCase):
     def test_browser_kind_from_binary_name(self):
         from purecdp import browser_kind
@@ -995,6 +1119,13 @@ class FirefoxLaunchHelperTests(unittest.IsolatedAsyncioTestCase):
         assert browser_kind('/usr/bin/librewolf') == 'firefox'
         assert browser_kind('/usr/bin/chromium') == 'chromium'
         assert browser_kind('/opt/brave.com/brave/brave') == 'chromium'
+
+    def test_a_callers_profile_gets_only_its_own_prefs(self):
+        from purecdp.browser import FIREFOX_PREFS, _firefox_prefs
+        assert _firefox_prefs(True, None) == FIREFOX_PREFS
+        assert _firefox_prefs(True, {'x': 1})['x'] == 1 and 'browser.startup.page' in _firefox_prefs(True, {'x': 1})
+        assert _firefox_prefs(False, None) == {}            # someone's daily browser: hands off
+        assert _firefox_prefs(False, {'x': 1}) == {'x': 1}
 
     def test_user_js_writer_is_idempotent_and_keeps_user_lines(self):
         from purecdp.browser import _write_user_js

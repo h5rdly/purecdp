@@ -255,6 +255,52 @@ class FirefoxPhase2E2ETests(unittest.IsolatedAsyncioTestCase):
         finally:
             await server.aclose()
 
+    async def test_connect_to_a_firefox_someone_else_started(self):
+        '''M21: a Firefox started with --remote-debugging-port (not by purecdp):
+        connect() by profile dir, attach the open tab, release the single BiDi
+        session on aclose() so a second connect works, and leave it running.'''
+        import os
+        import subprocess
+        import tempfile
+        profile = tempfile.mkdtemp(prefix='purecdp-ownff-')
+        proc = subprocess.Popen([FIREFOX, '--no-remote', '-profile', profile, '-headless',
+                                 '--remote-debugging-port', '0',
+                                 'data:text/html,<title>mine</title>my tab'],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            async with asyncio.timeout(90):
+                from purecdp.browser import _read_bidi_endpoint
+                while _read_bidi_endpoint(profile) is None:
+                    assert proc.poll() is None, 'firefox died'
+                    await asyncio.sleep(0.1)
+                browser = await purecdp.connect(user_data_dir=profile)
+                assert browser.process is None and browser.kind == 'firefox'
+                # the endpoint file lands before the startup tab has loaded its
+                # URL: take the one realized tab, make it ours, then find it by URL
+                page = await browser.attach()
+                await page.goto('data:text/html,<title>mine</title>my tab')
+                assert await page.evaluate('document.title') == 'mine'
+                same = await browser.attach(url_contains='title>mine')
+                assert same._driver.context == page._driver.context
+                await same.stop()
+                # Firefox allows one BiDi session: a second connect is refused, clearly
+                try:
+                    await purecdp.connect(user_data_dir=profile)
+                except purecdp.BrowserLaunchError as exc:
+                    assert 'held by another client' in str(exc)
+                else:
+                    raise AssertionError('second connect must be refused while the first is open')
+                await page.stop()
+                await browser.aclose()
+                assert proc.poll() is None, 'aclose() must not close the browser'
+                again = await purecdp.connect(user_data_dir=profile)   # session was released
+                tabs = await again.bidi.call('browsingContext.getTree', {})
+                assert any('title>mine' in c.get('url', '') for c in tabs['contexts'])
+                await again.aclose()
+                assert proc.poll() is None
+        finally:
+            proc.kill(); proc.wait(timeout=10)
+
     async def test_trusted_input_and_emulation_round_trip(self):
         async with asyncio.timeout(60):
             async with await purecdp.launch(browser='firefox') as browser:
