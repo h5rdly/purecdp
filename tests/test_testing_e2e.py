@@ -1375,7 +1375,10 @@ class ConnectE2ETests(CDPTestCase):
         port, _ = self._endpoint_parts()
         other = await purecdp.connect(f'http://127.0.0.1:{port}')
         try:
-            page = await other.new_page('data:text/html,<title>http-form</title>')
+            page = await other.new_page()
+            # new_page(url) creates the tab at the URL without waiting for the
+            # load; goto() waits — a slow runner read an empty title otherwise
+            await page.goto('data:text/html,<title>http-form</title>')
             assert await page.title() == 'http-form'
         finally:
             await other.aclose()
