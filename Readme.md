@@ -312,9 +312,13 @@ await browser.aclose()                               # ends purecdp's session; F
 ```
 
 `connect()` also takes the `ws://host:port/session` endpoint directly, or
-`browser="firefox"` with `host`/`port`. Firefox allows a single BiDi session at
-a time: a second client is refused with a message saying who to close, and
-purecdp releases its own session on `aclose()`. `launch(user_data_dir=profile)`
+`browser="firefox"` with `host`/`port`. Pages on a connected browser keep the
+window's own viewport (no 1280×720 emulation: it is a human's window) and
+subscribe to events for their tab only. Firefox allows a single BiDi session at
+a time and does not release it when a client dies, so a crashed client holds it
+until Firefox restarts; purecdp releases its own on `aclose()` and the error
+says which case you are in. Firefox also leaves `WebDriverBiDiServer.json`
+behind on exit; a connect to a stale one says so. `launch(user_data_dir=profile)`
 is the other route (Firefox must be closed first): purecdp no longer writes its
 quiet-startup prefs into a profile it did not create.
 

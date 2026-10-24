@@ -313,8 +313,12 @@ class Page(ElementQueries, LiveFactories):
         capture: bool = True,
         track_network: bool = True,
         viewport: tuple[int, int] | None = DEFAULT_VIEWPORT,
+        setup_timeout: float = 30.0,
     ) -> Page:
-        '''Arm a Page over any driver (the backend-neutral half of create()).'''
+        '''Arm a Page over any driver (the backend-neutral half of create()).
+        Each step is bounded by ``setup_timeout`` and a stall names it
+        (``"Page.create: step 'subscribe' did not complete within 30s on
+        bidi"``) instead of hanging silently.'''
         page = cls(session, default_timeout, driver=driver)
         page._capture = capture
         page._track_network = track_network
@@ -328,9 +332,19 @@ class Page(ElementQueries, LiveFactories):
             stream = page._driver.listen(*kinds, buffer_size=4096)
             page._streams.append(stream)
             page._tasks.append(asyncio.create_task(page._capture_pump(stream)))
-        await page._driver.arm(capture=capture, track_network=track_network)
-        if viewport is not None:
-            await page._driver.viewport(int(viewport[0]), int(viewport[1]))
+        step = 'subscribe'
+        try:
+            async with asyncio.timeout(setup_timeout):
+                await page._driver.arm(capture=capture, track_network=track_network)
+            if viewport is not None:
+                step = 'viewport'
+                async with asyncio.timeout(setup_timeout):
+                    await page._driver.viewport(int(viewport[0]), int(viewport[1]))
+        except TimeoutError:
+            await page.stop()
+            raise TimeoutError(
+                f'Page.create: step {step!r} did not complete within '
+                f'{setup_timeout:g}s on {page._driver.backend}') from None
         return page
 
     # -- capture -------------------------------------------------------------

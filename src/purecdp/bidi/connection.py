@@ -122,7 +122,8 @@ class BidiConnection:
         self._listeners: set[BidiEventStream] = set()
         self._reader_task: asyncio.Task | None = None
         self._closed_reason: str | None = None
-        self._subscribed: set[str] = set()
+        #: (event, context) pairs already subscribed; context None = browser-wide
+        self._subscribed: set[tuple[str, str | None]] = set()
         #: Browsing contexts the browser reported destroyed (tab closed by the
         #: user, ``window.close()``, ``browsingContext.close`` from anyone) —
         #: the whole subtree of each ``contextDestroyed`` event. Drivers
@@ -210,17 +211,23 @@ class BidiConnection:
 
     async def subscribe(self, events: typing.Sequence[str],
                         contexts: typing.Sequence[str] | None = None) -> None:
-        '''``session.subscribe`` for event methods not yet subscribed
-        globally (a context-scoped subscribe is always sent).'''
-        wanted = [e for e in events if contexts is not None or e not in self._subscribed]
-        if not wanted:
-            return
-        params: dict = {'events': list(wanted)}
-        if contexts is not None:
-            params['contexts'] = list(contexts)
-        await self.call('session.subscribe', params)
+        '''``session.subscribe`` for what is not subscribed yet. Scope it to
+        ``contexts`` whenever you can: on a browser that is somebody's (many
+        tabs), a browser-wide network/log subscription is a firehose purecdp
+        would only filter back out. A browser-wide subscription covers every
+        context; a context-scoped one is remembered per (event, context).'''
         if contexts is None:
-            self._subscribed.update(wanted)
+            wanted = [e for e in events if (e, None) not in self._subscribed]
+            if wanted:
+                await self.call('session.subscribe', {'events': wanted})
+                self._subscribed.update((e, None) for e in wanted)
+            return
+        for ctx in contexts:
+            wanted = [e for e in events
+                      if (e, None) not in self._subscribed and (e, ctx) not in self._subscribed]
+            if wanted:
+                await self.call('session.subscribe', {'events': wanted, 'contexts': [ctx]})
+                self._subscribed.update((e, ctx) for e in wanted)
 
     # -- events --------------------------------------------------------------
 

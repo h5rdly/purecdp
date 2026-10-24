@@ -222,13 +222,18 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.transport.push(event('browsingContext.load', {'context': 'CTX-2'}))
         assert (await waiter).params['context'] == 'CTX-2'
 
-    async def test_subscribe_is_deduplicated_globally(self):
-        await self.conn.subscribe(['log.entryAdded', 'browsingContext.load'])
-        await self.conn.subscribe(['log.entryAdded'])
+    async def test_subscribe_is_deduplicated_per_event_and_context(self):
         await self.conn.subscribe(['log.entryAdded'], contexts=['CTX-1'])
+        await self.conn.subscribe(['log.entryAdded', 'browsingContext.load'], contexts=['CTX-1'])
+        await self.conn.subscribe(['log.entryAdded'], contexts=['CTX-2'])   # another tab: its own
+        await self.conn.subscribe(['browsingContext.load'])                  # browser-wide
+        await self.conn.subscribe(['browsingContext.load'], contexts=['CTX-3'])  # covered by the global one
+        await self.conn.subscribe(['browsingContext.load'])
         subs = [m['params'] for m in self.transport.sent if m['method'] == 'session.subscribe']
-        assert subs == [{'events': ['log.entryAdded', 'browsingContext.load']},
-                        {'events': ['log.entryAdded'], 'contexts': ['CTX-1']}]
+        assert subs == [{'events': ['log.entryAdded'], 'contexts': ['CTX-1']},
+                        {'events': ['browsingContext.load'], 'contexts': ['CTX-1']},
+                        {'events': ['log.entryAdded'], 'contexts': ['CTX-2']},
+                        {'events': ['browsingContext.load']}]
 
     async def test_peer_close_fails_pending_and_ends_streams(self):
         stream = self.conn.listen()
@@ -307,9 +312,11 @@ class BidiDriverTests(unittest.IsolatedAsyncioTestCase):
     async def test_page_wiring_and_arm_subscribes(self):
         assert self.page.backend == 'bidi' and self.page.session is None
         assert self.page.bidi is self.conn and self.page.alive
-        subs = self.sent('session.subscribe')[0]['params']['events']
-        assert 'log.entryAdded' in subs and 'browsingContext.load' in subs
-        assert 'network.beforeRequestSent' in subs
+        first = self.sent('session.subscribe')[0]['params']
+        assert 'log.entryAdded' in first['events'] and 'browsingContext.load' in first['events']
+        assert 'network.beforeRequestSent' in first['events']
+        # scoped to THIS tab: on somebody's browser a global subscription is a firehose
+        assert all(m['params'].get('contexts') == ['CTX-1'] for m in self.sent('session.subscribe'))
 
     async def test_evaluate_by_value_and_by_handle(self):
         self.fake.queue('script.evaluate', self.script_result({'type': 'number', 'value': 2}))
@@ -922,6 +929,16 @@ class BidiDriverTests(unittest.IsolatedAsyncioTestCase):
         else:
             raise AssertionError('stale ref must raise LookupError')
 
+    async def test_creation_steps_are_bounded_and_named(self):
+        '''A stall inside Page.create names the step instead of hanging.'''
+        self.transport._responder = lambda msg: []        # the peer stops answering
+        try:   # a fresh context: its subscribe is really sent (CTX-1's is already deduped)
+            await Page._create_with(BidiDriver(self.conn, 'CTX-9'), setup_timeout=0.1)
+        except TimeoutError as exc:
+            assert "step 'subscribe'" in str(exc) and 'bidi' in str(exc), str(exc)
+        else:
+            raise AssertionError('expected a named TimeoutError')
+
 
 class FirefoxBrowserTests(unittest.IsolatedAsyncioTestCase):
     '''FirefoxBrowser over the fake connection (no process).'''
@@ -947,6 +964,11 @@ class FirefoxBrowserTests(unittest.IsolatedAsyncioTestCase):
         assert self.sent('browsingContext.create')[-1]['params'] == {'type': 'tab'}
         assert self.sent('browsingContext.navigate')[-1]['params']['url'] == 'http://x/'
         assert self.browser.capabilities['browserName'] == 'firefox'
+        # this browser has process=None (connected): a human's window is never resized
+        assert self.sent('browsingContext.setViewport') == []
+        await page.stop()
+        page = await self.browser.new_page(viewport=(800, 600))   # unless asked
+        assert self.sent('browsingContext.setViewport')[-1]['params']['viewport'] == {'width': 800, 'height': 600}
         await page.stop()
 
     async def test_user_context_scopes_new_tabs(self):
@@ -1056,12 +1078,29 @@ class ConnectFirefoxTests(unittest.IsolatedAsyncioTestCase):
         try:
             await purecdp.connect('ws://127.0.0.1:1/session')
         except purecdp.BrowserLaunchError as exc:
-            assert 'held by another client' in str(exc)
             assert 'Maximum number of active sessions' in str(exc)
-            assert 'restart Firefox' in str(exc)
+            assert 'crashed or was killed still counts' in str(exc)   # a dead client holds it
+            assert 'restarting Firefox clears it' in str(exc)
         else:
             raise AssertionError('expected BrowserLaunchError')
         assert self.transports[-1].closed    # the failed attempt cleaned up
+
+    async def test_stale_endpoint_file_is_diagnosed(self):
+        from unittest import mock
+
+        async def refused(url, capabilities):
+            raise ConnectionRefusedError(111, 'Connection refused')
+        with tempfile.TemporaryDirectory() as profile:
+            with open(os.path.join(profile, 'WebDriverBiDiServer.json'), 'w', encoding='utf-8') as f:
+                json.dump({'ws_host': '127.0.0.1', 'ws_port': 1}, f)
+            with mock.patch('purecdp.browser._bidi_connect', refused):
+                try:
+                    await purecdp.connect(user_data_dir=profile)
+                except purecdp.BrowserLaunchError as exc:
+                    assert 'nothing is listening' in str(exc) and 'leaves that file behind' in str(exc)
+                    assert 'WITHOUT --remote-debugging-port' in str(exc)
+                else:
+                    raise AssertionError('a dead endpoint must be diagnosed')
 
     async def test_bad_browser_and_endpoint_values(self):
         for kwargs in ({'browser': 'safari'},):
@@ -1109,6 +1148,18 @@ class FirefoxProfileTests(unittest.TestCase):
         from purecdp import find_firefox_profile
         with mock.patch.dict(os.environ, {'FIREFOX_PROFILE': '/home/me/.mozilla/firefox/x.prof'}):
             assert find_firefox_profile() == '/home/me/.mozilla/firefox/x.prof'
+
+    def test_xdg_config_home_is_searched(self):
+        from unittest import mock
+        from purecdp import find_firefox_profile
+        with tempfile.TemporaryDirectory() as xdg, tempfile.TemporaryDirectory() as home:
+            base = os.path.join(xdg, 'mozilla', 'firefox'); os.makedirs(base)
+            self.ini(base, '[Profile0]\nName=x\nIsRelative=1\nPath=abcd.default-release\n')
+            env = {'XDG_CONFIG_HOME': xdg, 'HOME': home}
+            with mock.patch.dict(os.environ, env, clear=False):
+                os.environ.pop('FIREFOX_PROFILE', None)
+                found = find_firefox_profile()
+            assert found == os.path.normpath(os.path.join(base, 'abcd.default-release'))
 
 
 class FirefoxLaunchHelperTests(unittest.IsolatedAsyncioTestCase):

@@ -280,6 +280,8 @@ class FirefoxPhase2E2ETests(unittest.IsolatedAsyncioTestCase):
                 page = await browser.attach()
                 await page.goto('data:text/html,<title>mine</title>my tab')
                 assert await page.evaluate('document.title') == 'mine'
+                # somebody's window is never resized: Firefox's own default, not 1280x720
+                assert await page.evaluate('innerWidth') != 1280
                 same = await browser.attach(url_contains='title>mine')
                 assert same._driver.context == page._driver.context
                 await same.stop()
@@ -287,7 +289,7 @@ class FirefoxPhase2E2ETests(unittest.IsolatedAsyncioTestCase):
                 try:
                     await purecdp.connect(user_data_dir=profile)
                 except purecdp.BrowserLaunchError as exc:
-                    assert 'held by another client' in str(exc)
+                    assert 'Maximum number of active sessions' in str(exc), str(exc)
                 else:
                     raise AssertionError('second connect must be refused while the first is open')
                 await page.stop()

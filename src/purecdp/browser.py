@@ -394,6 +394,8 @@ class Browser:
                 f'{len(matches)} page targets {described} — pass {hint} to '
                 f'pick one: {listing(matches)}')
         session = await self.connection.attach(str(matches[0].target_id))
+        if self.process is None:   # a browser we merely connected to: never resize its window
+            page_kw.setdefault('viewport', None)
         return await Page.create(session, **page_kw)
 
     async def close_page(self, session) -> None:
@@ -1025,6 +1027,8 @@ class FirefoxBrowser(Browser):
         if url and url != 'about:blank':
             await self.bidi.call('browsingContext.navigate',
                                  {'context': ctx, 'url': url, 'wait': 'none'})
+        if self.process is None:   # somebody's Firefox: don't resize their window
+            page_kw.setdefault('viewport', None)
         return await Page._create_with(BidiDriver(self.bidi, ctx), **page_kw)
 
     async def attach(self, *, url_contains: str | None = None,
@@ -1061,6 +1065,8 @@ class FirefoxBrowser(Browser):
             hint = 'target_id=' if url_contains is not None else 'url_contains= or target_id='
             raise TargetNotFound(f'{len(matches)} page targets match — pass '
                                  f'{hint} to pick one: {listing(matches)}')
+        if self.process is None:
+            page_kw.setdefault('viewport', None)
         return await Page._create_with(BidiDriver(self.bidi, matches[0][0]),
                                        **page_kw)
 
@@ -1207,16 +1213,28 @@ async def _connect_firefox(endpoint: str | None, *, user_data_dir: str | None,
     except BidiCommandError as exc:
         if exc.code == 'session not created':
             raise BrowserLaunchError(
-                "Firefox's BiDi session is held by another client "
-                f'({exc.code}: {exc.message}) — Firefox allows one at a time: '
-                'close that client (purecdp releases its own on aclose()), or '
-                'restart Firefox') from exc
+                "Firefox's BiDi session is taken "
+                f'({exc.code}: {exc.message}). Firefox allows one session at a '
+                'time and does NOT release it when its client dies — a client '
+                'that crashed or was killed still counts. If that client is still '
+                'running, close it (purecdp releases its own on aclose()); '
+                'otherwise only restarting Firefox clears it') from exc
         raise
+    except OSError as exc:  # refused / unreachable: nothing listening there
+        where = (f'{_BIDI_SERVER_FILE} in {user_data_dir} names {endpoint}, but '
+                 if user_data_dir else f'{endpoint}: ')
+        raise BrowserLaunchError(
+            f'{where}nothing is listening ({exc.__class__.__name__}: {exc}). '
+            'Firefox leaves that file behind when it exits, so either Firefox is '
+            'not running, or the one running was started WITHOUT '
+            '--remote-debugging-port (start it with the flag)') from exc
     return FirefoxBrowser(None, connection, user_data_dir or '', owns_profile=False)
 
 
 _PROFILES_INI_DIRS = (
     '~/.mozilla/firefox',
+    '$XDG_CONFIG_HOME/mozilla/firefox',      # newer builds honour XDG when
+    '~/.config/mozilla/firefox',             # ~/.mozilla does not exist
     '~/snap/firefox/common/.mozilla/firefox',
     '~/.var/app/org.mozilla.firefox/.mozilla/firefox',
     '~/Library/Application Support/Firefox',
@@ -1240,6 +1258,8 @@ def find_firefox_profile(root: str | None = None) -> str | None:
     roots = ([root] if root else
              [os.path.expandvars(os.path.expanduser(d)) for d in _PROFILES_INI_DIRS])
     for base in roots:
+        if '$' in base:
+            continue  # an unset env var ($XDG_CONFIG_HOME) stays literal: skip it
         ini = os.path.join(base, 'profiles.ini')
         if not os.path.isfile(ini):
             continue

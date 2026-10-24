@@ -339,7 +339,7 @@ class BidiDriver:
             events.append('log.entryAdded')
         if track_network:
             events += self._NETWORK_EVENTS
-        await self.connection.subscribe(events)
+        await self.connection.subscribe(events, contexts=[self.context])
 
     # -- scripting -----------------------------------------------------------
 
@@ -568,7 +568,7 @@ class BidiDriver:
     # -- network -------------------------------------------------------------
 
     async def enable_network(self) -> None:
-        await self.connection.subscribe(self._NETWORK_EVENTS)
+        await self.connection.subscribe(self._NETWORK_EVENTS, contexts=[self.context])
 
     async def collect_bodies(self) -> None:
         '''Keep request and response bodies for this context (BiDi stores
@@ -753,7 +753,8 @@ class BidiDriver:
         '''Allow downloads into ``directory`` for THIS page's user context
         and emit the download events.'''
         await self.connection.subscribe(['browsingContext.downloadWillBegin',
-                                         'browsingContext.downloadEnd'])
+                                         'browsingContext.downloadEnd'],
+                                        contexts=[self.context])
         tree = await self._cmd('browsingContext.getTree', {'root': self.context})
         contexts = tree.get('contexts') or [{}]
         user_context = contexts[0].get('userContext')
