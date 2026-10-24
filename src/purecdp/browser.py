@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import socket
+import sys
 import tempfile
 import typing
 from contextlib import suppress
@@ -517,6 +518,10 @@ def _profile_lock_holder(profile: str) -> int | None:
     PID is a stale lock left by a crash — Chromium ignores those, so we must
     too; a lock stamped by another host can't be liveness-checked, so it
     doesn't block either (the browser's own stderr says if it's real).'''
+    if sys.platform == 'win32':
+        # no symlink lock on Windows — and os.kill(pid, 0) there is a
+        # CTRL_C_EVENT to the console group, never a liveness probe
+        return None
     try:
         holder = os.readlink(os.path.join(profile, 'SingletonLock'))
     except OSError:
@@ -840,6 +845,8 @@ def _firefox_lock_holder(profile: str) -> int | None:
     lock is a symlink ``lock -> IP:+PID`` (plus a ``.parentlock`` file that
     carries nothing readable); a dead PID is a stale lock from a crash and
     doesn't block. Windows (``parent.lock`` held by a file lock) is skipped.'''
+    if sys.platform == 'win32':
+        return None   # Windows holds ``parent.lock`` with a file lock: not parsed
     try:
         holder = os.readlink(os.path.join(profile, 'lock'))
     except OSError:

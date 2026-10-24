@@ -265,14 +265,18 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
         assert self.conn._pending_methods == {} and self.conn._futures == {}
 
     async def test_stream_overflow_drops_oldest_and_warns_once(self):
-        import warnings
+        # the warning fires in the connection's reader task; on free-threaded
+        # 3.14 warnings.catch_warnings is context-aware and would not see it,
+        # so observe the module-level warn() instead
+        from unittest import mock
         with self.conn.listen('log.entryAdded', buffer_size=2) as stream:
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter('always')
+            with mock.patch('purecdp.bidi.connection.warnings.warn') as warn:
                 for i in range(4):
                     self.transport.push(event('log.entryAdded', {'text': str(i)}))
                 await drain()
-            assert len([w for w in caught if issubclass(w.category, RuntimeWarning)]) == 1
+            assert warn.call_count == 1
+            assert warn.call_args.args[1] is RuntimeWarning
+            assert 'buffer full' in warn.call_args.args[0]
             got = [(await stream.__anext__()).params['text'] for _ in range(2)]
         assert got == ['2', '3']
 
@@ -1005,6 +1009,9 @@ class FirefoxLaunchHelperTests(unittest.IsolatedAsyncioTestCase):
                         '// purecdp:end\n')
         assert text.count('purecdp:begin') == 1
 
+    @unittest.skipIf(sys.platform == 'win32',
+                     "Firefox's Windows lock is parent.lock, not a symlink (and the "
+                     'helper returns None there by design)')
     def test_lock_holder_live_dead_and_absent(self):
         from purecdp.browser import _firefox_lock_holder, _prepare_reused_firefox_profile
         with tempfile.TemporaryDirectory() as profile:
