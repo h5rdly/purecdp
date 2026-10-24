@@ -2253,3 +2253,96 @@ class AttachTests(PageTestBase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestCaseSetupTests(unittest.IsolatedAsyncioTestCase):
+    '''CDPTestCase brings the browser up under a bound and retries once — a
+    hung hosted-runner Chrome is one retried setup, not a watchdog-killed run.'''
+
+    class StubPage:
+        def record(self):
+            pass
+
+        async def stop(self):
+            pass
+
+    class StubContext:
+        async def new_page(self, **kw):
+            return TestCaseSetupTests.StubPage()
+
+    class StubBrowser:
+        connection = None
+
+        def __init__(self):
+            self.bidi = type('Link', (), {'default_command_timeout': None})()
+            self.closed = False
+
+        async def new_context(self):
+            return TestCaseSetupTests.StubContext()
+
+        async def aclose(self):
+            self.closed = True
+
+    def make_case(self, behaviours):
+        from unittest import mock
+        from purecdp.testing import CDPTestCase
+
+        class Probe(CDPTestCase):
+            SETUP_TIMEOUT = 0.3
+            ARTIFACTS = False
+            BROWSER_PATH = '/fake/chromium'
+
+            async def test_nothing(self):
+                pass
+
+        calls = []
+
+        async def fake_launch(path, **kw):
+            behaviour = behaviours[len(calls)]
+            calls.append(kw)
+            if behaviour == 'hang':
+                await asyncio.sleep(10)
+            if isinstance(behaviour, Exception):
+                raise behaviour
+            return behaviour
+
+        return Probe('test_nothing'), calls, mock.patch('purecdp.testing.testcase.launch', fake_launch)
+
+    async def test_hung_launch_is_retried_once_and_succeeds(self):
+        stub = self.StubBrowser()
+        case, calls, patch = self.make_case(['hang', stub])
+        with patch:
+            await case.asyncSetUp()
+        assert len(calls) == 2 and case.browser is stub and case.page is not None
+        assert stub.bidi.default_command_timeout is None     # bounded only during setup
+        assert case._pages == [case.page]
+
+    async def test_a_launch_error_is_retried_too(self):
+        stub = self.StubBrowser()
+        case, calls, patch = self.make_case([purecdp.BrowserLaunchError('exited early'), stub])
+        with patch:
+            await case.asyncSetUp()
+        assert len(calls) == 2 and case.browser is stub
+
+    async def test_two_failures_name_the_step(self):
+        case, calls, patch = self.make_case(['hang', 'hang'])
+        with patch:
+            try:
+                await case.asyncSetUp()
+            except AssertionError as exc:
+                assert "failed 2× at step 'launch'" in str(exc), str(exc)
+                assert 'TimeoutError' in str(exc)
+            else:
+                raise AssertionError('setup must fail after the retry')
+        assert len(calls) == 2 and case.browser is None
+
+    async def test_a_hang_after_launch_closes_that_browser(self):
+        class HangingBrowser(self.StubBrowser):
+            async def new_context(self):
+                await asyncio.sleep(10)
+
+        first, second = HangingBrowser(), self.StubBrowser()
+        case, calls, patch = self.make_case([first, second])
+        with patch:
+            await case.asyncSetUp()
+        assert first.closed and case.browser is second

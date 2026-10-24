@@ -7,11 +7,13 @@ door is the optional alternative.)
 
 from __future__ import annotations
 
+import asyncio
 import os
 import unittest
 from contextlib import suppress
 
 from ..browser import find_browser, find_firefox, launch
+from ..errors import PureCDPError
 from .artifacts import _sanitize, artifacts_dir, dump_artifacts
 from .page import Page
 
@@ -49,8 +51,42 @@ class CDPTestCase(unittest.IsolatedAsyncioTestCase):
     ARTIFACTS_DIR: str | None = None
     ARTIFACTS_NETWORK = False
 
+    #: Bound on bringing a browser up for a test (launch + context + page) and
+    #: how many extra attempts a hung or failed start gets. Hosted CI runners
+    #: occasionally start a Chrome that never answers one early command; with
+    #: no bound that is a watchdog-killed run, with this it is one retried
+    #: setup — and, if it fails twice, an error naming the step.
+    SETUP_TIMEOUT = 60.0
+    SETUP_RETRIES = 1
+
     async def asyncSetUp(self) -> None:
         await super().asyncSetUp()
+        last: BaseException | None = None
+        for attempt in range(self.SETUP_RETRIES + 1):
+            self._setup_step = 'launch'
+            self._pages = []          # a page from a failed attempt is gone with its browser
+            try:
+                async with asyncio.timeout(self.SETUP_TIMEOUT):
+                    await self._bring_up_browser()
+                return
+            except (TimeoutError, PureCDPError) as exc:
+                last = exc
+                step = self._setup_step
+                browser = getattr(self, 'browser', None)
+                self.browser = None
+                if browser is not None:
+                    with suppress(BaseException):
+                        await asyncio.wait_for(browser.aclose(), 15)
+                if attempt < self.SETUP_RETRIES:
+                    continue
+                kind = type(exc).__name__
+                detail = str(exc) or f'no reply within {self.SETUP_TIMEOUT:g}s'
+                raise AssertionError(
+                    f'browser setup failed {attempt + 1}× at step {step!r}: '
+                    f'{kind}: {detail}') from last
+
+    async def _bring_up_browser(self) -> None:
+        '''launch → isolated context → first page (``_setup_step`` tracks it).'''
         kind = self.BROWSER_KIND or os.environ.get('PURECDP_E2E_BROWSER') or 'chromium'
         if kind == 'firefox':
             path = self.BROWSER_PATH or find_firefox()
@@ -71,8 +107,17 @@ class CDPTestCase(unittest.IsolatedAsyncioTestCase):
                 pipe=self.PIPE,
                 extra_args=(*self.EXTRA_ARGS, *env_args),
             )
-        self.context = await self.browser.new_context()
-        self.page = await self.new_page()
+        # while setting up, every command is bounded so a browser that never
+        # answers names the command instead of hanging; tests run unbounded
+        link = self.browser.connection if self.browser.connection is not None else self.browser.bidi
+        link.default_command_timeout = self.SETUP_TIMEOUT / 2
+        try:
+            self._setup_step = 'new_context'
+            self.context = await self.browser.new_context()
+            self._setup_step = 'new_page'
+            self.page = await self.new_page()
+        finally:
+            link.default_command_timeout = None
 
     async def asyncTearDown(self) -> None:
         exc = getattr(self, '_artifact_exc', None)
