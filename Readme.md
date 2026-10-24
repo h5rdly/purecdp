@@ -247,6 +247,54 @@ returns a PNG image block for visual state; plus `wait` (until visible/hidden/
 count/text), `seed_storage` / `set_cookie` (plant an auth session before
 navigating), `record` (narrow capture), and `mock` (stub an endpoint, opt-in).
 
+
+Three things worth knowing. `snap.find("button", "sign in")` returns the first
+matching ref (role exact, name a case-insensitive substring, `exact=True` or a
+compiled regex for more), `find_all` every match — the loop every drive used to
+write. The outline comes from purecdp's in-page walker by default: one
+evaluate, about 3× faster than pulling the browser's whole accessibility tree
+over the wire (31 vs 85 ms on a 300-row table), fewer wrapper rows, and it
+matched Chrome's native control set exactly on seven real pages in the test
+suite's dogfood; `page.snapshot(engine="native")` (or
+`page.snapshot_engine = "native"`, `--snapshot-engine native` for the MCP
+server) asks Chromium's Accessibility domain instead — Firefox has no tree
+command and always walks. And every page starts with a 1280×720 viewport
+(`Page.create(viewport=None)` to keep the browser's own; `launch(window_size=)`
+sizes the window itself).
+## Firefox (experimental)
+
+Firefox speaks WebDriver BiDi, not CDP. `launch(browser="firefox")` (or any
+`browser_path` whose name says firefox) starts it, connects over BiDi and hands
+back the same `Page` API, so a drive's scripting, navigation, console capture,
+queries, screenshots and PDF work unchanged:
+
+```python
+async with await purecdp.launch(browser="firefox") as browser:
+    page = await browser.new_page()
+    await page.goto("https://example.com")
+    print(await page.evaluate("(sel) => document.querySelector(sel).textContent", "h1"))
+```
+
+Trusted input (`type`, `press`, `mouse_click`, the human cursor), cookies,
+extra headers, user-agent / geolocation / timezone overrides, dialogs, frames
+(`page.frame()` reaches same-origin iframes too — on BiDi every iframe is a
+browsing context), `apply_stealth` / `launch(stealth=True)` (the engine-neutral
+subset, browser-wide at launch: `navigator.webdriver` reads false) and `CDPTestCase` with `BROWSER_KIND = "firefox"` (or
+`PURECDP_E2E_BROWSER=firefox`), request interception (`route`, `mock_api`,
+`relay`), the network recorder with bodies, `expect_download`, and the agent
+surface — `snapshot()`, `act()`, cross-frame snapshots and the MCP server
+(`python -m purecdp.mcp --browser firefox`) — all work. BiDi has no
+accessibility-tree command, so on Firefox the outline comes from an in-page
+walker that is validated against Chrome's real tree in the test suite; it is
+an approximation by design (an outline for a model, not a screen reader). The
+one thing that raises `NotSupported` is media emulation, which has no BiDi
+equivalent at all. Two documented differences:
+`type(insert=True)` is typed as key events on Firefox (there is no
+`insertText`, so key listeners fire), and `page.session` is `None` (`page.bidi`
+is the raw escape hatch, `await page.bidi.call("module.command", {...})`). No
+pipe transport. Chromium stays on CDP: Chrome's own BiDi endpoint is a mapper
+over CDP, so nothing is gained by switching it.
+
 ## Layout
 
 ```

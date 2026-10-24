@@ -22,7 +22,6 @@ import math
 import random
 import typing
 
-from ..protocol import input as input_proto
 
 if typing.TYPE_CHECKING:
     from .element import Element
@@ -99,8 +98,7 @@ class HumanCursor:
             dist = math.hypot(x - self.x, y - self.y)
             steps = max(6, min(60, int(dist / 8)))
         for px, py in self._path(x, y, steps, curve, jitter):
-            await self.page.session.execute(input_proto.dispatch_mouse_event(
-                type='mouseMoved', x=px, y=py))
+            await self.page._driver.mouse('mouseMoved', px, py)
             if max_delay > 0:
                 await asyncio.sleep(self._rng.uniform(min_delay, max_delay))
         self.x, self.y = x, y
@@ -126,9 +124,8 @@ class HumanCursor:
             raise ValueError('click needs an element or explicit x and y')
         await self.move_to(x, y, **move_kwargs)
         for kind in ('mousePressed', 'mouseReleased'):
-            await self.page.session.execute(input_proto.dispatch_mouse_event(
-                type=kind, x=self.x, y=self.y,
-                button=input_proto.MouseButton.LEFT, click_count=1))
+            await self.page._driver.mouse(kind, self.x, self.y, button='left',
+                                          click_count=1)
 
 
 async def human_type(
@@ -148,10 +145,8 @@ async def human_type(
     rng = rng or random.Random()
     base = 60.0 / (wpm * 5)  # seconds/char at wpm (≈5 chars/word)
     for ch in text:
-        await page.session.execute(input_proto.dispatch_key_event(
-            type='keyDown', text=ch, key=ch))
-        await page.session.execute(input_proto.dispatch_key_event(
-            type='keyUp', key=ch))
+        await page._driver.key('keyDown', key=ch, text=ch)
+        await page._driver.key('keyUp', key=ch)
         delay = base * (1 + rng.uniform(-variance, variance))
         if rng.random() < mistake_pause:  # a brief "thinking" pause
             delay += rng.uniform(0.15, 0.4)
@@ -183,7 +178,7 @@ async def human_scroll(
     weights = [math.sin((i + 1) / steps * math.pi / 2) for i in range(steps)]
     total = sum(weights)
     for w in weights:
-        await page.session.execute(input_proto.dispatch_mouse_event(
-            type='mouseWheel', x=px, y=py, delta_x=0, delta_y=delta_y * w / total))
+        await page._driver.mouse('mouseWheel', px, py, delta_x=0,
+                                 delta_y=delta_y * w / total)
         if max_delay > 0:
             await asyncio.sleep(rng.uniform(min_delay, max_delay))

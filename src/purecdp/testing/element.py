@@ -14,15 +14,9 @@ import asyncio
 import json
 import re
 import typing
-from contextlib import suppress
-
 
 from ..errors import PureCDPError
-from ..protocol import dom as dom_proto
-from ..protocol import input as input_proto
-from ..protocol import page as page_proto
-from ..protocol import runtime as runtime_proto
-from .. import _b64
+from ._driver import Handle
 
 if typing.TYPE_CHECKING:
     from .page import Page
@@ -208,9 +202,14 @@ async def _query_timeout(owner: typing.Any, selector: str,
 class Element:
     '''A held DOM node. Created by Page.query()/query_all()/Element.query().'''
 
-    def __init__(self, page: Page, object_id: str):
+    def __init__(self, page: Page, handle: Handle | str):
         self._page = page
-        self._object_id = object_id
+        self._handle = Handle.coerce(handle)
+
+    @property
+    def _object_id(self) -> str:
+        '''The backend object id (pre-seam spelling, kept for callers).'''
+        return self._handle.id
 
     def __repr__(self) -> str:
         return f'Element({self._object_id!r})'
@@ -218,23 +217,7 @@ class Element:
     async def eval(self, function: str, *args: typing.Any) -> typing.Any:
         '''Call ``function`` (JS, e.g. ``'(el) => el.textContent'``) with this
         element as its first argument, plus JSON-serializable *args.'''
-        from .page import JSError  # local import: page imports this module
-
-        call_args = [runtime_proto.CallArgument(
-            object_id=runtime_proto.RemoteObjectId(self._object_id))]
-        call_args += [runtime_proto.CallArgument(value=a) for a in args]
-        result, details = await self._page.session.execute(
-            runtime_proto.call_function_on(
-                function_declaration=(
-                    f'function(...args) {{ return ({function})(...args); }}'),
-                object_id=runtime_proto.RemoteObjectId(self._object_id),
-                arguments=call_args,
-                return_by_value=True,
-                await_promise=True,
-            ))
-        if details is not None:
-            raise JSError.from_details(details)
-        return result.value
+        return await self._page._driver.call(function, [self, *args])
 
     async def text(self) -> str:
         return (await self.eval('(el) => el.textContent')) or ''
@@ -306,9 +289,8 @@ class Element:
             ' return {x: r.x + r.width / 2, y: r.y + r.height / 2}; }')
         x, y = center['x'], center['y']
         for kind in ('mousePressed', 'mouseReleased'):
-            await self._page.session.execute(input_proto.dispatch_mouse_event(
-                type=kind, x=x, y=y,
-                button=input_proto.MouseButton.LEFT, click_count=1))
+            await self._page._driver.mouse(kind, x, y, button='left',
+                                           click_count=1)
 
     async def human_click(self, **move_kwargs: typing.Any) -> None:
         '''Move the cursor here along a human, curved path and click — trusted
@@ -370,13 +352,11 @@ class Element:
             await self.wait_actionable(hit=False, timeout=timeout)
         self._raise_if_failed(await self.eval(_FOCUS_FOR_TYPING), 'type')
         if insert:
-            await self._page.session.execute(input_proto.insert_text(text))
+            await self._page._driver.insert_text(text)
             return
         for ch in text:
-            await self._page.session.execute(input_proto.dispatch_key_event(
-                type='keyDown', text=ch, key=ch))
-            await self._page.session.execute(input_proto.dispatch_key_event(
-                type='keyUp', key=ch))
+            await self._page._driver.key('keyDown', key=ch, text=ch)
+            await self._page._driver.key('keyUp', key=ch)
 
     async def scroll_into_view(self) -> None:
         await self.eval(
@@ -386,9 +366,7 @@ class Element:
         '''The frameId this element *owns* — set for <iframe>/<frame> host
         nodes, else None. Used by Page.frame() to correlate an iframe to its
         out-of-process CDP session.'''
-        node = await self._page.session.execute(dom_proto.describe_node(
-            object_id=runtime_proto.RemoteObjectId(self._object_id)))
-        return str(node.frame_id) if node.frame_id is not None else None
+        return await self._page._driver.node_frame_id(self._handle)
 
     async def bounding_box(self) -> dict | None:
         '''The element's viewport rect as {x, y, width, height} (from
@@ -410,8 +388,7 @@ class Element:
     async def hover(self) -> None:
         '''Move the mouse to the element's center (Input.dispatchMouseEvent).'''
         center = await self._center()
-        await self._page.session.execute(input_proto.dispatch_mouse_event(
-            type='mouseMoved', x=center['x'], y=center['y']))
+        await self._page._driver.mouse('mouseMoved', center['x'], center['y'])
 
     async def screenshot(self, path: str | None = None, *, format: str = 'png'
                          ) -> bytes:
@@ -421,14 +398,8 @@ class Element:
         box = await self.bounding_box()
         if box is None:
             raise LookupError('element has no visible box to screenshot')
-        data = await self._page.session.execute(
-            page_proto.capture_screenshot(
-                format=format,
-                clip=page_proto.Viewport(
-                    x=box['x'], y=box['y'], width=box['width'],
-                    height=box['height'], scale=1),
-                capture_beyond_viewport=True))
-        raw = _b64.b64decode(data)
+        raw = await self._page._driver.screenshot(
+            format=format, clip={**box, 'scale': 1}, beyond_viewport=True)
         if path is not None:
             with open(path, 'wb') as f:
                 f.write(raw)
@@ -451,9 +422,7 @@ class Element:
     async def set_input_files(self, *paths: str) -> None:
         '''Set the files on a <input type=file>
         (DOM.setFileInputFiles), the way to drive uploads.'''
-        await self._page.session.execute(dom_proto.set_file_input_files(
-            files=list(paths),
-            object_id=runtime_proto.RemoteObjectId(self._object_id)))
+        await self._page._driver.set_files(self._handle, paths)
 
     async def query(
         self,
@@ -465,19 +434,8 @@ class Element:
         '''Single-shot scoped query inside this element (no polling); None
         when nothing matches.'''
         function = _query_js('el', selector, containing, index)
-        result, details = await self._page.session.execute(
-            runtime_proto.call_function_on(
-                function_declaration=f'function() {{ return ({function})(this); }}',
-                object_id=runtime_proto.RemoteObjectId(self._object_id),
-                return_by_value=False,
-            ))
-        if details is not None:
-            from .page import JSError
-
-            raise JSError.from_details(details)
-        if result.object_id is None:
-            return None
-        return Element(self._page, str(result.object_id))
+        handle = await self._page._driver.call_handle(function, [self])
+        return Element(self._page, handle) if handle is not None else None
 
     async def query_all(
         self,
@@ -492,39 +450,19 @@ class Element:
         a set (a node's buttons, a widget's chips); for a single node use
         :meth:`query`.'''
         function = _query_all_js('el', selector, containing)
-        result, details = await self._page.session.execute(
-            runtime_proto.call_function_on(
-                function_declaration=f'function() {{ return ({function})(this); }}',
-                object_id=runtime_proto.RemoteObjectId(self._object_id),
-                return_by_value=False,
-            ))
-        if details is not None:
-            from .page import JSError
-
-            raise JSError.from_details(details)
-        if result.object_id is None:
+        handle = await self._page._driver.call_handle(function, [self])
+        if handle is None:
             return []
-        return await _elements_from_array(self._page, str(result.object_id))
+        return await _elements_from_array(self._page, handle)
 
 
-async def _elements_from_array(owner: typing.Any, array_object_id: str
+async def _elements_from_array(owner: typing.Any, array: Handle | str
                                ) -> list[Element]:
-    '''Resolve a JS array RemoteObject (of DOM nodes) into held Elements in
-    index order, then release the array wrapper. The element handles are
-    independent object ids and outlive the array.'''
-    props, *_rest = await owner.session.execute(runtime_proto.get_properties(
-        runtime_proto.RemoteObjectId(array_object_id), own_properties=True))
-    indexed: list[tuple[int, Element]] = []
-    for prop in props:
-        if (prop.name.isdigit() and prop.value is not None
-                and prop.value.object_id is not None):
-            indexed.append(
-                (int(prop.name), Element(owner, str(prop.value.object_id))))
-    indexed.sort(key=lambda pair: pair[0])
-    with suppress(Exception):  # freeing the wrapper is best-effort
-        await owner.session.execute(runtime_proto.release_object(
-            runtime_proto.RemoteObjectId(array_object_id)))
-    return [element for _, element in indexed]
+    '''Resolve a JS array handle (of DOM nodes) into held Elements in index
+    order; the array wrapper is released. The element handles are
+    independent and outlive the array.'''
+    handles = await owner._driver.array_handles(Handle.coerce(array))
+    return [Element(owner, h) for h in handles]
 
 
 def _js_regex(pattern: re.Pattern) -> tuple[str, str]:
@@ -610,10 +548,10 @@ class ElementQueries:
         try:
             async with asyncio.timeout(timeout or self.default_timeout):
                 while True:
-                    result = await self.evaluate(
-                        f'({js})(document)', return_by_value=False)
-                    if result.object_id is not None:
-                        return Element(self, str(result.object_id))
+                    handle = await self._driver.evaluate_handle(
+                        f'({js})(document)')
+                    if handle is not None:
+                        return Element(self, handle)
                     await asyncio.sleep(poll)
         except TimeoutError:
             if required:
@@ -671,8 +609,8 @@ class ElementQueries:
         element *with* waiting, use :meth:`query`; to just count, use
         :meth:`query_count`.'''
         function = _query_all_js('document', selector, containing)
-        result = await self.evaluate(
-            f'({function})(document)', return_by_value=False)
-        if result.object_id is None:
+        async with asyncio.timeout(self.default_timeout):
+            handle = await self._driver.evaluate_handle(f'({function})(document)')
+        if handle is None:
             return []
-        return await _elements_from_array(self, str(result.object_id))
+        return await _elements_from_array(self, handle)

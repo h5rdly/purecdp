@@ -287,6 +287,9 @@ class FakeBrowser:
         if method == 'Runtime.callFunctionOn':
             result = (self.call_results.pop(0) if self.call_results
                       else {'result': {'type': 'undefined'}})
+            if 'error' in result:  # {'error': {'code': ..., 'message': ...}}
+                return [{'id': msg_id, 'error': result['error'],
+                         **({'sessionId': sid} if sid else {})}]
             return [ok(result)]
         if method == 'Page.captureScreenshot':
             # a 1x1 PNG, enough to prove the bytes round-trip

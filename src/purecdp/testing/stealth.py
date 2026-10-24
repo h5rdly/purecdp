@@ -247,6 +247,13 @@ EVASIONS: tuple[str, ...] = tuple(_EVASIONS)
 DEFAULT_EVASIONS: tuple[str, ...] = tuple(
     n for n in _EVASIONS if n not in OPT_IN_EVASIONS)
 
+#: What ``apply_stealth`` applies on Firefox (BiDi) when no ``evasions`` are
+#: named: the engine-neutral subset. ``navigator.webdriver`` is the one that
+#: matters — Gecko flips it on for any remote session and no pref clears it
+#: (``dom.webdriver.enabled`` does nothing on 157); a preload script
+#: redefining the getter does.
+GECKO_EVASIONS: tuple[str, ...] = ('navigator.webdriver', 'function.toString')
+
 _DEFAULT_CONFIG = {
     'languages': ('en-US', 'en'),
     'vendor': 'Google Inc.',
@@ -313,6 +320,15 @@ async def apply_stealth(
     Pairs with ``launch(stealth=True)`` and
     ``Page.create(capture=False, track_network=False)`` for the full baseline.
     '''
+    if getattr(page, 'backend', 'cdp') == 'bidi':
+        # Gecko: the Blink-shaped evasions (window.chrome, Chrome's plugin
+        # list, vendor "Google Inc.", Chrome codec answers) would each be a
+        # tell on Firefox, so only the engine-neutral ones apply by default;
+        # name ``evasions`` explicitly to opt into more. Workers: no session
+        # to inject into over BiDi (yet).
+        names = GECKO_EVASIONS if evasions is None else evasions
+        await page.add_init_script(build_stealth_script(names, **overrides))
+        return
     script = build_stealth_script(evasions, **overrides)
     await page.add_init_script(script)
     if workers:

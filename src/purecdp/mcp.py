@@ -357,8 +357,11 @@ class MCPServer:
         page_factory: typing.Callable[[], typing.Awaitable[Page]] | None = None,
         allow_eval: bool = False,
         allow_mock: bool = False,
+        snapshot_engine: str | None = None,
     ):
         self._launch_kwargs = launch_kwargs or {}
+        #: ``Page.snapshot_engine`` for the server's page ('native' | 'walker').
+        self._snapshot_engine: str | None = snapshot_engine
         self._page_factory = page_factory
         #: Opt-in gates (default False): `evaluate` (arbitrary page JS) and
         #: `mock` (inject fake responses) are neither advertised nor callable.
@@ -380,8 +383,9 @@ class MCPServer:
                 self._page = await self._page_factory()
             else:
                 self._browser = await launch(**self._launch_kwargs)
-                session = await self._browser.new_session()
-                self._page = await Page.create(session)
+                self._page = await self._browser.new_page()
+            if self._snapshot_engine:   # either way the page came to be
+                self._page.snapshot_engine = self._snapshot_engine
             # broad by default so early traffic is never missed; `record`
             # narrows it. Reuse an existing recorder if the factory made one.
             self._recorder = (self._page._recorders[0]
@@ -685,9 +689,16 @@ def main(argv: typing.Sequence[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     launch_kwargs = {'headless': '--headful' not in argv,
                      'stealth': '--stealth' in argv}
+    if '--browser' in argv:  # --browser firefox (WebDriver BiDi) | chromium
+        launch_kwargs['browser'] = argv[argv.index('--browser') + 1]
+    elif '--firefox' in argv:
+        launch_kwargs['browser'] = 'firefox'
+    snapshot_engine = (argv[argv.index('--snapshot-engine') + 1]
+                       if '--snapshot-engine' in argv else None)
     server = MCPServer(launch_kwargs=launch_kwargs,
                        allow_eval='--allow-eval' in argv,
-                       allow_mock='--allow-mock' in argv)
+                       allow_mock='--allow-mock' in argv,
+                       snapshot_engine=snapshot_engine)
     asyncio.run(serve_stdio(server))
 
 

@@ -12,10 +12,8 @@ import json as _json
 import typing
 from dataclasses import dataclass
 
-from ..connection import Session
-from ..protocol import fetch as fetch_proto
-from ..protocol import network as network_proto
-from .. import _b64, _fastjson
+from .. import _fastjson
+from ._driver import Paused
 
 #: An async callable receiving an InterceptedRequest; it should call exactly
 #: one of fulfill/continue_/abort (unhandled requests are continued).
@@ -113,41 +111,32 @@ class InterceptedRequest:
     '''One paused network request. Call exactly one of :meth:`fulfill`,
     :meth:`continue_`, or :meth:`abort`.'''
 
-    def __init__(self, session: Session, event: fetch_proto.RequestPaused):
-        self._session = session
+    def __init__(self, driver: typing.Any, event: Paused):
+        self._driver = driver
         self._event = event
         self.handled = False
 
     @property
     def url(self) -> str:
-        return self._event.request.url
+        return self._event.url
 
     @property
     def method(self) -> str:
-        return self._event.request.method
+        return self._event.method
 
     @property
     def headers(self) -> dict:
-        return dict(self._event.request.headers)
+        return dict(self._event.headers)
 
     @property
     def resource_type(self) -> str:
-        return str(self._event.resource_type)
+        return self._event.resource_type or ''
 
     @property
     def post_data_bytes(self) -> bytes | None:
         '''The request body as sent, or None when the request has none.
-        Everything knowable is on the paused event already (no round-trip):
-        Chrome puts small text bodies in ``postData`` and large or binary
-        ones only in ``postDataEntries``.'''
-        request = self._event.request
-        if request.post_data is not None:
-            return request.post_data.encode()
-        if request.post_data_entries:
-            return b''.join(_b64.b64decode(entry.bytes)
-                            for entry in request.post_data_entries
-                            if entry.bytes)
-        return None
+        Everything knowable is on the paused event already (no round-trip).'''
+        return self._event.post_data
 
     @property
     def post_data(self) -> str | None:
@@ -164,7 +153,7 @@ class InterceptedRequest:
 
     def header(self, name: str) -> str | None:
         '''Case-insensitive request-header lookup (None when absent).'''
-        return next((v for k, v in self._event.request.headers.items()
+        return next((v for k, v in self._event.headers.items()
                      if k.lower() == name.lower()), None)
 
     _header = header  # pre-0.9.0 private spelling, kept for one release
@@ -192,10 +181,9 @@ class InterceptedRequest:
         )
 
     @staticmethod
-    def _header_entries(headers: Headers | None
-                        ) -> list[fetch_proto.HeaderEntry]:
+    def _header_entries(headers: Headers | None) -> list[tuple[str, str]]:
         pairs = headers.items() if isinstance(headers, dict) else (headers or ())
-        return [fetch_proto.HeaderEntry(name=k, value=v) for k, v in pairs]
+        return [(k, v) for k, v in pairs]
 
     async def fulfill(
         self,
@@ -225,21 +213,14 @@ class InterceptedRequest:
         self.handled = True
         entries = self._header_entries(headers)
         if content_type is not None:
-            entries.append(fetch_proto.HeaderEntry(name='Content-Type',
-                                                   value=content_type))
-        if cors and not any(e.name.lower() == 'access-control-allow-origin'
-                            for e in entries):
-            origin = next((v for k, v in self._event.request.headers.items()
-                           if k.lower() == 'origin'), '*')
-            entries.append(fetch_proto.HeaderEntry(
-                name='Access-Control-Allow-Origin', value=origin))
+            entries.append(('Content-Type', content_type))
+        if cors and not any(k.lower() == 'access-control-allow-origin'
+                            for k, _ in entries):
+            entries.append(('Access-Control-Allow-Origin',
+                            self.header('Origin') or '*'))
         raw = body.encode() if isinstance(body, str) else body
-        await self._session.execute(fetch_proto.fulfill_request(
-            request_id=self._event.request_id,
-            response_code=status,
-            response_headers=entries or None,
-            body=_b64.b64encode(raw).decode() if raw else None,
-        ))
+        await self._driver.fulfill(self._event.request_id, status=status,
+                                   headers=entries, body=raw)
 
     async def continue_(
         self,
@@ -252,18 +233,11 @@ class InterceptedRequest:
         '''Let the request proceed, optionally rewriting parts of it.'''
         self.handled = True
         raw = post_data.encode() if isinstance(post_data, str) else post_data
-        await self._session.execute(fetch_proto.continue_request(
-            request_id=self._event.request_id,
-            url=url,
-            method=method,
-            post_data=_b64.b64encode(raw).decode() if raw else None,
-            headers=self._header_entries(headers) if headers else None,
-        ))
+        await self._driver.continue_(
+            self._event.request_id, url=url, method=method, post_data=raw,
+            headers=self._header_entries(headers) if headers else None)
 
     async def abort(self, reason: str = 'Aborted') -> None:
         '''Fail the request (fetch() in the page rejects).'''
         self.handled = True
-        await self._session.execute(fetch_proto.fail_request(
-            request_id=self._event.request_id,
-            error_reason=network_proto.ErrorReason(reason),
-        ))
+        await self._driver.fail(self._event.request_id, reason)

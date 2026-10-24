@@ -101,6 +101,17 @@ class BrowserLaunchError(PureCDPError):
     published its debugging endpoint.'''
 
 
+class NotSupported(PureCDPError):
+    '''A feature with no mapping on this backend (CDP vs WebDriver BiDi).
+    Raised at the call, naming the feature and the backend, so a drive that
+    never uses the feature never notices.'''
+
+    def __init__(self, feature: str, backend: str):
+        super().__init__(f'{feature} is not supported on the {backend} backend')
+        self.feature = feature
+        self.backend = backend
+
+
 class ProtocolDriftWarning(UserWarning):
     '''The browser sent an event the pinned spec can parse only partially;
     the payload was preserved raw instead of crashing dispatch.'''

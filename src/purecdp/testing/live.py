@@ -263,16 +263,16 @@ class Live(LiveFactories):
         return f'({_LIVE_JS})({json.dumps(self._steps)}, {json.dumps(mode)})'
 
     async def _resolve_one(self) -> Element | None:
-        result = await self._owner.evaluate(self._call('one'), return_by_value=False)
-        if result.object_id is None:
-            return None
-        return Element(self._owner, str(result.object_id))
+        async with asyncio.timeout(self._owner.default_timeout):
+            handle = await self._owner._driver.evaluate_handle(self._call('one'))
+        return Element(self._owner, handle) if handle is not None else None
 
     async def _resolve_all(self) -> list[Element]:
-        result = await self._owner.evaluate(self._call('all'), return_by_value=False)
-        if result.object_id is None:
+        async with asyncio.timeout(self._owner.default_timeout):
+            handle = await self._owner._driver.evaluate_handle(self._call('all'))
+        if handle is None:
             return []
-        return await _elements_from_array(self._owner, str(result.object_id))
+        return await _elements_from_array(self._owner, handle)
 
     async def _wait_one(self, timeout: float | None = None) -> Element:
         '''Poll until the query matches at least one element (auto-wait).'''

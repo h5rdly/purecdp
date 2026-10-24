@@ -11,7 +11,7 @@ import os
 import unittest
 from contextlib import suppress
 
-from ..browser import find_browser, launch
+from ..browser import find_browser, find_firefox, launch
 from .artifacts import _sanitize, artifacts_dir, dump_artifacts
 from .page import Page
 
@@ -38,6 +38,12 @@ class CDPTestCase(unittest.IsolatedAsyncioTestCase):
     PIPE = False
     BROWSER_PATH: str | None = None
     EXTRA_ARGS: tuple[str, ...] = ()
+    #: ``'chromium'`` (CDP, default) or ``'firefox'`` (WebDriver BiDi,
+    #: experimental); None reads $PURECDP_E2E_BROWSER. On Firefox the
+    #: Chromium-specific EXTRA_ARGS / $PURECDP_LAUNCH_ARGS are NOT passed —
+    #: use FIREFOX_ARGS / $PURECDP_FIREFOX_ARGS.
+    BROWSER_KIND: str | None = None
+    FIREFOX_ARGS: tuple[str, ...] = ()
     DEFAULT_TIMEOUT = 10.0
     ARTIFACTS = True
     ARTIFACTS_DIR: str | None = None
@@ -45,16 +51,26 @@ class CDPTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self) -> None:
         await super().asyncSetUp()
-        path = self.BROWSER_PATH or find_browser()
-        if path is None:
-            self.skipTest('no Chromium-based browser found')
-        env_args = tuple(os.environ.get('PURECDP_LAUNCH_ARGS', '').split())
-        self.browser = await launch(
-            path,
-            headless=self.HEADLESS,
-            pipe=self.PIPE,
-            extra_args=(*self.EXTRA_ARGS, *env_args),
-        )
+        kind = self.BROWSER_KIND or os.environ.get('PURECDP_E2E_BROWSER') or 'chromium'
+        if kind == 'firefox':
+            path = self.BROWSER_PATH or find_firefox()
+            if path is None:
+                self.skipTest('no Firefox binary found')
+            env_args = tuple(os.environ.get('PURECDP_FIREFOX_ARGS', '').split())
+            self.browser = await launch(
+                path, browser='firefox', headless=self.HEADLESS,
+                extra_args=(*self.FIREFOX_ARGS, *env_args))
+        else:
+            path = self.BROWSER_PATH or find_browser()
+            if path is None:
+                self.skipTest('no Chromium-based browser found')
+            env_args = tuple(os.environ.get('PURECDP_LAUNCH_ARGS', '').split())
+            self.browser = await launch(
+                path,
+                headless=self.HEADLESS,
+                pipe=self.PIPE,
+                extra_args=(*self.EXTRA_ARGS, *env_args),
+            )
         self.context = await self.browser.new_context()
         self.page = await self.new_page()
 
@@ -75,8 +91,7 @@ class CDPTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def new_page(self) -> Page:
         '''An additional Page in the same isolated context.'''
-        session = await self.browser.new_session(context=self.context)
-        page = await Page.create(session, default_timeout=self.DEFAULT_TIMEOUT)
+        page = await self.context.new_page(default_timeout=self.DEFAULT_TIMEOUT)
         if self.ARTIFACTS_NETWORK and self._artifacts_on():
             page.record()
         if not hasattr(self, '_pages'):

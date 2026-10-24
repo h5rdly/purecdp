@@ -20,14 +20,13 @@ import asyncio
 import typing
 
 from ..errors import PureCDPError
-from ..protocol import runtime as runtime_proto
 from . import _agent
 from .element import Element, ElementQueries
 from .live import LiveFactories
 from .snapshot import Snapshot
 
 if typing.TYPE_CHECKING:
-    from .connection import Session
+    from ._driver import Driver
     from .page import Page
 
 
@@ -43,9 +42,9 @@ class Frame(ElementQueries, LiveFactories):
 
     _where = ' in frame'         # seasons ElementQueries timeout messages
 
-    def __init__(self, page: Page, session: Session, frame_id: str):
+    def __init__(self, page: Page, driver: Driver, frame_id: str):
         self.page = page                 # the Page this iframe is embedded in
-        self.session = session           # the frame's own (OOPIF) CDP session
+        self._driver = driver            # the frame's own scope (CDP: its session)
         self.frame_id = frame_id
         self.default_timeout = page.default_timeout
         self._dismissers = page._dismissers      # shared with the page
@@ -54,6 +53,11 @@ class Frame(ElementQueries, LiveFactories):
 
     def __repr__(self) -> str:
         return f'Frame({self.frame_id!r})'
+
+    @property
+    def session(self):
+        '''The frame's own CDP session (the escape hatch; CDP backend only).'''
+        return getattr(self._driver, 'session', None)
 
     @property
     def cursor(self):
@@ -75,23 +79,11 @@ class Frame(ElementQueries, LiveFactories):
         '''Evaluate JS in the frame's context; raises JSError on exceptions.
         With positional ``*args`` the expression must be a function
         declaration, called injection-safely — see :meth:`Page.evaluate`.'''
-        from .page import JSError, _call_function  # local: page imports this module lazily
+        from .page import _evaluate  # local: page imports this module lazily
         async with asyncio.timeout(timeout or self.default_timeout):
-            if args:
-                return await _call_function(
-                    self.session, expression, args,
-                    await_promise=await_promise,
-                    return_by_value=return_by_value,
-                    user_gesture=user_gesture)
-            result, details = await self.session.execute(runtime_proto.evaluate(
-                expression=expression,
-                return_by_value=return_by_value,
-                await_promise=await_promise,
-                user_gesture=True if user_gesture else None,
-            ))
-        if details is not None:
-            raise JSError.from_details(details)
-        return result.value if return_by_value else result
+            return await _evaluate(
+                self._driver, expression, args, await_promise=await_promise,
+                return_by_value=return_by_value, user_gesture=user_gesture)
 
     # query/query_count/query_all and live()/get_by_* are inherited —
     # ElementQueries (element.py) and LiveFactories (live.py), shared with Page.
@@ -111,10 +103,13 @@ class Frame(ElementQueries, LiveFactories):
 
     # -- agent surface (shared with Page, scoped to this frame) ---------------
 
-    async def snapshot(self, *, depth: int | None = None) -> Snapshot:
+    async def snapshot(self, *, depth: int | None = None,
+                       engine: str | None = None) -> Snapshot:
         '''Ref-tagged accessibility outline of *this frame* (refs are
-        frame-local; a stitched page-wide snapshot is M10 Phase 3).'''
-        return await _agent.snapshot(self, depth=depth)
+        frame-local; a stitched page-wide snapshot is M10 Phase 3).
+        ``engine`` as in :meth:`Page.snapshot` (default: the page's).'''
+        return await _agent.snapshot(self, depth=depth,
+                                     engine=engine or self.page.snapshot_engine)
 
     async def element_for_ref(self, ref: str) -> Element:
         return await _agent.element_for_ref(self, ref)

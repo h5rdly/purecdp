@@ -2,11 +2,11 @@
 a *host*, so it works verbatim on a Page (the main frame) or a Frame (a
 cross-origin child frame — see frame.py).
 
-A host exposes ``.session`` (where DOM/AX/Runtime/Input commands go — the frame's
-own session for a Frame), a mutable ``._snapshot_refs`` dict, and the rest of the
-Element owner contract (``.default_timeout``, ``._dismissers``, ``.cursor``).
-Both Page and Frame do; every command runs against the host's own session in its
-own coordinate space, so the same code drives the top document or an OOPIF.
+A host exposes ``._driver`` (its own scope — the frame's own session for a
+Frame on CDP), a mutable ``._snapshot_refs`` dict, and the rest of the Element
+owner contract (``.default_timeout``, ``._dismissers``, ``.cursor``). Both Page
+and Frame do; every command runs against the host's own scope in its own
+coordinate space, so the same code drives the top document or an OOPIF.
 '''
 
 from __future__ import annotations
@@ -14,22 +14,13 @@ from __future__ import annotations
 import asyncio
 import typing
 
-from ..protocol import dom as dom_proto
+from ._cdp_driver import raw_command as _raw_command  # noqa: F401 (pre-seam name)
 from .element import Element
 from .snapshot import Snapshot, _from_wire, build_from_wire, build_snapshot
 
 #: AX roles for an <iframe> host node (whose subtree, for an OOPIF, lives in a
 #: separate session and must be stitched in — see stitched_snapshot).
 _IFRAME_ROLES = frozenset({'Iframe', 'iframe', 'IframePresentational'})
-
-
-def _raw_command(method: str, params: dict | None = None):
-    '''A CDP command whose result parse is the identity — yields the request
-    and returns the raw result dict. Drives the normal execute path (routing,
-    errors) but skips generated ``from_json``, so a caller can read the wire
-    directly (see snapshot).'''
-    result = yield {'method': method, 'params': params or {}}
-    return result
 
 
 def _scope_to_dialog(wire_nodes: list) -> tuple[list, bool]:
@@ -71,17 +62,21 @@ def _scope_to_dialog(wire_nodes: list) -> tuple[list, bool]:
     return [n for n in wire_nodes if str(n.get('nodeId')) in keep], True
 
 
+_ENGINES = ('native', 'walker')
+
+
+def _check_engine(engine: str) -> str:
+    if engine not in _ENGINES:
+        raise ValueError(f"engine must be 'native' or 'walker', not {engine!r}")
+    return engine
+
+
 async def snapshot(host: typing.Any, *, depth: int | None = None,
-                   scope: str | None = None) -> Snapshot:
+                   scope: str | None = None, engine: str = 'native') -> Snapshot:
     if scope not in (None, 'dialog'):
         raise ValueError(f"scope must be None or 'dialog', not {scope!r}")
-    params = {} if depth is None else {'depth': depth}
-    # Read the AX nodes straight off the wire: build_from_wire needs only a few
-    # fields, so parsing every node into a typed AXNode (then flattening it
-    # right back) is pure overhead — sizeable on large trees.
-    result = await host.session.execute(
-        _raw_command('Accessibility.getFullAXTree', params))
-    nodes = result.get('nodes', [])
+    _check_engine(engine)
+    nodes = await host._driver.ax_tree(depth=depth, engine=engine)
     note = ''
     if scope == 'dialog':
         nodes, found = _scope_to_dialog(nodes)
@@ -92,52 +87,45 @@ async def snapshot(host: typing.Any, *, depth: int | None = None,
         snap.text = note + snap.text
     host._snapshot_refs = dict(snap.refs)
     host._snapshot_owners = {}  # single frame — every ref resolves on host
+    host._snapshot_engine = engine
     return snap
 
 
-def _iframe_sessions(connection: typing.Any) -> set:
-    return {s for s in connection.sessions.values()
-            if s.target_info and 'iframe' in (s.target_info.type or '')}
-
-
-async def _settle_frames(connection: typing.Any, timeout: float = 0.5,
+async def _settle_frames(driver: typing.Any, timeout: float = 0.5,
                          interval: float = 0.03) -> None:
-    '''Wait until the attached-session count stops growing — nested OOPIFs
+    '''Wait until the attached-frame count stops growing — nested OOPIFs
     attach a level at a time as auto-attach propagates (see Page._enable_frame_
     attach). Best-effort: a frame still in flight just misses this snapshot.'''
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     prev = -1
     while loop.time() < deadline:
-        count = len(connection.sessions)
+        count = len(driver.frame_scopes())
         if count == prev:
             return
         prev = count
         await asyncio.sleep(interval)
 
 
-async def stitched_snapshot(page: typing.Any, *, depth: int | None = None) -> Snapshot:
+async def stitched_snapshot(page: typing.Any, *, depth: int | None = None,
+                            engine: str = 'native') -> Snapshot:
     '''A cross-frame snapshot: the page's AX tree with every attached
     cross-origin iframe's tree spliced in under its <iframe> node — recursively,
     to any nesting depth. Refs are numbered across the whole thing and each
     remembers its frame, so element_for_ref/act route to the right session.'''
-    from ..protocol import page as page_proto
     from .frame import Frame
 
+    _check_engine(engine)
     await page._enable_frame_attach()
-    connection = page.session.connection
-    await _settle_frames(connection)
-    params = {} if depth is None else {'depth': depth}
+    await _settle_frames(page._driver)
     merged: list[dict] = []
     token_to_frame: dict[str, typing.Any] = {}
     counter = [0]
-    remaining = _iframe_sessions(connection)
+    remaining = {scope.frame_id: scope for scope in page._driver.frame_scopes()}
 
-    async def frame_nodes(session, token):
-        result = await session.execute(
-            _raw_command('Accessibility.getFullAXTree', params))
+    async def frame_nodes(driver, token):
         mapped, by_backend = [], {}
-        for n in result.get('nodes', []):
+        for n in await driver.ax_tree(depth=depth, engine=engine):
             d = _from_wire(n)
             d['frame'] = token
             d['id'] = f'{token}:{d['id']}'
@@ -147,27 +135,27 @@ async def stitched_snapshot(page: typing.Any, *, depth: int | None = None) -> Sn
                 by_backend[int(d['backend'])] = d
         return mapped, by_backend
 
-    async def build(session, owner):
+    async def build(driver, owner):
         token = str(counter[0])
         counter[0] += 1
         if owner is not page:
             token_to_frame[token] = owner
-        mapped, by_backend = await frame_nodes(session, token)
+        mapped, by_backend = await frame_nodes(driver, token)
         merged.extend(mapped)
         # claim the OOPIFs whose <iframe> host node lives in *this* frame's tree
-        for s in list(remaining):
-            if s not in remaining:
+        for frame_id in list(remaining):
+            scope = remaining.get(frame_id)
+            if scope is None:
                 continue
-            try:
-                backend, _ = await session.execute(dom_proto.get_frame_owner(
-                    frame_id=page_proto.FrameId(str(s.target_id))))
-            except Exception:
-                continue  # frame isn't a descendant of this session's document
-            host_node = by_backend.get(int(backend))
+            backend = await driver.frame_owner(frame_id)
+            if backend is None:
+                continue  # frame isn't a descendant of this scope's document
+            host_node = by_backend.get(backend)
             if host_node is None:
                 continue
-            remaining.discard(s)
-            child_roots = await build(s, Frame(page, s, str(s.target_id)))
+            del remaining[frame_id]
+            child_roots = await build(
+                scope.driver, Frame(page, scope.driver, frame_id))
             host_node['children'].extend(child_roots)
         referenced = {c for d in mapped for c in d['children']}
         roots = [d for d in mapped if d['id'] not in referenced]
@@ -176,31 +164,30 @@ async def stitched_snapshot(page: typing.Any, *, depth: int | None = None) -> Sn
                 d['ignored'] = True
         return [d['id'] for d in roots]
 
-    await build(page.session, page)
+    await build(page._driver, page)
     snap = build_snapshot(merged)
     page._snapshot_refs = dict(snap.refs)
     page._snapshot_owners = {ref: token_to_frame[tok]
                              for ref, tok in snap.frames.items()
                              if tok in token_to_frame}
+    page._snapshot_engine = engine
     return snap
 
 
-async def _await_frame_session(connection: typing.Any, frame_id: str | None,
-                               url: str | None, timeout: float):
-    '''Poll attached sessions for the OOPIF: by target id (== frameId for
-    out-of-process frames) or by fnmatch on the frame URL. None on timeout.'''
+async def _await_frame_scope(driver: typing.Any, frame_id: str | None,
+                             url: str | None, timeout: float):
+    '''Poll the attached cross-origin frames for the OOPIF: by frame id or by
+    fnmatch on the frame URL. None on timeout.'''
     from fnmatch import fnmatch
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while True:
-        for s in connection.sessions.values():
-            if frame_id is not None and s.target_id == frame_id:
-                return s
-            info = s.target_info
-            if (url is not None and info is not None
-                    and 'iframe' in (info.type or '')
-                    and fnmatch(info.url or '', url)):
-                return s
+        await driver.enable_frame_attach()  # CDP: no-op after the first; BiDi: re-read the tree
+        for scope in driver.frame_scopes():
+            if frame_id is not None and scope.frame_id == frame_id:
+                return scope
+            if url is not None and fnmatch(scope.url, url):
+                return scope
         if loop.time() > deadline:
             return None
         await asyncio.sleep(0.03)
@@ -210,7 +197,7 @@ async def resolve_frame(host: typing.Any, page: typing.Any, selector: str | None
                         url: str | None, timeout: float | None):
     '''Resolve a cross-origin child iframe of ``host`` (a Page or a Frame) to a
     Frame. Shared by Page.frame() and Frame.frame() — the only difference is
-    which session the <iframe> is queried in (the host's).'''
+    which scope the <iframe> is queried in (the host's).'''
     from .frame import Frame, FrameNotFound
     await page._enable_frame_attach()
     to = timeout if timeout is not None else host.default_timeout
@@ -222,14 +209,13 @@ async def resolve_frame(host: typing.Any, page: typing.Any, selector: str | None
             raise FrameNotFound(f'{selector!r} is not a frame element')
     elif url is None:
         raise ValueError('frame() needs selector= or url=')
-    session = await _await_frame_session(
-        page.session.connection, frame_id, url, to)
-    if session is None:
+    scope = await _await_frame_scope(page._driver, frame_id, url, to)
+    if scope is None:
         raise FrameNotFound(
             f'frame {selector or url!r} did not attach within {to}s — is it '
             'actually cross-origin (out-of-process)? same-origin iframes have '
             'no separate session')
-    return Frame(page, session, frame_id or str(session.target_id))
+    return Frame(page, scope.driver, frame_id or scope.frame_id)
 
 
 async def element_for_ref(host: typing.Any, ref: str) -> Element:
@@ -238,13 +224,13 @@ async def element_for_ref(host: typing.Any, ref: str) -> Element:
         raise LookupError(
             f'unknown ref {ref!r}; call snapshot() first (known: '
             f'{len(host._snapshot_refs)} refs)')
-    # a cross-frame ref resolves on its own frame's session (see stitched_snapshot)
+    # a cross-frame ref resolves on its own frame's scope (see stitched_snapshot)
     owner = host._snapshot_owners.get(ref, host)
-    obj = await owner.session.execute(dom_proto.resolve_node(
-        backend_node_id=dom_proto.BackendNodeId(backend)))
-    if obj.object_id is None:
+    handle = await owner._driver.resolve_ax_node(
+        backend, engine=getattr(host, '_snapshot_engine', 'native'))
+    if handle is None:
         raise LookupError(f'ref {ref!r} no longer resolves; re-snapshot()')
-    return Element(owner, str(obj.object_id))
+    return Element(owner, handle)
 
 
 async def act(

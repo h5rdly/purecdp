@@ -18,13 +18,17 @@ from .browser import (
     BrowserContext,
     close_page,
     connect,
+    FirefoxBrowser,
+    browser_kind,
     find_browser,
+    find_firefox,
     launch,
     new_context,
     new_session,
 )
 from .connection import Connection, EventStream, Session, Transport
 from .errors import (
+    NotSupported,
     BrowserLaunchError,
     CDPClosedError,
     CDPConnectionClosed,
@@ -55,6 +59,10 @@ __all__ = [
     'launch',
     'connect',
     'find_browser',
+    'find_firefox',
+    'browser_kind',
+    'FirefoxBrowser',
+    'NotSupported',
     'new_context',
     'new_session',
     'close_page',

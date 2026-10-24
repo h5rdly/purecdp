@@ -89,6 +89,15 @@ class PageE2ETests(CDPTestCase):
         finally:
             server.close()
 
+    async def test_evaluate_calls_a_bare_function_literal(self):
+        '''No IIFE dance: a function literal with no args is invoked (both
+        engines; it used to come back as {} / None without running).'''
+        await self.page.goto('data:text/html,<title>lit</title>')
+        assert await self.page.evaluate('() => document.title') == 'lit'
+        assert await self.page.evaluate('async () => { await new Promise(r => setTimeout(r, 10)); return 7 }') == 7
+        assert await self.page.evaluate('function () { return 1 + 1 }') == 2
+        assert await self.page.evaluate('(() => 3)()') == 3     # an IIFE still works
+
     async def test_evaluate_with_args(self):
         assert await self.page.evaluate('(a, b) => a + b', 2, 3) == 5
         # async functions await like promise expressions do
@@ -210,6 +219,12 @@ class PageE2ETests(CDPTestCase):
     async def test_goto_network_idle(self):
         await self.page.goto('data:text/html,<p>quiet</p>', wait='idle')
         assert await self.page.evaluate('document.readyState') == 'complete'
+
+    async def test_default_viewport_is_1280x720(self):
+        '''launch(window_size=(1280, 720)) by default — Playwright's size,
+        on both engines (headless: the window IS the viewport).'''
+        await self.page.goto('data:text/html,<title>vp</title>')
+        assert await self.page.evaluate('[innerWidth, innerHeight]') == [1280, 720]
 
     async def test_second_page_same_context(self):
         other = await self.new_page()
@@ -640,6 +655,22 @@ class ConvenienceE2ETests(CDPTestCase):
             "fetch('https://svc.invalid/other').then(() => 'hit')"
             ".catch(() => 'passed-through')")
         assert outcome == 'passed-through'
+
+    async def test_evaluate_args_survive_navigation(self):
+        '''evaluate(fn, *args) anchors callFunctionOn on a per-session
+        globalThis handle. A navigation kills it (Chrome: -32000 "Cannot
+        find context with specified id"); the next call must re-anchor
+        and succeed, and keep the new anchor afterwards.'''
+        driver = self.page._driver
+        await self.page.goto('data:text/html,<title>a</title>one')
+        assert await self.page.evaluate('(n) => document.title + n', 1) == 'a1'
+        first = driver._global_anchor
+        await self.page.goto('data:text/html,<title>b</title>two')
+        assert await self.page.evaluate('(n) => document.title + n', 2) == 'b2'
+        second = driver._global_anchor
+        assert first is not None and second != first
+        assert await self.page.evaluate('(n) => document.title + n', 3) == 'b3'
+        assert driver._global_anchor == second
 
 
 @unittest.skipUnless(purecdp.find_browser(), 'no Chromium-based browser found')
@@ -1118,12 +1149,135 @@ class AgentSurfaceE2ETests(CDPTestCase):
         await self.page.act(button, 'click')
         assert await self.page.evaluate('window.clicked') == 1
 
+    async def test_walker_engine_drives_act(self):
+        '''snapshot(engine='walker') produces refs act() can use — the same
+        flow Firefox runs, here on Chromium next to the native tree.'''
+        await self.page.goto(self.FORM)
+        snap = await self.page.snapshot(engine='walker')
+        assert 'button "Sign in"' in snap.text and 'textbox "Email"' in snap.text
+        email = next(r for r, m in snap.meta.items() if m['name'] == 'Email')
+        button = next(r for r, m in snap.meta.items()
+                      if m['role'] == 'button' and m['name'] == 'Sign in')
+        await self.page.act(email, 'fill', text='a@b.c')
+        await self.page.act(button, 'click')
+        assert await self.page.evaluate('document.querySelector("input").value') == 'a@b.c'
+        assert await self.page.evaluate('window.clicked') == 1
+        # the native engine is still there, a flip away
+        native = await self.page.snapshot(engine='native')
+        assert 'button "Sign in"' in native.text
+        assert native.find('button', 'sign in') and snap.find('button', 'sign in')
+
     async def test_password_value_never_leaks(self):
         await self.page.goto(self.FORM)
         pw = next(r for r, m in (await self.page.snapshot()).meta.items()
                   if m['name'] == 'Password')
         await self.page.act(pw, 'fill', text='s3cret')
         assert 's3cret' not in str(await self.page.snapshot())
+
+
+class AXWalkerParityE2ETests(CDPTestCase):
+    '''M20 phase 4 oracle: the in-page accessibility walker (what Firefox
+    uses for snapshot()/act()) run in CHROME and diffed against Chrome's real
+    tree. Every actionable node Chrome reports must come out of the walker
+    with the same role, name, value and states; the walker may add context
+    (paragraph/label nodes Chrome folds) but never miss or misname a control.'''
+
+    EXTRA_ARGS = EXTRA
+
+    FIXTURES = {
+        'form': ('data:text/html,<title>login</title><form><h2>Sign in</h2>'
+                 '<input aria-label=Email type=email>'
+                 '<input aria-label=Password type=password value=hunter2>'
+                 '<button onclick="return false">Sign in</button></form>'),
+        'dialog': ('data:text/html,<button>Outer</button><dialog open>'
+                   '<input aria-label=Amount><button>Charge</button></dialog>'),
+        'mixed': ('data:text/html,<title>mix</title><nav><a href="/x">Home</a><a>plain</a></nav>'
+                  '<main><h1>Title</h1><p>Some <b>bold</b> text</p>'
+                  '<label>Agree <input type=checkbox checked></label>'
+                  '<label for=n>Name</label><input id=n placeholder="Your name" value=Bo>'
+                  '<select><option>One</option><option selected>Two</option></select>'
+                  '<ul><li>a</li><li>b</li></ul><img src=x alt=Logo><div hidden>secret</div>'
+                  '<details open><summary>More</summary><p>details</p></details>'
+                  '<button disabled>Nope</button><div role=button tabindex=0>divbtn</div>'
+                  '<input type=radio name=r aria-label=R1><textarea aria-label=Notes>hello</textarea>'
+                  '<input aria-label=Req required><button aria-pressed=true>Tog</button>'
+                  '<input aria-label=PIN type=password value=s3cret>'
+                  '<details><summary>Closed</summary><button>Hidden by details</button></details></main>'
+                  '<iframe title=Fr srcdoc="<p>inner</p>"></iframe>'),
+        'shadow': ('data:text/html,<my-el><a href=x>slotted</a></my-el>'
+                   '<script>customElements.define("my-el", class extends HTMLElement {'
+                   ' connectedCallback() { this.attachShadow({mode: "open"}).innerHTML ='
+                   ' "<button>Shadow btn</button><slot></slot>"; } })</script>'),
+        # the name rules the 2026-10-24 dogfood on real pages taught us
+        'names': ('data:text/html,<style>'
+                  '.ext::after { content: "\\200b" / " (external)"; }'
+                  '.up { text-transform: uppercase }'
+                  '.hid { visibility: hidden }'
+                  '.ghost::before { content: "#"; visibility: hidden }'
+                  '</style>'
+                  '<a class=ext href=x>Legal</a>'
+                  '<h2 class=up>downloads</h2>'
+                  '<h3><span class=ghost></span>Caret <a href=y aria-label="Direct link to Caret"></a></h3>'
+                  '<button>Danger <span class=hid>Loading</span></button>'
+                  '<a href=q><img alt=TechRadar><blockquote>a long quote</blockquote> Desire Athow</a>'
+                  '<a href=l><img alt="MediaWiki logo"></a>'
+                  '<svg role=img width=10 height=10><title>MDN</title><path d="M0 0h1"/></svg>'
+                  '<img src=x alt="">'
+                  '<a href=n>104&nbsp;comments</a>'
+                  '<ul><li><a href=p>plain</a></li></ul>'),
+    }
+    #: roles whose (role, name, value, states) must match exactly
+    CORE = frozenset({'button', 'link', 'textbox', 'searchbox', 'checkbox', 'radio',
+                      'combobox', 'listbox', 'option', 'heading', 'image', 'dialog',
+                      'slider', 'spinbutton', 'DisclosureTriangle', 'Iframe'})
+
+    @staticmethod
+    def _controls(snap):
+        import re
+        # the walker collapses runs of whitespace INCLUDING no-break spaces
+        # (friendlier for a model); compare names on that footing
+        return sorted((n['role'], re.sub(r'[\s\u00a0]+', ' ', n['name'] or '').strip(),
+                       n['value'], tuple(n['states']))
+                      for n in snap.nodes if n['ref'] and n['role'] in
+                      AXWalkerParityE2ETests.CORE)
+
+    async def test_walker_matches_chrome_on_every_control(self):
+        from purecdp.testing._ax_walker import AX_RESOLVE_JS, AX_WALKER_JS
+        from purecdp.testing.snapshot import build_from_wire
+        for name, url in self.FIXTURES.items():
+            await self.page.goto(url)
+            native = await self.page.snapshot()
+            walked = build_from_wire(await self.page.evaluate(AX_WALKER_JS, None))
+            assert self._controls(native) == self._controls(walked), (
+                f'{name}:\nchrome:\n{native.text}\nwalker:\n{walked.text}')
+            # a password's cleartext never crosses the wire, whatever its label
+            assert 's3cret' not in str(await self.page.evaluate(AX_WALKER_JS, None))
+            assert 'Hidden by details' not in walked.text
+            # refs resolve to the live element through the registry
+            for ref, meta in walked.meta.items():
+                if meta['role'] in ('button', 'textbox', 'checkbox'):
+                    tag = await self.page.evaluate(
+                        f'(i) => ({AX_RESOLVE_JS})(i).tagName', walked.refs[ref])
+                    assert tag in ('BUTTON', 'INPUT', 'TEXTAREA', 'DIV'), (name, ref, tag)
+            # the dialog scoping works on the walker's nodes too
+            if name == 'dialog':
+                from purecdp.testing._agent import _scope_to_dialog
+                scoped, found = _scope_to_dialog(await self.page.evaluate(AX_WALKER_JS, None))
+                assert found and 'Outer' not in build_from_wire(scoped).text
+
+    async def test_walker_prunes_hidden_and_respects_depth(self):
+        from purecdp.testing._ax_walker import AX_WALKER_JS
+        from purecdp.testing.snapshot import build_from_wire
+        await self.page.goto('data:text/html,<div hidden><button>H1</button></div>'
+                             '<div style="display:none"><button>H2</button></div>'
+                             '<div aria-hidden=true><button>H3</button></div>'
+                             '<div><div><div><button>Deep</button></div></div></div>'
+                             '<button>Top</button>')
+        full = build_from_wire(await self.page.evaluate(AX_WALKER_JS, None))
+        assert 'H1' not in full.text and 'H2' not in full.text and 'H3' not in full.text
+        assert 'Deep' in full.text and 'Top' in full.text
+        shallow = build_from_wire(await self.page.evaluate(AX_WALKER_JS, 2))
+        assert 'Top' in shallow.text and 'Deep' not in shallow.text
 
 
 class ActionabilityE2ETests(CDPTestCase):
@@ -1723,8 +1877,9 @@ class RelayE2ETests(CDPTestCase):
         same = await self.page.evaluate(post, '/api/turns?n=1')
         assert same == {'echo': {'q': 'hi'}, 'path': '/api/turns?n=1'}
         # cross-origin to a port nobody listens on: preflight answered by
-        # the pump, POST relayed — never touches the network
-        cross = await self.page.evaluate(post, 'http://127.0.0.1:1/api/x')
+        # the pump, POST relayed — never touches the network. (A high port:
+        # Firefox refuses port 1 as a blocked port BEFORE interception.)
+        cross = await self.page.evaluate(post, 'http://127.0.0.1:65530/api/x')
         assert cross == {'echo': {'q': 'hi'}, 'path': '/api/x'}
 
 

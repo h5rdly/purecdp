@@ -63,7 +63,7 @@ jobs:
         shell: bash
         run: |
           export PYTHONPATH="$PWD/src"
-          python -c "import purecdp; print('purecdp', purecdp.__version__, '| browser:', purecdp.find_browser())"
+          python -c "import purecdp; print('purecdp', purecdp.__version__, '| browser:', purecdp.find_browser(), '| firefox:', purecdp.find_firefox())"
 
       - name: Launch smoke
         shell: bash
@@ -72,13 +72,26 @@ jobs:
           export PYTHONPATH="$PWD/src"
           python -c "import asyncio, purecdp; loop = asyncio.new_event_loop(); b = loop.run_until_complete(purecdp.launch(extra_args=('--no-sandbox',))); loop.run_until_complete(b.aclose()); print('launch smoke: OK')"
 
-      - name: Run tests
+      - name: Run tests (Chromium / CDP)
         timeout-minutes: 20
+        env:
+          PURECDP_NO_FIREFOX: '1'   # the Firefox leg runs as its own step below
         run: >-
           python -X faulthandler -c "import faulthandler, sys, unittest;
-          faulthandler.dump_traceback_later(600, exit=True);
+          faulthandler.dump_traceback_later(900, exit=True);
           sys.exit(not unittest.TextTestRunner(verbosity=2).run(
           unittest.defaultTestLoader.discover('tests')).wasSuccessful())"
+
+      - name: Run tests (Firefox / WebDriver BiDi)
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          export PYTHONPATH="$PWD/src"
+          python -c "import purecdp; print('firefox:', purecdp.find_firefox())"
+          python -X faulthandler -c "import faulthandler, sys, unittest;
+          faulthandler.dump_traceback_later(900, exit=True);
+          sys.exit(not unittest.TextTestRunner(verbosity=2).run(
+          unittest.defaultTestLoader.loadTestsFromNames(['tests.test_firefox_e2e'])).wasSuccessful())"
 
       - name: Upload failure artifacts
         if: failure()

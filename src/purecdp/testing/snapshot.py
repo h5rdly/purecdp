@@ -98,6 +98,39 @@ class Snapshot:
     def __repr__(self) -> str:
         return f'Snapshot({len(self.refs)} refs)'
 
+    def find(self, role: str | None = None, name: str | typing.Pattern | None = None,
+             *, exact: bool = False) -> str | None:
+        '''The first ref (document order) whose node matches ``role`` (exact,
+        case-insensitive) and ``name`` — a case-insensitive substring, or an
+        exact match with ``exact=True``, or a compiled regex searched against
+        the name. None when nothing matches. The loop every drive used to
+        write: ``snap.find('button', 'sign in')`` → ``'e8'``.'''
+        return next(self.find_all(role, name, exact=exact), None)
+
+    def find_all(self, role: str | None = None,
+                 name: str | typing.Pattern | None = None, *,
+                 exact: bool = False) -> typing.Iterator[str]:
+        '''Every ref matching ``role`` / ``name`` (see :meth:`find`), in
+        document order.'''
+        want_role = role.lower() if role else None
+        for node in self.nodes:
+            ref = node['ref']
+            if not ref:
+                continue
+            if want_role is not None and (node['role'] or '').lower() != want_role:
+                continue
+            if name is not None:
+                have = node['name'] or ''
+                if hasattr(name, 'search'):
+                    if not name.search(have):
+                        continue
+                elif exact:
+                    if have.strip() != str(name).strip():
+                        continue
+                elif str(name).lower() not in have.lower():
+                    continue
+            yield ref
+
 
 def _line(node: dict) -> str:
     parts = ['  ' * node['depth'], '- ', node['role'] or 'generic']

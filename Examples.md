@@ -69,7 +69,12 @@ await page.evaluate("(el, cls) => el.classList.add(cls)", el, "active")
 
 Args must be JSON-serializable — or `Element` handles, which arrive as live
 DOM nodes (last line; `el.eval("(el, ...) => ...", ...)` is the same thing
-scoped to the element). The old way still works but don't reach for it:
+scoped to the element). Cost: one round-trip per call — the `globalThis`
+handle the call is anchored on is cached per session; a navigation kills it
+and the next call quietly re-anchors and retries once. The old way still
+works but don't reach for it. A function literal is always *called*: with no
+args `page.evaluate("() => location.href")` invokes it (it used to evaluate to
+the function object and hand back `{}`), so there is no IIFE dance:
 
 ```python
 # the anti-pattern: interpolating values into JS source. One quote in

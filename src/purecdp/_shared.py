@@ -49,3 +49,24 @@ def parse_event(method: str, params: T_JSON_DICT) -> typing.Any:
     if cls is None:
         return UnknownEvent(method=method, params=params)
     return cls.from_json(params)
+
+
+@dataclass(frozen=True, slots=True)
+class Handle:
+    '''A remote object held in the page, protocol-neutral. ``id`` is what
+    the backend uses to call on / release it (CDP objectId, BiDi handle — or
+    the sharedId when no handle was granted); ``node_id`` is the backend's
+    node identity when the object is a DOM node and the backend distinguishes
+    the two (BiDi sharedId; None on CDP, where objectId serves). ``raw`` is
+    the backend-native remote-object record, for callers that asked for one
+    (``Page.evaluate(return_by_value=False)``).'''
+
+    id: str
+    node_id: str | None = None
+    raw: typing.Any = field(default=None, compare=False, hash=False, repr=False)
+
+    @staticmethod
+    def coerce(value: Handle | str) -> Handle:
+        '''Accept a bare id string (the pre-seam ``Element(page, 'OBJ-1')``
+        spelling) as a Handle.'''
+        return value if isinstance(value, Handle) else Handle(str(value))

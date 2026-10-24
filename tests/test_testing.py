@@ -42,6 +42,10 @@ class PageTestBase(unittest.IsolatedAsyncioTestCase):
         await self.conn.open()
         session = await purecdp.new_session(self.conn, 'about:blank')
         self.page = await Page.create(session, default_timeout=5.0)
+        # the FakeBrowser answers Accessibility.getFullAXTree and cannot run
+        # the walker's JS: pin the native engine here (the class default is
+        # 'walker'; WalkerEngineTests covers both)
+        self.page.snapshot_engine = 'native'
 
     async def asyncTearDown(self):
         await self.page.stop()
@@ -254,6 +258,171 @@ class EvaluateTests(PageTestBase):
             raise AssertionError('expected ExpectationError')
 
 
+class DriverSeamTests(PageTestBase):
+    '''M20 phase 0: the testing layer talks to a Driver, never to a protocol
+    module; the CDP driver is the only implementation so far.'''
+
+    def test_page_and_frames_carry_a_cdp_driver(self):
+        from purecdp.testing._cdp_driver import CdpDriver
+        assert isinstance(self.page._driver, CdpDriver)
+        assert self.page._driver.backend == 'cdp'
+        assert self.page._driver.session is self.page.session
+        assert self.page._driver.alive is self.page.alive is True
+
+    def test_no_protocol_module_is_imported_outside_the_driver(self):
+        '''The seam is only a seam if nothing above it reaches for CDP.'''
+        import pathlib as _pl
+        import purecdp.testing as t
+        root = _pl.Path(t.__file__).parent
+        offenders = []
+        for mod in ('page', 'element', 'frame', 'live', 'intercept', 'recorder',
+                    '_agent', 'human', 'snapshot', 'artifacts', 'testcase'):
+            text = (root / f'{mod}.py').read_text()
+            if ('from ..protocol import' in text
+                    or 'from purecdp.protocol import' in text
+                    or 'import purecdp.protocol' in text):
+                offenders.append(mod)
+        assert offenders == [], offenders
+
+    def test_handle_coerces_bare_ids_and_elements_keep_the_old_spelling(self):
+        from purecdp.testing import Element, Handle
+        h = Handle.coerce('OBJ-7')
+        assert h == Handle('OBJ-7') and h.node_id is None and h.raw is None
+        assert Handle.coerce(h) is h
+        el = Element(self.page, 'OBJ-7')
+        assert el._object_id == 'OBJ-7' and el._handle == h
+        assert repr(el) == "Element('OBJ-7')"
+
+    async def test_evaluate_by_handle_returns_a_handle_or_none(self):
+        from purecdp.testing import Handle
+        self.fake.evaluate_results.append(
+            {'result': {'type': 'object', 'className': 'HTMLBodyElement',
+                        'objectId': 'OBJ-BODY'}})
+        handle = await self.page.evaluate('document.body', return_by_value=False)
+        assert isinstance(handle, Handle) and handle.id == 'OBJ-BODY'
+        assert handle.raw.class_name == 'HTMLBodyElement'   # the CDP record rides along
+        self.fake.evaluate_results.append({'result': {'type': 'number', 'value': 3}})
+        assert await self.page.evaluate('1 + 2', return_by_value=False) is None
+
+    def test_not_supported_names_feature_and_backend(self):
+        from purecdp import PureCDPError
+        from purecdp.testing import NotSupported
+        exc = NotSupported('media emulation', 'bidi')
+        assert isinstance(exc, PureCDPError)
+        assert exc.feature == 'media emulation' and exc.backend == 'bidi'
+        assert str(exc) == 'media emulation is not supported on the bidi backend'
+
+    async def test_element_eval_anchors_on_the_element_itself(self):
+        '''One round-trip: callFunctionOn on the element's own handle, no
+        globalThis anchor resolved or released.'''
+        from purecdp.testing import Element
+        before = len(self.sent('Runtime.evaluate'))
+        self.fake.call_results.append({'result': {'type': 'string', 'value': 'DIV'}})
+        assert await Element(self.page, 'OBJ-1').eval('(el) => el.tagName') == 'DIV'
+        call = self.sent('Runtime.callFunctionOn')[-1]['params']
+        assert call['objectId'] == 'OBJ-1'
+        assert call['arguments'] == [{'objectId': 'OBJ-1'}]
+        assert len(self.sent('Runtime.evaluate')) == before
+        assert self.sent('Runtime.releaseObject') == []
+
+
+class WalkerEngineTests(PageTestBase):
+    '''snapshot(engine='walker') on Chromium: the in-page walker instead of
+    Accessibility.getFullAXTree; refs resolve through the page registry.'''
+
+    WIRE = [
+        {'nodeId': 'ax0', 'ignored': False, 'role': {'value': 'RootWebArea'},
+         'name': {'value': 't'}, 'backendDOMNodeId': 0, 'childIds': ['ax1']},
+        {'nodeId': 'ax1', 'ignored': False, 'role': {'value': 'button'},
+         'name': {'value': 'Go'}, 'backendDOMNodeId': 1, 'childIds': []},
+    ]
+
+    def wire_result(self):
+        return {'result': {'type': 'object', 'value': self.WIRE}}
+
+    async def test_walker_engine_uses_call_function_not_ax_domain(self):
+        from purecdp.testing._ax_walker import AX_WALKER_JS
+        self.fake.evaluate_results.append({'result': {'type': 'object', 'objectId': 'G-1'}})
+        self.fake.call_results.append(self.wire_result())
+        snap = await self.page.snapshot(engine='walker')
+        assert snap.text.splitlines() == ['- RootWebArea "t" [e1]', '  - button "Go" [e2]']
+        assert self.sent('Accessibility.getFullAXTree') == []
+        call = self.sent('Runtime.callFunctionOn')[-1]['params']
+        assert AX_WALKER_JS in call['functionDeclaration']
+        assert call['arguments'] == [{}]   # depth None -> undefined -> no limit
+        # refs index the registry: element_for_ref calls the resolver, not DOM.resolveNode
+        from purecdp.testing._ax_walker import AX_RESOLVE_JS
+        self.fake.evaluate_results.append({'result': {'type': 'object', 'objectId': 'G-2'}})
+        self.fake.call_results.append({'result': {'type': 'object', 'subtype': 'node',
+                                                  'objectId': 'OBJ-GO'}})
+        el = await self.page.element_for_ref('e2')
+        assert el._object_id == 'OBJ-GO'
+        call = self.sent('Runtime.callFunctionOn')[-1]['params']
+        assert AX_RESOLVE_JS in call['functionDeclaration']
+        assert call['arguments'] == [{'value': 1}]
+        assert self.sent('DOM.resolveNode') == []
+
+    async def test_walker_is_the_default_and_native_is_a_flip_away(self):
+        from purecdp.testing import Page
+        assert Page.snapshot_engine == 'walker'          # the class default (2026-10-24)
+        assert self.page.snapshot_engine == 'native'      # PageTestBase pins native for the fake
+        self.fake.ax_nodes = list(self.WIRE)
+        await self.page.snapshot()
+        assert len(self.sent('Accessibility.getFullAXTree')) == 1
+        self.page.snapshot_engine = 'walker'
+        self.fake.evaluate_results.append({'result': {'type': 'object', 'objectId': 'G-1'}})
+        self.fake.call_results.append(self.wire_result())
+        await self.page.snapshot()
+        assert len(self.sent('Accessibility.getFullAXTree')) == 1   # unchanged
+        try:
+            await self.page.snapshot(engine='magic')
+        except ValueError as exc:
+            assert "'native' or 'walker'" in str(exc)
+        else:
+            raise AssertionError('bad engine accepted')
+
+    async def test_mcp_server_passes_the_engine_through(self):
+        from purecdp.mcp import MCPServer
+        server = MCPServer(snapshot_engine='walker')
+        assert server._snapshot_engine == 'walker'
+        from purecdp import mcp as mcp_mod
+        import inspect
+        src = inspect.getsource(mcp_mod.main)
+        assert '--snapshot-engine' in src and '--browser' in src
+
+
+class EvaluateLiteralTests(PageTestBase):
+    '''A function literal given to evaluate() with no args is CALLED, not
+    evaluated to a function object ({} on Chromium, None on Firefox).'''
+
+    async def test_arrow_and_function_literals_are_called(self):
+        from purecdp.testing.page import _is_function_literal
+        for src in ('() => 1', '(a, b) => a', 'x => x', 'async () => { return 1 }',
+                    'function () { return 1 }', 'async function f() {}',
+                    '  ( ) => 2'):
+            assert _is_function_literal(src), src
+        for src in ('1 + 1', 'document.title', '(() => 1)()', '((a) => a)(1)',
+                    '(\n(steps, mode) => steps)(1, 2)',          # Live's own call shape
+                    '(() => { const x = 1; return x; })()',      # _near_miss_js shape
+                    '[1].map(x => x)', 'window.fn = () => 1', 'a = b'):
+            assert not _is_function_literal(src), src
+        self.fake.evaluate_results.append({'result': {'type': 'object', 'objectId': 'G-1'}})
+        self.fake.call_results.append({'result': {'type': 'string', 'value': 'called'}})
+        before = len(self.sent('Runtime.evaluate'))
+        assert await self.page.evaluate('() => "called"') == 'called'
+        call = self.sent('Runtime.callFunctionOn')[-1]['params']
+        assert '() => "called"' in call['functionDeclaration'] and call['arguments'] == []
+        # the only Runtime.evaluate was the globalThis anchor, not the literal
+        assert [m['params']['expression'] for m in self.sent('Runtime.evaluate')[before:]] == ['globalThis']
+
+    async def test_by_handle_keeps_a_function_literal_as_an_expression(self):
+        self.fake.evaluate_results.append({'result': {'type': 'function', 'objectId': 'FN-1'}})
+        handle = await self.page.evaluate('() => 1', return_by_value=False)
+        assert handle is not None and handle.id == 'FN-1'
+        assert self.sent('Runtime.evaluate')[-1]['params']['expression'] == '() => 1'
+        assert self.sent('Runtime.callFunctionOn') == []
+
+
 class EvaluateArgsTests(PageTestBase):
     '''With positional args, evaluate() goes through Runtime.callFunctionOn —
     values travel as CallArguments, never interpolated into JS source.'''
@@ -269,9 +438,75 @@ class EvaluateArgsTests(PageTestBase):
         assert '(a, b) => a + b' in params['functionDeclaration']
         assert params['arguments'] == [{'value': 2}, {'value': 3}]
         assert params['objectId'] == 'G-1'
-        # the globalThis anchor is per-call and released afterwards
         assert self.sent('Runtime.evaluate')[-1]['params']['expression'] == 'globalThis'
-        assert self.sent('Runtime.releaseObject')[0]['params']['objectId'] == 'G-1'
+
+    async def test_anchor_is_cached_per_session(self):
+        '''Second call: one round-trip — no re-resolve, and nothing to release.'''
+        self.fake.evaluate_results.append(self.ANCHOR)
+        self.fake.call_results += [{'result': {'type': 'number', 'value': 1}},
+                                   {'result': {'type': 'number', 'value': 2}}]
+        before = len(self.sent('Runtime.evaluate'))
+        assert await self.page.evaluate('(a) => a', 1) == 1
+        assert await self.page.evaluate('(a) => a', 2) == 2
+        anchors = [m for m in self.sent('Runtime.evaluate')[before:]
+                   if m['params']['expression'] == 'globalThis']
+        assert len(anchors) == 1
+        calls = self.sent('Runtime.callFunctionOn')
+        assert [c['params']['objectId'] for c in calls] == ['G-1', 'G-1']
+        assert self.sent('Runtime.releaseObject') == []
+
+    async def test_dead_anchor_is_reanchored_and_retried_once(self):
+        '''A navigation killed the cached handle: CDP answers -32000. The
+        call re-resolves globalThis and retries transparently.'''
+        gone = {'error': {'code': -32000,
+                          'message': 'Cannot find context with specified id'}}
+        self.fake.evaluate_results += [
+            self.ANCHOR,
+            {'result': {'type': 'object', 'className': 'Window',
+                        'objectId': 'G-2'}}]
+        self.fake.call_results += [{'result': {'type': 'number', 'value': 1}},
+                                   gone,
+                                   {'result': {'type': 'number', 'value': 2}}]
+        assert await self.page.evaluate('(a) => a', 1) == 1
+        assert await self.page.evaluate('(a) => a', 2) == 2
+        calls = self.sent('Runtime.callFunctionOn')
+        assert [c['params']['objectId'] for c in calls] == ['G-1', 'G-1', 'G-2']
+        # and the new anchor is what later calls use
+        self.fake.call_results.append({'result': {'type': 'number', 'value': 3}})
+        assert await self.page.evaluate('(a) => a', 3) == 3
+        assert self.sent('Runtime.callFunctionOn')[-1]['params']['objectId'] == 'G-2'
+
+    async def test_fresh_anchor_failing_does_not_loop(self):
+        '''-32000 against a JUST-resolved anchor is a real error (a dead
+        Element handle among the args, say): raised, not retried forever.'''
+        from purecdp.errors import CDPCommandError
+        gone = {'error': {'code': -32000,
+                          'message': 'Could not find object with given id'}}
+        self.fake.evaluate_results.append(self.ANCHOR)
+        self.fake.call_results += [gone, gone, gone]
+        try:
+            await self.page.evaluate('(a) => a', 1)
+        except CDPCommandError as exc:
+            assert exc.code == -32000
+        else:
+            raise AssertionError('expected CDPCommandError')
+        assert len(self.sent('Runtime.callFunctionOn')) == 1
+        assert len(self.fake.call_results) == 2  # two canned errors unused
+
+    async def test_other_command_errors_are_not_retried(self):
+        from purecdp.errors import CDPCommandError
+        self.fake.evaluate_results.append(self.ANCHOR)
+        self.fake.call_results += [
+            {'result': {'type': 'number', 'value': 1}},
+            {'error': {'code': -32602, 'message': 'Invalid parameters'}}]
+        assert await self.page.evaluate('(a) => a', 1) == 1
+        try:
+            await self.page.evaluate('(a) => a', 2)
+        except CDPCommandError as exc:
+            assert exc.code == -32602
+        else:
+            raise AssertionError('expected CDPCommandError')
+        assert len(self.sent('Runtime.callFunctionOn')) == 2
 
     async def test_element_arg_becomes_a_handle(self):
         from purecdp.testing.element import Element
@@ -1501,8 +1736,11 @@ class CaptureOptInTests(unittest.IsolatedAsyncioTestCase):
 
 class EmulationWireTests(PageTestBase):
     async def test_set_viewport(self):
+        # Page.create already applied the default viewport (1280x720, dsf 1)
+        first = self.sent('Emulation.setDeviceMetricsOverride')[0]['params']
+        assert (first['width'], first['height'], first['deviceScaleFactor']) == (1280, 720, 1.0)
         await self.page.set_viewport(1280, 720, device_scale_factor=2.0)
-        p = self.sent('Emulation.setDeviceMetricsOverride')[0]['params']
+        p = self.sent('Emulation.setDeviceMetricsOverride')[-1]['params']
         assert p['width'] == 1280 and p['height'] == 720
         assert p['deviceScaleFactor'] == 2.0 and p['mobile'] is False
 
@@ -1778,6 +2016,38 @@ class AgentSurfaceTests(PageTestBase):
                 pass
             else:
                 raise AssertionError(f'expected ValueError for {action}')
+
+
+class SnapshotFindTests(unittest.TestCase):
+    def snap(self):
+        from purecdp.testing import build_snapshot
+        return build_snapshot([
+            {'id': 'r', 'ignored': False, 'role': 'RootWebArea', 'name': 'Login', 'value': None,
+             'props': {}, 'backend': 1, 'children': ['h', 'e', 'p', 'b', 'b2']},
+            {'id': 'h', 'ignored': False, 'role': 'heading', 'name': 'Sign in', 'value': None,
+             'props': {}, 'backend': 2, 'children': []},
+            {'id': 'e', 'ignored': False, 'role': 'textbox', 'name': 'Email', 'value': '',
+             'props': {}, 'backend': 3, 'children': []},
+            {'id': 'p', 'ignored': False, 'role': 'textbox', 'name': 'Password', 'value': None,
+             'props': {}, 'backend': 4, 'children': []},
+            {'id': 'b', 'ignored': False, 'role': 'button', 'name': 'Sign in', 'value': None,
+             'props': {}, 'backend': 5, 'children': []},
+            {'id': 'b2', 'ignored': False, 'role': 'button', 'name': 'Sign in with Google',
+             'value': None, 'props': {}, 'backend': 6, 'children': []},
+        ])
+
+    def test_find_by_role_and_name(self):
+        import re
+        snap = self.snap()
+        assert snap.find('button', 'sign in') == 'e5'          # role disambiguates the heading
+        assert snap.find('heading', 'SIGN IN') == 'e2'         # case-insensitive substring
+        assert snap.find('button', 'Sign in', exact=True) == 'e5'
+        assert snap.find('button', re.compile(r'google$', re.I)) == 'e6'
+        assert snap.find(name='password') == 'e4'               # role optional
+        assert snap.find('textbox') == 'e3'                     # name optional
+        assert snap.find('button', 'logout') is None
+        assert list(snap.find_all('button')) == ['e5', 'e6']
+        assert list(snap.find_all(name='sign in')) == ['e2', 'e5', 'e6']
 
 
 class SnapshotBuilderTests(unittest.TestCase):

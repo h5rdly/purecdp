@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import pathlib
+import re
 import shutil
 import tempfile
 import typing
@@ -19,18 +20,15 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from ..browser import Browser, close_page, launch
-from ..connection import EventStream, Session
+from ..browser import Browser, launch
+from ..connection import Session
 from ..errors import CDPClosedError, PureCDPError
-from .. import _b64
-from ..protocol import browser as browser_proto
-from ..protocol import emulation as emulation_proto
-from ..protocol import fetch as fetch_proto
-from ..protocol import input as input_proto
-from ..protocol import network as network_proto
-from ..protocol import page as page_proto
-from ..protocol import runtime as runtime_proto
 from . import _agent
+from ._cdp_driver import CdpDriver
+from ._driver import (Console, Dialog, DownloadBegin, DownloadProgress,
+                      Exception_, Failed, Finished, FrameStopped, Handle,
+                      JSError, Load, Paused, Request, RequestExtra, Response,
+                      ResponseExtra, Stream)
 from .element import Element, ElementQueries
 from .live import LiveFactories
 from .snapshot import Snapshot
@@ -57,6 +55,13 @@ _ADD_TAG_JS = '''
 }))()
 '''.strip()
 
+
+#: Default viewport every Page gets at create() (Playwright's 1280×720):
+#: emulated per page (device metrics on CDP, setViewport on BiDi) so
+#: innerWidth/innerHeight are exact regardless of window chrome — headless
+#: browsers reserve toolbar height even with --window-size. ``viewport=None``
+#: on create() keeps the browser's own.
+DEFAULT_VIEWPORT: tuple[int, int] | None = (1280, 720)
 
 #: Key descriptors for press(): (code, text, virtual key code).
 KEYS = {
@@ -85,80 +90,54 @@ class NavigateError(PureCDPError):
         self.net_error = net_error
 
 
-class JSError(PureCDPError):
-    '''A JavaScript exception, surfaced from evaluate() or captured uncaught.'''
-
-    def __init__(self, message: str, details: typing.Any = None):
-        super().__init__(message)
-        self.details = details  # protocol.runtime.ExceptionDetails
-
-    @classmethod
-    def from_details(cls, details: typing.Any) -> JSError:
-        exception = details.exception
-        if exception is not None and exception.description:
-            message = exception.description
-        elif exception is not None and exception.value is not None:
-            message = str(exception.value)
-        else:
-            message = details.text
-            if details.url:
-                message += f' ({details.url}:{details.line_number})'
-        return cls(message, details)
+#: An arrow function or a ``function`` expression, optionally async: the
+#: shapes evaluate() calls rather than evaluates.
+#: The parameter list may not contain parens: that is what keeps every IIFE
+#: shape — ``(() => 1)()``, ``((a) => a)(1)``, ``(fn)(args)`` — an expression.
+_FUNCTION_LITERAL = re.compile(
+    r'^\s*(?:async\s+)?(?:function\b|(?:\([^()]*\)|[A-Za-z_$][\w$]*)\s*=>)')
 
 
-async def _call_function(
-    session: Session,
-    function: str,
+def _is_function_literal(expression: str) -> bool:
+    return bool(_FUNCTION_LITERAL.match(expression))
+
+
+async def _evaluate(
+    driver: typing.Any,
+    expression: str,
     args: tuple,
     *,
     await_promise: bool = True,
     return_by_value: bool = True,
     user_gesture: bool = False,
 ) -> typing.Any:
-    '''``function(*args)`` in the page via Runtime.callFunctionOn — how
-    evaluate() passes values without interpolating them into JS source.
-    Anchored on a per-call ``globalThis`` handle: a cached one dies with
-    every navigation, and evaluate is nowhere near a hot path. Element args
-    become live handles (legal: element handles and the anchor are both
-    main-world); everything else must be JSON-serializable.'''
-    call_args = []
-    for index, arg in enumerate(args):
-        if isinstance(arg, Element):
-            call_args.append(runtime_proto.CallArgument(
-                object_id=runtime_proto.RemoteObjectId(arg._object_id)))
-            continue
-        try:
-            json.dumps(arg)
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f'evaluate() argument {index} is neither JSON-serializable '
-                f'nor an Element: {arg!r}') from exc
-        call_args.append(runtime_proto.CallArgument(value=arg))
-    anchor, _ = await session.execute(runtime_proto.evaluate(
-        expression='globalThis', return_by_value=False))
-    if anchor.object_id is None:  # can't realistically happen; fail loudly
-        raise JSError('could not resolve globalThis to anchor callFunctionOn')
-    try:
-        result, details = await session.execute(runtime_proto.call_function_on(
-            function_declaration=(
-                f'function(...args) {{ return ({function})(...args); }}'),
-            object_id=anchor.object_id,
-            arguments=call_args,
-            return_by_value=return_by_value,
-            await_promise=await_promise,
-            user_gesture=True if user_gesture else None,
-        ))
-    finally:
-        with suppress(Exception):
-            await session.execute(
-                runtime_proto.release_object(anchor.object_id))
-    if details is not None:
-        error = JSError.from_details(details)
-        if 'is not a function' in str(error):
-            error.add_note('with arguments, evaluate() takes a function '
-                           "declaration like '(a, b) => ...' as its expression")
-        raise error
-    return result.value if return_by_value else result
+    '''The shared body of Page.evaluate / Frame.evaluate over a driver:
+    a function literal is CALLED (with ``args``, which travel as protocol
+    arguments, never interpolated into JS source; Element args arrive as
+    live DOM nodes); anything else is evaluated as an expression.
+    ``return_by_value=False`` yields a :class:`~purecdp.testing._driver.Handle`
+    (None for a non-object result) instead of a JSON value — and keeps a
+    bare function literal as an expression, since a handle to a function is
+    a legitimate thing to ask for.'''
+    if not args and return_by_value and _is_function_literal(expression):
+        # '() => {...}' with no args used to be evaluated as an EXPRESSION:
+        # the function object itself came back — {} on Chromium, None on
+        # Firefox — and the body never ran. Nobody wants that; call it.
+        args = ()
+        return await driver.call(expression, args, await_promise=await_promise,
+                                 user_gesture=user_gesture)
+    if args:
+        if return_by_value:
+            return await driver.call(expression, args, await_promise=await_promise,
+                                     user_gesture=user_gesture)
+        return await driver.call_handle(expression, args,
+                                        await_promise=await_promise,
+                                        user_gesture=user_gesture)
+    if return_by_value:
+        return await driver.evaluate(expression, await_promise=await_promise,
+                                     user_gesture=user_gesture)
+    return await driver.evaluate_handle(expression, await_promise=await_promise,
+                                        user_gesture=user_gesture)
 
 
 @dataclass
@@ -205,22 +184,17 @@ class _DownloadExpectation:
         return self._task
 
 
-def _remote_text(obj: typing.Any) -> str:
-    '''Best-effort string for a runtime.RemoteObject.'''
-    if obj.value is not None:
-        return str(obj.value)
-    if obj.unserializable_value is not None:
-        return str(obj.unserializable_value)
-    if obj.description:
-        return obj.description
-    return str(obj.type)
-
-
 class Page(ElementQueries, LiveFactories):
     '''High-level page driver for tests. See Page.create().'''
 
-    def __init__(self, session: Session, default_timeout: float):
+    def __init__(self, session: Session | None, default_timeout: float, *,
+                 driver: typing.Any = None):
+        #: The CDP session — the typed escape hatch into ``purecdp.protocol``.
+        #: None on a non-CDP backend (Firefox over BiDi): use ``page.bidi``.
         self.session = session
+        #: The driver seam this page is written against (M20): every browser
+        #: operation goes through it.
+        self._driver = driver if driver is not None else CdpDriver(session)
         self.default_timeout = default_timeout
         #: Console messages captured since create(), oldest first.
         self.console: list[ConsoleMessage] = []
@@ -233,7 +207,7 @@ class Page(ElementQueries, LiveFactories):
         self._doc_requests: dict[str, str] = {}  # Document request_id -> frame_id
         self._doc_failures: dict[str, str] = {}  # frame_id -> net error string
         self._tasks: list[asyncio.Task] = []
-        self._streams: list[EventStream] = []
+        self._streams: list[Stream] = []
         #: NetworkRecorders started via record(); artifacts-on-failure dumps them.
         self._recorders: list[NetworkRecorder] = []
         self._routes: list[Route] = []
@@ -247,9 +221,6 @@ class Page(ElementQueries, LiveFactories):
         #: CSS selectors clicked away during an actionability wait — cookie /
         #: consent banners that block actions (see add_auto_dismiss).
         self._dismissers: list[str] = []
-        #: Armed on first frame() call — flat auto-attach for cross-origin
-        #: iframes (see _enable_frame_attach).
-        self._frame_attach_enabled = False
         #: Auto-answer CORS preflights for matched routes (see
         #: InterceptedRequest.respond_preflight). Disable for tests that are
         #: about preflight behavior itself.
@@ -264,7 +235,18 @@ class Page(ElementQueries, LiveFactories):
         front door: ``while page.alive: ...`` cannot spin on a dead tab —
         pair with ``except CDPClosedError: break`` for the give-up decision.
         '''
-        return not self.session.closed
+        return self._driver.alive
+
+    @property
+    def backend(self) -> str:
+        '''``'cdp'`` (Chromium) or ``'bidi'`` (Firefox).'''
+        return self._driver.backend
+
+    @property
+    def bidi(self):
+        '''The BiDi connection on a Firefox page — the raw escape hatch
+        (``await page.bidi.call("module.command", {...})``); None on CDP.'''
+        return getattr(self._driver, 'connection', None) if self.backend == 'bidi' else None
 
     @property
     def cursor(self):
@@ -295,6 +277,7 @@ class Page(ElementQueries, LiveFactories):
         default_timeout: float = 10.0,
         capture: bool = True,
         track_network: bool = True,
+        viewport: tuple[int, int] | None = DEFAULT_VIEWPORT,
     ) -> Page:
         '''Arm a Page over a session.
 
@@ -309,63 +292,75 @@ class Page(ElementQueries, LiveFactories):
         (``route``) and ``record`` enable their own domains on demand and are
         unaffected by these flags. The Page domain is always enabled (needed
         for navigation waits, low-risk).
+
+        ``viewport`` (default :data:`DEFAULT_VIEWPORT`, 1280×720) is applied
+        with :meth:`set_viewport`; ``None`` leaves the browser's own. A
+        fingerprint-minded drive may prefer None: an emulated viewport is
+        what Playwright does too, but it decouples ``screen`` from the window.
         '''
-        page = cls(session, default_timeout)
+        return await cls._create_with(CdpDriver(session), session,
+                                      default_timeout=default_timeout,
+                                      capture=capture, track_network=track_network,
+                                      viewport=viewport)
+
+    @classmethod
+    async def _create_with(
+        cls,
+        driver: typing.Any,
+        session: Session | None = None,
+        *,
+        default_timeout: float = 10.0,
+        capture: bool = True,
+        track_network: bool = True,
+        viewport: tuple[int, int] | None = DEFAULT_VIEWPORT,
+    ) -> Page:
+        '''Arm a Page over any driver (the backend-neutral half of create()).'''
+        page = cls(session, default_timeout, driver=driver)
         page._capture = capture
         page._track_network = track_network
-        event_types: list[type] = []
+        kinds: list[type] = []
         if capture:
-            event_types += [runtime_proto.ConsoleAPICalled,
-                            runtime_proto.ExceptionThrown]
+            kinds += [Console, Exception_]
         if track_network:
-            event_types += [network_proto.RequestWillBeSent,
-                            network_proto.LoadingFinished,
-                            network_proto.LoadingFailed]
-        if event_types:
+            kinds += [Request, Finished, Failed]
+        if kinds:
             # subscribe BEFORE enabling the domains, or early events are lost
-            stream = session.listen(*event_types, buffer_size=4096)
+            stream = page._driver.listen(*kinds, buffer_size=4096)
             page._streams.append(stream)
             page._tasks.append(asyncio.create_task(page._capture_pump(stream)))
-        await session.execute(page_proto.enable())
-        if capture:
-            await session.execute(runtime_proto.enable())
-        if track_network:
-            await session.execute(network_proto.enable())
+        await page._driver.arm(capture=capture, track_network=track_network)
+        if viewport is not None:
+            await page._driver.viewport(int(viewport[0]), int(viewport[1]))
         return page
 
     # -- capture -------------------------------------------------------------
 
-    async def _capture_pump(self, stream: EventStream) -> None:
+    async def _capture_pump(self, stream: Stream) -> None:
         with suppress(Exception):  # session teardown ends the pump
             async for event in stream:
-                if isinstance(event, runtime_proto.ConsoleAPICalled):
-                    self.console.append(ConsoleMessage(
-                        kind=str(event.type),
-                        text=' '.join(_remote_text(a) for a in event.args)))
-                elif isinstance(event, runtime_proto.ExceptionThrown):
-                    self.js_errors.append(
-                        JSError.from_details(event.exception_details))
-                elif isinstance(event, network_proto.RequestWillBeSent):
-                    self._inflight.add(str(event.request_id))
-                    if (event.type is not None and str(event.type) == 'Document'
+                if isinstance(event, Console):
+                    self.console.append(ConsoleMessage(kind=event.kind,
+                                                       text=event.text))
+                elif isinstance(event, Exception_):
+                    self.js_errors.append(event.error)
+                elif isinstance(event, Request):
+                    self._inflight.add(event.request_id)
+                    if (event.resource_type == 'Document'
                             and event.frame_id is not None):
-                        self._doc_requests[str(event.request_id)] = \
-                            str(event.frame_id)
+                        self._doc_requests[event.request_id] = event.frame_id
                     self._touch_network()
-                elif isinstance(event, (network_proto.LoadingFinished,
-                                        network_proto.LoadingFailed)):
-                    request_id = str(event.request_id)
+                elif isinstance(event, (Finished, Failed)):
+                    request_id = event.request_id
                     self._inflight.discard(request_id)
                     frame_id = self._doc_requests.pop(request_id, None)
-                    if (frame_id is not None
-                            and isinstance(event, network_proto.LoadingFailed)
+                    if (frame_id is not None and isinstance(event, Failed)
                             and not event.canceled):
                         # a document's load failed — goto() checks this to turn
                         # a silently-committed chrome-error:// page into a
                         # NavigateError that carries the net error. Canceled
                         # loads (ERR_ABORTED: a replaced/interrupted navigation)
                         # are not failures.
-                        self._doc_failures[frame_id] = str(event.error_text)
+                        self._doc_failures[frame_id] = event.error_text
                     self._touch_network()
 
     def _touch_network(self) -> None:
@@ -390,17 +385,14 @@ class Page(ElementQueries, LiveFactories):
             async with asyncio.timeout(to):
                 waiter = None
                 if wait != 'none':
-                    waiter = asyncio.create_task(
-                        self.session.wait_for(page_proto.LoadEventFired))
+                    waiter = asyncio.create_task(self._driver.wait_for(Load))
                     await asyncio.sleep(0)
                 try:
                     # clear BEFORE the browser can even receive the navigate:
                     # any document failure recorded after this belongs to it
                     # (clearing after would race the pump and could eat it)
                     self._doc_failures.clear()
-                    result = await self.session.execute(page_proto.navigate(url=url))
-                    frame_id = str(result[0])
-                    error_text = result[2]
+                    frame_id, error_text = await self._driver.navigate(url)
                     if error_text:
                         raise NavigateError(
                             f'navigation to {url!r} failed: {error_text}',
@@ -467,10 +459,8 @@ class Page(ElementQueries, LiveFactories):
             async with page.expect_navigation():
                 await page.click("button[type=submit]")
         '''
-        waiter = asyncio.create_task(
-            self.session.wait_for(page_proto.FrameStoppedLoading
-                                  if wait == 'idle' else
-                                  page_proto.LoadEventFired))
+        waiter = asyncio.create_task(self._driver.wait_for(
+            FrameStopped if wait == 'idle' else Load))
         await asyncio.sleep(0)
         try:
             async with asyncio.timeout(timeout or self.default_timeout):
@@ -492,8 +482,7 @@ class Page(ElementQueries, LiveFactories):
         handled dialog's message is appended to. Enables the Page domain
         events. Call once, before the code that triggers dialogs.'''
         seen: list[str] = []
-        stream = self.session.listen(page_proto.JavascriptDialogOpening,
-                                     buffer_size=64)
+        stream = self._driver.listen(Dialog, buffer_size=64)
         self._streams.append(stream)
 
         async def pump() -> None:
@@ -501,9 +490,8 @@ class Page(ElementQueries, LiveFactories):
                 async for event in stream:
                     seen.append(event.message)
                     with suppress(Exception):
-                        await self.session.execute(
-                            page_proto.handle_java_script_dialog(
-                                accept=accept, prompt_text=prompt_text))
+                        await self._driver.handle_dialog(
+                            accept=accept, prompt_text=prompt_text)
 
         self._tasks.append(asyncio.create_task(pump()))
         return seen
@@ -522,28 +510,20 @@ class Page(ElementQueries, LiveFactories):
         '''Evaluate JS and return its value; raises JSError on exceptions
         (including rejected promises, which are awaited by default).
 
-        With positional ``*args``, ``expression`` must be a FUNCTION
-        DECLARATION (``'(a, b) => a + b'``) and is called with the args via
-        Runtime.callFunctionOn — the injection-safe way to pass values in
-        (never interpolate them into the JS source). Args must be
-        JSON-serializable, or ``Element`` handles (which arrive as live DOM
-        nodes).'''
+        A FUNCTION LITERAL (``'(a, b) => a + b'``, ``'async () => {…}'``,
+        ``'function () {…}'``) is CALLED — with the positional ``*args`` via
+        Runtime.callFunctionOn, the injection-safe way to pass values in
+        (never interpolate them into the JS source); with no args it is
+        simply invoked (it used to be evaluated as an expression and hand
+        back the function object: ``{}``). Args must be JSON-serializable,
+        or ``Element`` handles (which arrive as live DOM nodes).
+        ``return_by_value=False`` returns a ``Handle`` to the result object
+        (None for a primitive) instead of its JSON value, and leaves a bare
+        function literal un-called.'''
         async with asyncio.timeout(timeout or self.default_timeout):
-            if args:
-                return await _call_function(
-                    self.session, expression, args,
-                    await_promise=await_promise,
-                    return_by_value=return_by_value,
-                    user_gesture=user_gesture)
-            result, details = await self.session.execute(runtime_proto.evaluate(
-                expression=expression,
-                return_by_value=return_by_value,
-                await_promise=await_promise,
-                user_gesture=True if user_gesture else None,
-            ))
-        if details is not None:
-            raise JSError.from_details(details)
-        return result.value if return_by_value else result
+            return await _evaluate(
+                self._driver, expression, args, await_promise=await_promise,
+                return_by_value=return_by_value, user_gesture=user_gesture)
 
     async def wait_for_function(
         self, expression: str, *, timeout: float | None = None, poll: float = 0.05
@@ -569,19 +549,9 @@ class Page(ElementQueries, LiveFactories):
         sessions. ``wait_for_debugger=False`` — subframes attach *live*, never
         paused, so there are no resume round-trips and no deadlock. Only called
         from frame(), so pages that never touch OOPIFs are unaffected.'''
-        if self._frame_attach_enabled:
-            return
-        self._frame_attach_enabled = True
-        conn = self.session.connection
-
-        async def _arm(session):  # propagate auto-attach into nested OOPIFs
-            info = session.target_info
-            if info is not None and 'iframe' in (info.type or ''):
-                await session.set_auto_attach(wait_for_debugger=False)
-
-        conn.add_session_hook(_arm)
-        await self.session.set_auto_attach(wait_for_debugger=False)
-        await asyncio.sleep(0.05)  # let already-loaded OOPIFs attach (one-time)
+        # the driver decides what "arm" means: CDP flat auto-attach, once;
+        # BiDi re-reads the context tree each time (cheap, and frames move)
+        await self._driver.enable_frame_attach()
 
     async def frame(
         self,
@@ -616,9 +586,17 @@ class Page(ElementQueries, LiveFactories):
         dismissal yourself before acting.'''
         self._dismissers.extend(selectors)
 
+    #: Default ``engine`` for :meth:`snapshot`: ``'walker'`` (purecdp's
+    #: in-page walker — one evaluate, 2–3× faster than the browser's tree on
+    #: big pages, fewer wrapper rows; matched Chrome's native control set
+    #: exactly on seven real pages in the 2026-10 dogfood; what Firefox always
+    #: uses) or ``'native'`` (CDP's Accessibility domain, Chromium only). Flip
+    #: once per page/drive: ``page.snapshot_engine = 'native'``.
+    snapshot_engine: str = 'walker'
+
     async def snapshot(
         self, *, depth: int | None = None, cross_frame: bool = False,
-        scope: str | None = None,
+        scope: str | None = None, engine: str | None = None,
     ) -> Snapshot:
         '''A compact, ref-tagged accessibility outline for an LLM to act on —
         ``str(snapshot)`` is the text to show the model, and every actionable
@@ -638,14 +616,25 @@ class Page(ElementQueries, LiveFactories):
         that's actually open". No dialog open -> the full page, with a
         leading note line saying so.
 
+        ``engine`` picks how the tree is produced (default
+        :attr:`snapshot_engine`, ``'walker'``): ``'walker'`` runs purecdp's
+        in-page walker (~30 ms for a 300-row table; validated against
+        Chrome's native tree in the test suite and on real pages;
+        outline-friendlier — no InlineTextBox/ListMarker rows, collapsed
+        whitespace), ``'native'`` asks the browser (CDP's Accessibility
+        domain — the reference, but it ships every node over the wire: ~85 ms
+        on the same page; Chromium only, Firefox always walks). Refs from
+        either resolve through :meth:`act` / :meth:`element_for_ref` as usual.
+
         Prefer this over feeding raw HTML/screenshots to a model: it's small,
         stable, and names controls the way a human sees them.'''
+        engine = engine or self.snapshot_engine
         if cross_frame:
             if scope is not None:
                 raise ValueError(
                     'scope= is not supported with cross_frame=True yet')
-            return await _agent.stitched_snapshot(self, depth=depth)
-        return await _agent.snapshot(self, depth=depth, scope=scope)
+            return await _agent.stitched_snapshot(self, depth=depth, engine=engine)
+        return await _agent.snapshot(self, depth=depth, scope=scope, engine=engine)
 
     async def element_for_ref(self, ref: str) -> Element:
         '''Resolve a snapshot ref (``e3``) to a live :class:`Element` — the
@@ -731,17 +720,14 @@ class Page(ElementQueries, LiveFactories):
         except KeyError:
             raise ValueError(
                 f'unknown key {key!r}; known: {', '.join(KEYS)}') from None
-        await self.session.execute(input_proto.dispatch_key_event(
-            type='keyDown', key=key, code=code, text=text_,
-            windows_virtual_key_code=vk, native_virtual_key_code=vk))
-        await self.session.execute(input_proto.dispatch_key_event(
-            type='keyUp', key=key, code=code,
-            windows_virtual_key_code=vk, native_virtual_key_code=vk))
+        await self._driver.key('keyDown', key=key, code=code, text=text_,
+                               virtual_key=vk)
+        await self._driver.key('keyUp', key=key, code=code, virtual_key=vk)
 
     async def insert_text(self, text: str) -> None:
         '''Type text into the focused element (Input.insertText — fires real
         input events, unlike JS value writes).'''
-        await self.session.execute(input_proto.insert_text(text))
+        await self._driver.insert_text(text)
 
     # -- page-level scripting ------------------------------------------------
 
@@ -750,8 +736,7 @@ class Page(ElementQueries, LiveFactories):
         (Page.addScriptToEvaluateOnNewDocument) — the way to seed
         sessionStorage/localStorage/globals before a SPA boots. Call before
         goto().'''
-        await self.session.execute(
-            page_proto.add_script_to_evaluate_on_new_document(source=source))
+        await self._driver.add_init_script(source)
 
     async def seed_session_storage(self, key: str, value: str) -> None:
         '''Plant a sessionStorage entry into every new document before the
@@ -862,15 +847,9 @@ class Page(ElementQueries, LiveFactories):
                                    record_preflights=record_preflights,
                                    default_timeout=default_timeout,
                                    bodies=bodies, redact=redact)
-        stream = self.session.listen(
-            network_proto.RequestWillBeSent,
-            network_proto.ResponseReceived,
-            network_proto.RequestWillBeSentExtraInfo,
-            network_proto.ResponseReceivedExtraInfo,
-            network_proto.LoadingFinished,
-            network_proto.LoadingFailed,
-            buffer_size=4096,
-        )
+        stream = self._driver.listen(
+            Request, Response, RequestExtra, ResponseExtra, Finished, Failed,
+            buffer_size=4096)
         self._streams.append(stream)
         self._tasks.append(asyncio.create_task(recorder._pump(stream)))
         self._recorders.append(recorder)
@@ -895,18 +874,10 @@ class Page(ElementQueries, LiveFactories):
         the body runs, so a download that starts immediately is not missed.
         Raises :class:`DownloadError` if the download is canceled or no
         completion arrives within ``timeout`` (the page default).'''
-        conn = self.session.connection
         directory = tempfile.mkdtemp(prefix='purecdp-download-')
-        # scope the behavior to THIS page's browser context — an isolated
-        # context (the CDPTestCase default) doesn't inherit the default one's,
-        # so a browser-wide call would leave the download denied → "canceled".
-        info = self.session.target_info
-        context_id = info.browser_context_id if info is not None else None
-        await conn.execute(browser_proto.set_download_behavior(
-            behavior='allowAndName', download_path=directory,
-            browser_context_id=context_id, events_enabled=True))
-        stream = conn.listen(browser_proto.DownloadWillBegin,
-                             browser_proto.DownloadProgress, buffer_size=256)
+        await self._driver.download_behavior(directory)
+        stream = self._driver.listen(DownloadBegin, DownloadProgress,
+                                     buffer_size=256)
         self._streams.append(stream)
 
         async def collect() -> Download:
@@ -915,9 +886,9 @@ class Page(ElementQueries, LiveFactories):
             try:
                 async with asyncio.timeout(timeout or self.default_timeout):
                     async for event in stream:
-                        if isinstance(event, browser_proto.DownloadWillBegin):
+                        if isinstance(event, DownloadBegin):
                             info, guid = event, event.guid
-                        elif (isinstance(event, browser_proto.DownloadProgress)
+                        elif (isinstance(event, DownloadProgress)
                               and event.guid == guid):
                             if event.state == 'completed':
                                 path = (event.file_path
@@ -957,10 +928,8 @@ class Page(ElementQueries, LiveFactories):
         full_page: bool = False,
     ) -> bytes:
         '''Capture a screenshot; returns the bytes, optionally writing path.'''
-        data = await self.session.execute(page_proto.capture_screenshot(
-            format=format, quality=quality,
-            capture_beyond_viewport=True if full_page else None))
-        raw = _b64.b64decode(data)
+        raw = await self._driver.screenshot(format=format, quality=quality,
+                                            beyond_viewport=full_page)
         if path is not None:
             with open(path, 'wb') as f:
                 f.write(raw)
@@ -970,9 +939,7 @@ class Page(ElementQueries, LiveFactories):
         '''Render the page to PDF (headless Chromium only). Extra keyword
         options pass straight to Page.printToPDF (landscape, print_background,
         paper_width, ...). Returns the bytes, optionally writing path.'''
-        data, _stream = await self.session.execute(
-            page_proto.print_to_pdf(**options))
-        raw = _b64.b64decode(data)
+        raw = await self._driver.pdf(**options)
         if path is not None:
             with open(path, 'wb') as f:
                 f.write(raw)
@@ -989,9 +956,8 @@ class Page(ElementQueries, LiveFactories):
         mobile: bool = False,
     ) -> None:
         '''Override the layout viewport (Emulation.setDeviceMetricsOverride).'''
-        await self.session.execute(emulation_proto.set_device_metrics_override(
-            width=width, height=height,
-            device_scale_factor=device_scale_factor, mobile=mobile))
+        await self._driver.viewport(width, height, scale=device_scale_factor,
+                                    mobile=mobile)
 
     async def set_user_agent(
         self,
@@ -1013,11 +979,9 @@ class Page(ElementQueries, LiveFactories):
         ``strip_headless_ua()`` to drop only the ``Headless`` token); to truly
         present a different fingerprint you need an external TLS-rewriting proxy,
         not CDP.'''
-        ua_metadata = (emulation_proto.UserAgentMetadata.from_json(metadata)
-                       if metadata is not None else None)
-        await self.session.execute(emulation_proto.set_user_agent_override(
-            user_agent=user_agent, accept_language=accept_language,
-            platform=platform, user_agent_metadata=ua_metadata))
+        await self._driver.user_agent(
+            user_agent, accept_language=accept_language, platform=platform,
+            metadata=metadata)
 
     async def strip_headless_ua(self) -> str:
         '''Rewrite ``HeadlessChrome/`` → ``Chrome/`` in the user agent (the
@@ -1046,53 +1010,45 @@ class Page(ElementQueries, LiveFactories):
         ('light'/'dark') and prefers-reduced-motion ('reduce'/'no-preference').'''
         features = []
         if color_scheme is not None:
-            features.append(emulation_proto.MediaFeature(
-                name='prefers-color-scheme', value=color_scheme))
+            features.append(('prefers-color-scheme', color_scheme))
         if reduced_motion is not None:
-            features.append(emulation_proto.MediaFeature(
-                name='prefers-reduced-motion', value=reduced_motion))
-        await self.session.execute(emulation_proto.set_emulated_media(
-            media=media, features=features or None))
+            features.append(('prefers-reduced-motion', reduced_motion))
+        await self._driver.media(media=media, features=features)
 
     async def set_geolocation(
         self, latitude: float, longitude: float, *, accuracy: float = 1.0
     ) -> None:
         '''Override geolocation (Emulation.setGeolocationOverride).'''
-        await self.session.execute(emulation_proto.set_geolocation_override(
-            latitude=latitude, longitude=longitude, accuracy=accuracy))
+        await self._driver.geolocation(latitude, longitude, accuracy=accuracy)
 
     async def set_timezone(self, timezone_id: str) -> None:
         '''Override the timezone, e.g. 'Europe/Paris'
         (Emulation.setTimezoneOverride).'''
-        await self.session.execute(
-            emulation_proto.set_timezone_override(timezone_id=timezone_id))
+        await self._driver.timezone(timezone_id)
 
     async def set_extra_headers(self, headers: dict[str, str]) -> None:
         '''Send these extra HTTP headers on every request
         (Network.setExtraHTTPHeaders); enables the Network domain.'''
         if not self._track_network:
-            await self.session.execute(network_proto.enable())
+            await self._driver.enable_network()
             self._track_network = True
-        await self.session.execute(network_proto.set_extra_http_headers(
-            headers=network_proto.Headers(headers)))
+        await self._driver.extra_headers(headers)
 
     # -- cookies & storage ---------------------------------------------------
 
     async def cookies(self, urls: list[str] | None = None) -> list[dict]:
         '''Return cookies (Network.getCookies) as CDP dicts (name, value,
         domain, path, ...).'''
-        got = await self.session.execute(network_proto.get_cookies(urls=urls))
-        return [c.to_json() for c in got]
+        return await self._driver.cookies(urls)
 
     async def set_cookies(self, cookies: list[dict]) -> None:
         '''Set cookies from CDP-shaped dicts (name + value required, plus url
         or domain/path; optional secure, httpOnly, sameSite, expires).'''
-        params = [network_proto.CookieParam.from_json(c) for c in cookies]
-        await self.session.execute(network_proto.set_cookies(cookies=params))
+        await self._driver.set_cookies(cookies)
 
     async def clear_cookies(self) -> None:
         '''Clear all browser cookies (Network.clearBrowserCookies).'''
-        await self.session.execute(network_proto.clear_browser_cookies())
+        await self._driver.clear_cookies()
 
     async def storage_state(self) -> dict:
         '''Snapshot cookies + localStorage for the current origin, in a shape
@@ -1120,9 +1076,7 @@ class Page(ElementQueries, LiveFactories):
     async def set_content(self, html: str) -> None:
         '''Replace the document's HTML (Page.setDocumentContent on the main
         frame).'''
-        tree = await self.session.execute(page_proto.get_frame_tree())
-        await self.session.execute(page_proto.set_document_content(
-            frame_id=tree.frame.id, html=html))
+        await self._driver.set_content(html)
 
     async def add_script_tag(
         self, *, url: str | None = None, content: str | None = None
@@ -1152,20 +1106,24 @@ class Page(ElementQueries, LiveFactories):
         self._routes.append(Route(pattern, handler))
         if not self._intercepting:
             self._intercepting = True
-            stream = self.session.listen(fetch_proto.RequestPaused,
-                                         buffer_size=4096)
+            stream = self._driver.listen(Paused, buffer_size=4096)
             self._streams.append(stream)
             self._tasks.append(asyncio.create_task(self._route_pump(stream)))
-            await self.session.execute(fetch_proto.enable())
+            await self._driver.enable_intercept()
 
     def clear_routes(self) -> None:
         '''Drop all routes (interception stays enabled; requests continue).'''
         self._routes.clear()
 
-    async def _route_pump(self, stream: EventStream) -> None:
+    async def _route_pump(self, stream: Stream) -> None:
         with suppress(Exception):  # session teardown ends the pump
             async for event in stream:
-                request = InterceptedRequest(self.session, event)
+                if event.post_data is None and event.body_size:
+                    # BiDi: the body is held by a data collector, not on the event
+                    with suppress(Exception):
+                        event.post_data = await self._driver.request_body(
+                            event.request_id)
+                request = InterceptedRequest(self._driver, event)
                 routes = matching_routes(self._routes, request.url)
                 try:
                     if routes and self.auto_preflight and request.is_cors_preflight:
@@ -1206,7 +1164,7 @@ class Page(ElementQueries, LiveFactories):
         '''aclose() and close the underlying page target.'''
         await self.stop()
         with suppress(Exception):
-            await close_page(self.session.connection, self.session)
+            await self._driver.close_target()
 
     async def __aenter__(self) -> Page:
         return self
@@ -1233,8 +1191,7 @@ async def launched_page(
     browser = await launch(browser_path, headless=headless, pipe=pipe,
                            extra_args=extra_args)
     try:
-        session = await browser.new_session()
-        page = await Page.create(session, default_timeout=default_timeout)
+        page = await browser.new_page(default_timeout=default_timeout)
         yield browser, page
     finally:
         await browser.aclose()

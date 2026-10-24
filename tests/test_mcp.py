@@ -38,7 +38,7 @@ class MCPServerTests(unittest.IsolatedAsyncioTestCase):
             session = await purecdp.new_session(self.conn, 'about:blank')
             return await Page.create(session, default_timeout=5.0)
 
-        self.server = MCPServer(page_factory=factory)
+        self.server = MCPServer(page_factory=factory, snapshot_engine='native')
 
     async def asyncTearDown(self):
         await self.conn.aclose()
@@ -77,7 +77,7 @@ class MCPServerTests(unittest.IsolatedAsyncioTestCase):
         async def factory():
             session = await purecdp.new_session(self.conn, 'about:blank')
             return await Page.create(session, default_timeout=5.0)
-        server = MCPServer(page_factory=factory, allow_eval=True)
+        server = MCPServer(page_factory=factory, snapshot_engine='native', allow_eval=True)
         listed = await server.handle(
             {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'})
         assert 'evaluate' in {t['name'] for t in listed['result']['tools']}
@@ -92,7 +92,7 @@ class MCPServerTests(unittest.IsolatedAsyncioTestCase):
         async def factory():
             session = await purecdp.new_session(self.conn, 'about:blank')
             return await Page.create(session, default_timeout=5.0)
-        server = MCPServer(page_factory=factory, allow_eval=True)
+        server = MCPServer(page_factory=factory, snapshot_engine='native', allow_eval=True)
         self.fake.evaluate_results = [           # the globalThis anchor
             {'result': {'type': 'object', 'objectId': 'G-1'}}]
         self.fake.call_results = [{'result': {'type': 'number', 'value': 5}}]
@@ -162,7 +162,7 @@ class MCPNetworkToolTests(unittest.IsolatedAsyncioTestCase):
             session = await purecdp.new_session(self.conn, 'about:blank')
             return await Page.create(session, default_timeout=5.0)
 
-        self.server = MCPServer(page_factory=factory)
+        self.server = MCPServer(page_factory=factory, snapshot_engine='native')
 
     async def asyncTearDown(self):
         await self.conn.aclose()
@@ -328,7 +328,7 @@ class MCPMockToolTests(unittest.IsolatedAsyncioTestCase):
             session = await purecdp.new_session(self.conn, 'about:blank')
             return await Page.create(session, default_timeout=5.0)
 
-        self.server = MCPServer(page_factory=factory, allow_mock=True)
+        self.server = MCPServer(page_factory=factory, snapshot_engine='native', allow_mock=True)
 
     async def asyncTearDown(self):
         await self.conn.aclose()

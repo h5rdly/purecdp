@@ -3,7 +3,9 @@
 The launcher runs the browser with an ephemeral debug port (or the pipe),
 connects, and guarantees teardown — kill the process, remove the temporary
 profile — as an async context manager. Anything Chromium-based works
-(Chromium, Chrome, Brave, Edge, headless-shell).
+(Chromium, Chrome, Brave, Edge, headless-shell) over CDP; Firefox works over
+WebDriver BiDi (``launch(browser="firefox")``, experimental — see
+:class:`FirefoxBrowser` for what is and isn't there yet).
 '''
 
 from __future__ import annotations
@@ -22,7 +24,8 @@ from urllib.parse import urlsplit
 
 from .connection import Connection
 from .discovery import get_version
-from .errors import BrowserLaunchError, TargetNotFound, TargetNotRealized
+from .errors import (BrowserLaunchError, NotSupported, TargetNotFound,
+                     TargetNotRealized)
 from .transport.pipe import spawn_pipe_process
 from .transport.websocket import WebSocketTransport
 
@@ -46,6 +49,39 @@ EXTRA_PATHS = (
     '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
 )
 
+#: Gecko binaries, checked by find_firefox() (never by find_browser(), whose
+#: callers expect CDP); override with $FIREFOX_BROWSER.
+FIREFOX_CANDIDATES = (
+    'firefox',
+    'firefox-esr',
+    'firefox-developer-edition',
+    'librewolf',
+    'waterfox',
+)
+FIREFOX_EXTRA_PATHS = (
+    '/Applications/Firefox.app/Contents/MacOS/firefox',
+)
+
+#: Profile prefs every Firefox launch gets (``user.js``): no first-run UI,
+#: no update/telemetry chatter, no session restore. Caller ``prefs`` win.
+FIREFOX_PREFS: dict[str, typing.Any] = {
+    'browser.shell.checkDefaultBrowser': False,
+    'browser.startup.page': 0,
+    'browser.startup.homepage_override.mstone': 'ignore',
+    'browser.sessionstore.resume_from_crash': False,
+    'browser.aboutwelcome.enabled': False,
+    'datareporting.policy.dataSubmissionEnabled': False,
+    'toolkit.telemetry.reportingpolicy.firstRun': False,
+    'app.update.auto': False,
+    'app.update.enabled': False,
+    'dom.disable_beforeunload': True,
+}
+
+#: Default window (= headless viewport) size for launch(); Playwright's
+#: 1280×720 rather than Chromium's 800×600 / Firefox's 1366×768, so
+#: screenshots and layout-dependent drives see the same page everywhere.
+DEFAULT_WINDOW_SIZE: tuple[int, int] | None = (1280, 720)
+
 DEFAULT_ARGS = (
     '--no-first-run',
     '--no-default-browser-check',
@@ -65,8 +101,9 @@ STEALTH_ARGS = (
 
 def find_browser() -> str | None:
     '''Locate a Chromium-based binary: $CDP_BROWSER, then PATH, then known
-    bundle locations. Returns None if nothing is found '''
-    
+    bundle locations. Returns None if nothing is found. (Firefox is found by
+    :func:`find_firefox` — a separate question, since it speaks BiDi.)'''
+
     if os.environ.get('PURECDP_NO_BROWSER'):
         return None
     env = os.environ.get('CDP_BROWSER')
@@ -80,6 +117,31 @@ def find_browser() -> str | None:
         if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
     return None
+
+
+def find_firefox() -> str | None:
+    '''Locate a Firefox (Gecko) binary: $FIREFOX_BROWSER, then PATH, then
+    the macOS bundle. None if nothing is found.'''
+    if os.environ.get('PURECDP_NO_BROWSER') or os.environ.get('PURECDP_NO_FIREFOX'):
+        return None
+    env = os.environ.get('FIREFOX_BROWSER')
+    if env:
+        return env
+    for name in FIREFOX_CANDIDATES:
+        path = shutil.which(name)
+        if path:
+            return path
+    for path in FIREFOX_EXTRA_PATHS:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def browser_kind(path: str) -> str:
+    '''``'firefox'`` when the binary name says Gecko, else ``'chromium'``.'''
+    name = path.replace('\\', '/').rsplit('/', 1)[-1].lower()
+    gecko = ('firefox', 'librewolf', 'waterfox')
+    return 'firefox' if any(g in name for g in gecko) else 'chromium'
 
 
 class BrowserContext:
@@ -215,6 +277,9 @@ class Browser:
     Async context manager; aclose() is idempotent and always reaps the
     process and (if we created it) the temporary profile directory.
     '''
+
+    #: ``'chromium'`` (CDP) — :class:`FirefoxBrowser` says ``'firefox'``.
+    kind = 'chromium'
 
     def __init__(
         self,
@@ -363,16 +428,26 @@ class Browser:
         # reply, so a hung browser still gets killed as fast as before.
         graceful = False
         if self.process is not None and self.process.returncode is None:
-            from .protocol import browser as _browser
-
-            try:
-                await self.connection.execute(
-                    _browser.close(), timeout=self.graceful_close_timeout)
-                graceful = True
-            except Exception:
-                pass
+            graceful = await self._graceful_close()
         with suppress(Exception):
-            await self.connection.aclose()
+            await self._close_connection()
+        await self._reap(graceful)
+
+    async def _graceful_close(self) -> bool:
+        '''Ask the browser to close itself over the wire; True on a reply.'''
+        from .protocol import browser as _browser
+
+        try:
+            await self.connection.execute(
+                _browser.close(), timeout=self.graceful_close_timeout)
+            return True
+        except Exception:
+            return False
+
+    async def _close_connection(self) -> None:
+        await self.connection.aclose()
+
+    async def _reap(self, graceful: bool) -> None:
         # process is None for a connect()ed browser — detach only, never
         # close, reap, or delete a browser/profile we didn't create.
         if self.process is not None and self.process.returncode is None:
@@ -524,6 +599,7 @@ class _StderrTail:
 async def launch(
     browser_path: str | None = None,
     *,
+    browser: str | None = None,
     headless: bool = True,
     pipe: bool = False,
     stealth: bool = False,
@@ -532,8 +608,15 @@ async def launch(
     prefs: dict | None = None,
     extra_args: typing.Sequence[str] = (),
     timeout: float = 30.0,
+    window_size: tuple[int, int] | None = DEFAULT_WINDOW_SIZE,
 ) -> Browser:
     '''Launch a browser and return a Browser with an open Connection.
+
+    ``window_size`` (default 1280×720) sizes the browser window; ``None``
+    keeps the browser's own default. The page VIEWPORT is a separate,
+    exact knob: ``Page.create(viewport=…)`` emulates 1280×720 per page by
+    default (headless browsers still reserve toolbar height, so a 720-high
+    window is a ~640-high viewport without it).
 
     Websocket mode uses ``--remote-debugging-port=0`` and reads the ephemeral
     endpoint from the profile's DevToolsActivePort file (no port collisions,
@@ -546,13 +629,40 @@ async def launch(
 
     ``ignore_https_errors=True`` accepts invalid/self-signed certificates
     (``--ignore-certificate-errors``) — for local-HTTPS and dev-proxy setups.
+
+    ``browser`` picks the engine: ``"chromium"`` (CDP, the default) or
+    ``"firefox"`` (WebDriver BiDi, experimental — see :class:`FirefoxBrowser`).
+    Left None, it is inferred from the binary's name, so ``browser_path=
+    "/usr/bin/firefox"`` just works; with no path at all, ``browser="firefox"``
+    looks for one via :func:`find_firefox`. On Firefox ``prefs`` go to the
+    profile's ``user.js``, ``ignore_https_errors`` becomes the
+    ``acceptInsecureCerts`` capability, ``pipe`` is an error, and ``stealth``
+    installs the Gecko evasions (``testing.GECKO_EVASIONS``: a
+    ``navigator.webdriver`` that reads false) as a browser-wide preload
+    script — every tab, like Chromium's launch flag.
     '''
-    path = browser_path or find_browser()
+    if browser not in (None, 'chromium', 'firefox'):
+        raise ValueError(f"browser must be 'chromium' or 'firefox', not {browser!r}")
+    path = browser_path or (find_firefox() if browser == 'firefox' else find_browser())
     if path is None:
+        if browser == 'firefox':
+            raise BrowserLaunchError(
+                'no Firefox binary found; install Firefox, or set '
+                '$FIREFOX_BROWSER, or pass browser_path=')
         raise BrowserLaunchError(
             'no browser binary found; install Chromium/Chrome/Brave, '
             'or set $CDP_BROWSER, or pass browser_path='
         )
+    kind = browser or browser_kind(path)
+    if kind == 'firefox':
+        if pipe:
+            raise BrowserLaunchError('Firefox has no pipe transport; use the '
+                                     'websocket (pipe=False)')
+        return await _launch_firefox(
+            path, headless=headless, user_data_dir=user_data_dir, prefs=prefs,
+            extra_args=extra_args, timeout=timeout,
+            ignore_https_errors=ignore_https_errors, stealth=stealth,
+            window_size=window_size)
     owns_profile = user_data_dir is None
     profile = user_data_dir or tempfile.mkdtemp(prefix='purecdp-profile-')
     if not owns_profile:
@@ -561,6 +671,8 @@ async def launch(
         _write_prefs(profile, prefs)
 
     argv = [path, f'--user-data-dir={profile}', *DEFAULT_ARGS]
+    if window_size is not None:
+        argv.append(f'--window-size={int(window_size[0])},{int(window_size[1])}')
     if stealth:
         argv += STEALTH_ARGS
     if ignore_https_errors:
@@ -686,3 +798,303 @@ async def _wait_for_endpoint(
                 f'{stderr_tail.suffix()}'
             )
         await asyncio.sleep(0.05)
+
+
+# -- Firefox over WebDriver BiDi (M20) ----------------------------------------
+
+_USER_JS_BEGIN = '// purecdp:begin (rewritten on every launch; edit outside this block)'
+_USER_JS_END = '// purecdp:end'
+
+
+def _write_user_js(profile: str, prefs: dict) -> None:
+    '''Write ``user_pref("k", v);`` lines into ``<profile>/user.js`` — the
+    Gecko counterpart of Chromium's ``Default/Preferences`` — inside a marked
+    block that is REPLACED on each launch, so a reused profile does not grow
+    a copy of the defaults per run and the user's own lines survive. Values
+    are JSON-encoded (bool/number/string are what Firefox accepts).'''
+    os.makedirs(profile, exist_ok=True)
+    path = os.path.join(profile, 'user.js')
+    kept: list[str] = []
+    with suppress(OSError):
+        with open(path, encoding='utf-8') as f:
+            inside = False
+            for line in f.read().splitlines():
+                if line.strip() == _USER_JS_BEGIN:
+                    inside = True
+                    continue
+                if line.strip() == _USER_JS_END:
+                    inside = False
+                    continue
+                if not inside:
+                    kept.append(line)
+    block = [_USER_JS_BEGIN]
+    block += [f'user_pref({json.dumps(k)}, {json.dumps(v)});' for k, v in prefs.items()]
+    block.append(_USER_JS_END)
+    text = '\n'.join([*[l for l in kept if l.strip()], *block]) + '\n'
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(text)
+
+
+def _firefox_lock_holder(profile: str) -> int | None:
+    '''PID of the live Firefox holding this profile, or None. Gecko's POSIX
+    lock is a symlink ``lock -> IP:+PID`` (plus a ``.parentlock`` file that
+    carries nothing readable); a dead PID is a stale lock from a crash and
+    doesn't block. Windows (``parent.lock`` held by a file lock) is skipped.'''
+    try:
+        holder = os.readlink(os.path.join(profile, 'lock'))
+    except OSError:
+        return None
+    _host, sep, pid_text = holder.rpartition('+')
+    if not sep or not pid_text.isdigit():
+        return None
+    pid = int(pid_text)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        return pid
+    except OSError:
+        return None
+    return pid
+
+
+_BIDI_SERVER_FILE = 'WebDriverBiDiServer.json'
+
+
+def _prepare_reused_firefox_profile(profile: str) -> None:
+    holder = _firefox_lock_holder(profile)
+    if holder is not None:
+        raise BrowserLaunchError(
+            f'profile {profile} is in use by PID {holder} (lock) — close that '
+            'Firefox or pass a different user_data_dir')
+    with suppress(OSError):
+        os.remove(os.path.join(profile, _BIDI_SERVER_FILE))
+
+
+async def _wait_for_bidi_endpoint(
+    process: asyncio.subprocess.Process, profile: str, timeout: float,
+    stderr_tail: _StderrTail,
+) -> str:
+    '''Poll ``<profile>/WebDriverBiDiServer.json`` (``{"ws_host", "ws_port"}``
+    — Firefox also prints "WebDriver BiDi listening on ws://…" to stderr, but
+    the file is the authoritative advertisement) and build the session URL.'''
+    port_file = os.path.join(profile, _BIDI_SERVER_FILE)
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        if process.returncode is not None:
+            await stderr_tail.wait_drained()
+            raise BrowserLaunchError(
+                f'Firefox exited with code {process.returncode} before '
+                f'publishing its BiDi endpoint{stderr_tail.suffix()}')
+        info: dict = {}
+        with suppress(OSError, ValueError):
+            with open(port_file, encoding='utf-8') as f:
+                info = json.load(f)
+        if isinstance(info, dict) and info.get('ws_port'):
+            host = info.get('ws_host') or '127.0.0.1'
+            return f'ws://{host}:{int(info["ws_port"])}/session'
+        if asyncio.get_running_loop().time() > deadline:
+            raise BrowserLaunchError(
+                f'Firefox did not publish {port_file} within {timeout}s'
+                f'{stderr_tail.suffix()}')
+        await asyncio.sleep(0.05)
+
+
+class FirefoxUserContext:
+    '''An isolated Firefox user context (BiDi ``browser.createUserContext``:
+    own cookies/storage, like a Chromium BrowserContext). Async context
+    manager; aclose() removes it and closes its tabs.'''
+
+    def __init__(self, browser: FirefoxBrowser, context_id: str):
+        self.browser = browser
+        self.context_id = context_id
+
+    async def new_page(self, url: str = 'about:blank', **page_kw):
+        return await self.browser.new_page(url, context=self, **page_kw)
+
+    async def aclose(self) -> None:
+        await self.browser.bidi.call('browser.removeUserContext',
+                                     {'userContext': self.context_id})
+
+    async def __aenter__(self) -> FirefoxUserContext:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.aclose()
+
+
+class FirefoxBrowser(Browser):
+    '''A launched Firefox plus its WebDriver BiDi connection (``.bidi``).
+
+    The same ``Browser`` surface where the protocol allows it: ``new_page()``
+    / ``attach()`` hand back a ``testing.Page`` driven over BiDi,
+    ``new_context()`` is a BiDi user context, ``aclose()`` is graceful-first.
+    There is no CDP ``connection`` (None) and no ``new_session()`` — CDP
+    sessions do not exist on Firefox; the raw escape hatch is
+    ``browser.bidi.call(method, params)``. Experimental (M20): Page features
+    without a BiDi mapping yet raise :class:`~purecdp.errors.NotSupported`.
+    '''
+
+    kind = 'firefox'
+
+    def __init__(self, process, bidi, user_data_dir: str, owns_profile: bool,
+                 *, stderr_tail: _StderrTail | None = None):
+        super().__init__(process, None, user_data_dir, owns_profile,
+                         stderr_tail=stderr_tail)
+        self.bidi = bidi
+
+    @property
+    def capabilities(self) -> dict:
+        '''What ``session.new`` reported: browserName, browserVersion, …'''
+        return self.bidi.capabilities
+
+    async def new_context(self) -> FirefoxUserContext:
+        result = await self.bidi.call('browser.createUserContext', {})
+        return FirefoxUserContext(self, str(result['userContext']))
+
+    async def new_session(self, url: str = 'about:blank', *, context=None):
+        raise NotSupported('CDP sessions', 'bidi')
+
+    async def new_page(self, url: str = 'about:blank', *, context=None,
+                       **page_kw):
+        '''A new tab as a ready ``testing.Page`` (BiDi
+        ``browsingContext.create``); ``page_kw`` forwards to Page.create.'''
+        from .testing._bidi_driver import BidiDriver
+        from .testing.page import Page  # lazy: testing sits above this module
+
+        params: dict = {'type': 'tab'}
+        if context is not None:
+            params['userContext'] = context.context_id
+        result = await self.bidi.call('browsingContext.create', params)
+        ctx = str(result['context'])
+        if url and url != 'about:blank':
+            await self.bidi.call('browsingContext.navigate',
+                                 {'context': ctx, 'url': url, 'wait': 'none'})
+        return await Page._create_with(BidiDriver(self.bidi, ctx), **page_kw)
+
+    async def attach(self, *, url_contains: str | None = None,
+                     target_id: str | None = None, **page_kw):
+        '''An EXISTING tab as a ready Page — by URL substring, by browsing
+        context id, or (no selector) the one realized tab; same contract and
+        error messages as :meth:`Browser.attach`.'''
+        from .testing._bidi_driver import BidiDriver
+        from .testing.page import Page
+
+        if url_contains is not None and target_id is not None:
+            raise ValueError('pass at most one of url_contains= / target_id=')
+        tree = await self.bidi.call('browsingContext.getTree', {})
+        tabs = [(str(c['context']), c.get('url') or '')
+                for c in tree.get('contexts', [])]
+
+        def listing(items):
+            return ', '.join(f'{cid} {url[:80] or "<unrealized: empty URL>"}'
+                             for cid, url in items[:8])
+
+        if target_id is not None:
+            matches = [t for t in tabs if t[0] == target_id]
+            wanted = f'target id {target_id!r}'
+        elif url_contains is not None:
+            matches = [t for t in tabs if url_contains in t[1]]
+            wanted = f'URL containing {url_contains!r}'
+        else:
+            matches = [t for t in tabs if t[1].startswith(_REALIZED_PAGE_SCHEMES)]
+            wanted = 'a realized URL (http/https/about/file/data)'
+        if not matches:
+            raise TargetNotFound(f'no page target with {wanted}; open page '
+                                 f'targets: {listing(tabs) or "none"}')
+        if len(matches) > 1:
+            hint = 'target_id=' if url_contains is not None else 'url_contains= or target_id='
+            raise TargetNotFound(f'{len(matches)} page targets match — pass '
+                                 f'{hint} to pick one: {listing(matches)}')
+        return await Page._create_with(BidiDriver(self.bidi, matches[0][0]),
+                                       **page_kw)
+
+    async def close_page(self, session) -> None:
+        raise NotSupported('CDP sessions', 'bidi')
+
+    async def close_target(self, target_id: str) -> bool:
+        await self.bidi.call('browsingContext.close', {'context': target_id})
+        return True
+
+    async def _graceful_close(self) -> bool:
+        try:
+            await self.bidi.call('browser.close', {},
+                                 timeout=self.graceful_close_timeout)
+            return True
+        except Exception:
+            return False
+
+    async def _close_connection(self) -> None:
+        await self.bidi.aclose()
+
+
+async def _launch_firefox(
+    path: str,
+    *,
+    headless: bool,
+    user_data_dir: str | None,
+    prefs: dict | None,
+    extra_args: typing.Sequence[str],
+    timeout: float,
+    ignore_https_errors: bool,
+    stealth: bool = False,
+    window_size: tuple[int, int] | None = DEFAULT_WINDOW_SIZE,
+) -> FirefoxBrowser:
+    from . import bidi as _bidi
+
+    owns_profile = user_data_dir is None
+    profile = user_data_dir or tempfile.mkdtemp(prefix='purecdp-firefox-')
+    if not owns_profile:
+        _prepare_reused_firefox_profile(profile)
+    _write_user_js(profile, {**FIREFOX_PREFS, **(prefs or {})})
+    argv = [path, '--no-remote', '-profile', profile,
+            '--remote-debugging-port', '0']
+    if window_size is not None:
+        argv += ['-width', str(int(window_size[0])), '-height', str(int(window_size[1]))]
+    if headless:
+        argv.append('-headless')
+    argv += [*extra_args, 'about:blank']
+    # 'ignore': leave alerts/confirms up for Page.handle_dialogs (BiDi's
+    # default 'dismiss and notify' auto-dismisses them — confirm() would
+    # answer False before any handler runs). Same contract as CDP's Page domain.
+    capabilities: dict = {'unhandledPromptBehavior': {'default': 'ignore'}}
+    if ignore_https_errors:
+        capabilities['acceptInsecureCerts'] = True
+
+    process: asyncio.subprocess.Process | None = None
+    stderr_tail = _StderrTail(None)
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *argv, stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE)
+        stderr_tail = _StderrTail(process.stderr)
+        url = await _wait_for_bidi_endpoint(process, profile, timeout, stderr_tail)
+        connection = await _bidi.connect(url, capabilities=capabilities)
+        if stealth:
+            from .testing.stealth import GECKO_EVASIONS, build_stealth_script
+            # no ``contexts``: applies to every browsing context, present and
+            # future — the Gecko twin of --disable-blink-features=AutomationControlled
+            await connection.call('script.addPreloadScript', {
+                'functionDeclaration':
+                    f'() => {{\n{build_stealth_script(GECKO_EVASIONS)}\n}}'})
+    except BaseException as exc:
+        died = process is not None and process.returncode is not None
+        if process is not None and process.returncode is None:
+            with suppress(ProcessLookupError):
+                process.kill()
+            await process.wait()
+        if died:
+            await stderr_tail.wait_drained()
+        note = stderr_tail.suffix()
+        stderr_tail.close()
+        if owns_profile:
+            await asyncio.to_thread(shutil.rmtree, profile, True)
+        if (died and isinstance(exc, Exception)
+                and not isinstance(exc, BrowserLaunchError)):
+            raise BrowserLaunchError(
+                f'Firefox exited with code {process.returncode} during '
+                f'launch{note}') from exc
+        raise
+    return FirefoxBrowser(process, connection, profile, owns_profile,
+                          stderr_tail=stderr_tail)

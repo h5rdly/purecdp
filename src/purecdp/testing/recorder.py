@@ -14,10 +14,9 @@ import typing
 from contextlib import suppress
 from dataclasses import dataclass, field
 
-from .. import _fastjson
-from .. import _b64
+from .. import _b64, _fastjson
 from ..errors import PureCDPError
-from ..protocol import network as network_proto
+from ._driver import Failed, Finished, Request, RequestExtra, Response, ResponseExtra
 
 if typing.TYPE_CHECKING:
     from .page import Page
@@ -72,6 +71,7 @@ class Exchange:
     _started: float | None = field(default=None, repr=False)  # CDP monotonic
     _finished: bool = field(default=False, repr=False)
     _masked: bool = field(default=False, repr=False)  # redact= hit: scrub headers too
+    _body_pending: bool = field(default=False, repr=False)  # request body off-event (BiDi)
 
     def _guard_redacted(self, side: str) -> None:
         if self.redacted:
@@ -522,25 +522,30 @@ class NetworkRecorder:
 
     async def _pump(self, stream) -> None:
         with suppress(Exception):  # session teardown ends the pump
+            if self._bodies:
+                # BiDi keeps no bodies unless asked (a data collector); CDP is
+                # a no-op. Sent before the first event is read, i.e. ahead of
+                # whatever the caller triggers after record().
+                await self._page._driver.collect_bodies()
             async for event in stream:
-                if isinstance(event, network_proto.RequestWillBeSent):
+                if isinstance(event, Request):
                     self._on_request(event)
-                elif isinstance(event, network_proto.ResponseReceived):
+                elif isinstance(event, Response):
                     self._on_response(event)
-                elif isinstance(event, network_proto.RequestWillBeSentExtraInfo):
+                elif isinstance(event, RequestExtra):
                     self._on_request_extra(event)
-                elif isinstance(event, network_proto.ResponseReceivedExtraInfo):
+                elif isinstance(event, ResponseExtra):
                     self._on_response_extra(event)
-                elif isinstance(event, network_proto.LoadingFinished):
+                elif isinstance(event, Finished):
                     await self._on_done(event, failed=None)
-                elif isinstance(event, network_proto.LoadingFailed):
-                    await self._on_done(event, failed=str(event.error_text))
+                elif isinstance(event, Failed):
+                    await self._on_done(event, failed=event.error_text)
 
-    def _on_request(self, event) -> None:
-        request_id = str(event.request_id)
-        if (not self._matches(event.request.url)
+    def _on_request(self, event: Request) -> None:
+        request_id = event.request_id
+        if (not self._matches(event.url)
                 or (not self._record_preflights
-                    and event.request.method.upper() == 'OPTIONS')):
+                    and event.method.upper() == 'OPTIONS')):
             # remember the miss so this request's ExtraInfo is dropped, and
             # release anything already buffered for it
             self._unmatched.add(request_id)
@@ -550,21 +555,25 @@ class NetworkRecorder:
         # privacy decision happens HERE, before the secret is ever stored:
         # postData arrives unconditionally on the base event, so a redacted
         # request body is dropped at capture, not scrubbed after the fact
-        masked = self._redact is not None and self._redact(event.request.url)
+        masked = self._redact is not None and self._redact(event.url)
         private = masked or not self._bodies
-        post_data = event.request.post_data
+        post_data = event.post_data
         exchange = Exchange(
-            url=event.request.url,
-            method=event.request.method,
+            url=event.url,
+            method=event.method,
             request_body=None if private else post_data,
-            request_headers=dict(event.request.headers or {}),
-            timestamp=float(event.wall_time),
-            _started=float(event.timestamp),
+            request_headers=dict(event.headers),
+            timestamp=event.wall_time,
+            _started=event.timestamp,
             redacted=private,
             _masked=masked,
         )
         if private and post_data is not None:
             exchange.request_body_size = len(post_data.encode())
+        elif private and event.body_size:
+            exchange.request_body_size = event.body_size     # BiDi: size only
+        exchange._body_pending = (not private and post_data is None
+                                  and bool(event.body_size))
         # ExtraInfo may already have arrived (CDP guarantees no order);
         # its headers are the wire truth, so they win on key collisions.
         exchange.request_headers.update(
@@ -577,66 +586,68 @@ class NetworkRecorder:
         self._pending[request_id] = exchange
         self._by_id[request_id] = exchange
 
-    def _on_response(self, event) -> None:
-        exchange = self._by_id.get(str(event.request_id))
+    def _on_response(self, event: Response) -> None:
+        exchange = self._by_id.get(event.request_id)
         if exchange is not None:
-            exchange.status = int(event.response.status)
-            exchange.mime = str(event.response.mime_type)
+            exchange.status = event.status
+            exchange.mime = event.mime
             # anything already present came from ExtraInfo — keep it on top
             exchange.response_headers = {
-                **dict(event.response.headers or {}),
-                **exchange.response_headers}
+                **event.headers, **exchange.response_headers}
             if exchange._masked:
                 exchange.response_headers = _mask_credentials(
                     exchange.response_headers)
 
-    def _on_request_extra(self, event) -> None:
-        request_id = str(event.request_id)
+    def _on_request_extra(self, event: RequestExtra) -> None:
+        request_id = event.request_id
         if request_id in self._unmatched:
             return
         exchange = self._by_id.get(request_id)
         if exchange is not None:
-            exchange.request_headers.update(dict(event.headers or {}))
+            exchange.request_headers.update(event.headers)
             if exchange._masked:  # ExtraInfo is where Cookie actually arrives
                 exchange.request_headers = _mask_credentials(
                     exchange.request_headers)
         else:  # ExtraInfo beat the base event — buffer until it arrives
             self._early_request_extra.setdefault(request_id, {}).update(
-                dict(event.headers or {}))
+                event.headers)
 
-    def _on_response_extra(self, event) -> None:
-        request_id = str(event.request_id)
+    def _on_response_extra(self, event: ResponseExtra) -> None:
+        request_id = event.request_id
         if request_id in self._unmatched:
             return
         exchange = self._by_id.get(request_id)
         if exchange is not None:
-            exchange.response_headers.update(dict(event.headers or {}))
+            exchange.response_headers.update(event.headers)
             if exchange._masked:  # Set-Cookie only ever arrives via ExtraInfo
                 exchange.response_headers = _mask_credentials(
                     exchange.response_headers)
         else:
             self._early_response_extra.setdefault(request_id, {}).update(
-                dict(event.headers or {}))
+                event.headers)
 
-    async def _on_done(self, event, failed: str | None) -> None:
-        exchange = self._pending.pop(str(event.request_id), None)
+    async def _on_done(self, event: Finished | Failed, failed: str | None) -> None:
+        exchange = self._pending.pop(event.request_id, None)
         if exchange is None:
             return
         if exchange._started is not None:  # same monotonic clock as the start
-            exchange.duration = max(0.0, float(event.timestamp) - exchange._started)
+            exchange.duration = max(0.0, event.timestamp - exchange._started)
+        if getattr(exchange, '_body_pending', False):
+            # BiDi keeps request bodies in the data collector, not on events
+            with suppress(Exception):
+                raw = await self._page._driver.request_body(event.request_id)
+                if raw is not None:
+                    exchange.request_body = raw.decode('utf-8', 'replace')
         if failed is not None:
             exchange.failed = failed          # the request itself failed
         elif exchange.redacted:
             # deliberately no getResponseBody: the bytes never enter the
             # process. The wire length still lands — metadata is the point.
-            exchange.body_size = int(event.encoded_data_length)
+            exchange.body_size = event.encoded_length
         else:
             try:
-                body, is_b64 = await self._page.session.execute(
-                    network_proto.get_response_body(
-                        network_proto.RequestId(str(event.request_id))))
-                exchange.body = (_b64.b64decode(body) if is_b64
-                                 else body.encode())
+                exchange.body = await self._page._driver.response_body(
+                    event.request_id)
             except Exception as exc:  # a lost body must not kill the pump
                 # a bodyless response (204/304, HEAD, redirect) has nothing to
                 # fetch — getResponseBody reports "No resource ..." and that is

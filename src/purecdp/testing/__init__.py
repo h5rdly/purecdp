@@ -7,6 +7,7 @@
 '''
 
 from .artifacts import Checks, dump_artifacts
+from ._driver import Handle, NotSupported
 from .element import ActionabilityError, Element, QueryTimeout
 from .frame import Frame, FrameNotFound
 from .live import ExpectationError, Live
@@ -27,6 +28,7 @@ from .sse import ServerSentEvent, parse_sse
 from .stealth import (
     DEFAULT_EVASIONS,
     EVASIONS,
+    GECKO_EVASIONS,
     OPT_IN_EVASIONS,
     apply_stealth,
     build_stealth_script,
@@ -35,11 +37,14 @@ from .testcase import CDPTestCase
 
 __all__ = [
     'Page',
+    'Handle',
+    'NotSupported',
     'launched_page',
     'apply_stealth',
     'build_stealth_script',
     'EVASIONS',
     'DEFAULT_EVASIONS',
+    'GECKO_EVASIONS',
     'OPT_IN_EVASIONS',
     'HumanCursor',
     'human_type',
