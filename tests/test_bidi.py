@@ -999,10 +999,10 @@ class FirefoxLaunchHelperTests(unittest.IsolatedAsyncioTestCase):
     def test_user_js_writer_is_idempotent_and_keeps_user_lines(self):
         from purecdp.browser import _write_user_js
         with tempfile.TemporaryDirectory() as profile:
-            pathlib.Path(profile, 'user.js').write_text('user_pref("mine", 1);\n')
+            pathlib.Path(profile, 'user.js').write_text('user_pref("mine", 1);\n', encoding='utf-8')
             _write_user_js(profile, {'a.b': True, 'c': 'x"y', 'd': 3})
             _write_user_js(profile, {'a.b': True, 'e': False})   # a second launch
-            text = pathlib.Path(profile, 'user.js').read_text()
+            text = pathlib.Path(profile, 'user.js').read_text(encoding='utf-8')
         assert text == ('user_pref("mine", 1);\n'
                         '// purecdp:begin (rewritten on every launch; edit outside this block)\n'
                         'user_pref("a.b", true);\nuser_pref("e", false);\n'

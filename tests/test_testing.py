@@ -277,7 +277,7 @@ class DriverSeamTests(PageTestBase):
         offenders = []
         for mod in ('page', 'element', 'frame', 'live', 'intercept', 'recorder',
                     '_agent', 'human', 'snapshot', 'artifacts', 'testcase'):
-            text = (root / f'{mod}.py').read_text()
+            text = (root / f'{mod}.py').read_text(encoding='utf-8')  # cp1252 on Windows otherwise
             if ('from ..protocol import' in text
                     or 'from purecdp.protocol import' in text
                     or 'import purecdp.protocol' in text):

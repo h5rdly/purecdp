@@ -95,8 +95,8 @@ async def main():
                 await asyncio.sleep(1.0)   # let late JS settle (not a purecdp wait: a dogfood choice)
                 t = time.perf_counter(); native = await page.snapshot(engine='native'); t_native = time.perf_counter() - t
                 t = time.perf_counter(); walked = await page.snapshot(engine='walker'); t_walker = time.perf_counter() - t
-                (OUT / f'{label}.native.txt').write_text(native.text)
-                (OUT / f'{label}.walker.txt').write_text(walked.text)
+                (OUT / f'{label}.native.txt').write_text(native.text, encoding='utf-8')
+                (OUT / f'{label}.walker.txt').write_text(walked.text, encoding='utf-8')
                 missing, extra = summarize(label, native, walked, t_native, t_walker)
                 verdict = await flow(page, kind, walked) if kind else 'no flow'
                 print(f'  flow: {verdict}')
